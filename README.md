@@ -717,8 +717,10 @@ Use `--scope host` for explicitly authorized host operations with `run`, `lane a
 The default `--scope repo` keeps the executor inside its worktree. Host scope allows task-card-listed
 paths outside the worktree and remote-host operations; repository edits still stay in the worktree
 and are committed by swrm. `rm outside worktree` and `sudo` are recorded as RISK warnings in host
-scope; all command fragments are checked, so `sudo true; git push origin main` still blocks
-the run. Push, publish, and secret-print enforcement remains active. `status.json`, `result.json`,
+scope; all command fragments and commands wrapped by `sudo`, `env`, `nohup`, or `timeout` are checked.
+`sudo git push origin main`, `sudo cat .env`, and `sudo npm publish` still block the run.
+Warning-only lane permission requests receive the normal protocol response. Push, publish, and
+secret-print enforcement remains active. The ledger, `status.json`, `result.json`,
 `report`, and `watch` include the selected scope. `fleet exec` passes `--scope` through to `run`.
 
 `openswarm report --daily --date YYYY-MM-DD --html report.html --json` writes one

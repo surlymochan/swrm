@@ -3892,6 +3892,63 @@ def event_commands(event):
     return list(dict.fromkeys(commands))
 
 
+def shell_wrapper_command(words, cwd):
+    """Return a known launcher's command, retaining option operands as data."""
+    op = os.path.basename(words[0])
+    options = {
+        "sudo": ("ugphCDRrtT", {"user", "group", "host", "prompt", "close-from", "chdir", "chroot",
+                                "role", "type", "command-timeout", "other-user"}),
+        "env": ("uCaS", {"unset", "chdir", "argv0", "split-string"}),
+        "timeout": ("ks", {"kill-after", "signal"}),
+        "nice": ("n", {"adjustment"}),
+        "exec": ("a", set()),
+        "command": ("", set()),
+        "nohup": ("", set()),
+        "!": ("", set()),
+    }
+    if op not in options:
+        return None
+    short_options, long_options = options[op]
+    i = 1
+    while i < len(words):
+        word = words[i]
+        if word == "--":
+            i += 1
+            break
+        if not word.startswith("-") or word == "-":
+            if op == "env" and word == "-":
+                i += 1
+                continue
+            break
+        option, value = word, None
+        if word.startswith("--"):
+            option, sep, value = word.partition("=")
+            if option[2:] in long_options and not sep:
+                i += 1
+                value = words[i] if i < len(words) else None
+        else:
+            for offset, flag in enumerate(word[1:], 2):
+                if flag in short_options:
+                    option = "-" + flag
+                    value = word[offset:]
+                    if not value:
+                        i += 1
+                        value = words[i] if i < len(words) else None
+                    break
+        if value is not None:
+            if (op == "env" and option in ("-C", "--chdir")) or (op == "sudo" and option in ("-D", "--chdir")):
+                cwd = os.path.realpath(os.path.join(cwd, os.path.expandvars(os.path.expanduser(value))))
+            if op == "env" and option in ("-S", "--split-string"):
+                try:
+                    return shlex.split(value) + words[i + 1:], cwd
+                except ValueError:
+                    return [], cwd
+        i += 1
+    if op == "timeout":
+        i += 1  # duration, not an executable
+    return words[i:], cwd
+
+
 def shell_invocations(command, cwd, depth=0):
     """Identify command positions and shell -c bodies; quoted prose stays an operand."""
     if depth > 16:
@@ -3912,19 +3969,28 @@ def shell_invocations(command, cwd, depth=0):
         else:
             segment.append(token)
     for words in segments:
-        while words and (re.match(r"^[A-Za-z_]\w*=", words[0]) or words[0] in ("env", "command", "exec", "nohup", "!")):
-            words = words[1:]
+        command_cwd = cwd
+        wrapped = False
+        while words:
+            if re.match(r"^[A-Za-z_]\w*=", words[0]):
+                words = words[1:]
+                continue
+            yield words, command_cwd
+            inner = shell_wrapper_command(words, command_cwd)
+            if inner is None:
+                break
+            wrapped = wrapped or os.path.basename(words[0]) not in ("command", "!")
+            words, command_cwd = inner
         if not words:
             continue
         op = os.path.basename(words[0])
-        yield words, cwd
-        if op == "cd":
+        if op == "cd" and not wrapped:
             dest = words[1] if len(words) > 1 else HOME
             cwd = os.path.realpath(os.path.join(cwd, os.path.expandvars(os.path.expanduser(dest))))
         if op in ("sh", "bash", "zsh", "dash", "ksh", "fish"):
             for i, word in enumerate(words[1:], 1):
                 if (word == "--command" or re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", word)) and i + 1 < len(words):
-                    yield from shell_invocations(words[i + 1], cwd, depth + 1)
+                    yield from shell_invocations(words[i + 1], command_cwd, depth + 1)
                     break
 
 
@@ -5097,7 +5163,7 @@ def cmd_run(args, policy):
                       "commit": None, "bus": {"issue_url": state.get("bus_issue_url"), "executor": None,
                                                 "pr_url": None}, "run_dir": rdir}
             jsave(f"{rdir}/result.json", output)
-            append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "failed",
+            append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "failed", "scope": scope,
                            "backend": "github-issue", "error_class": "bus_error", "summary": bus_redact(str(error))[:300],
                            "card_type": card_type, "rework_of": rework_of,
                            **exec_pass_fields(False, False, bool(args.verify), None)})
@@ -5110,7 +5176,7 @@ def cmd_run(args, policy):
     if not decision["ok"]:
         out = {"id": rid, "status": "unroutable", "decision": decision, "scope": scope}
         set_status(rdir, state="unroutable", scope=scope)
-        append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "unroutable", "decision": decision,
+        append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "unroutable", "decision": decision, "scope": scope,
                        "card_type": card_type, "rework_of": rework_of,
                        **exec_pass_fields(False, False, bool(args.verify), None)})
         jsave(f"{rdir}/result.json", out)
@@ -5192,7 +5258,7 @@ def cmd_run(args, policy):
                    **fin, "attempts": [], "claude_review": decision.get("claude_review"),
                    "decision_reasons": decision.get("reasons"), "run_dir": rdir}
             jsave(f"{rdir}/result.json", out)
-            append_ledger({"id": rid, "ts": NOW(), "title": title, "profile": prof, "status": "failed",
+            append_ledger({"id": rid, "ts": NOW(), "title": title, "profile": prof, "status": "failed", "scope": scope,
                            "backend": decision["backend"], "model": decision["model"],
                            "error_class": "prepare_failed", "seconds": prepared["seconds"],
                            "card_type": card_type, "rework_of": rework_of, **routing_fields,
@@ -5342,7 +5408,7 @@ def cmd_run(args, policy):
         "decision_reasons": decision.get("reasons"), "run_dir": rdir, **routing_fields,
     }
     jsave(f"{rdir}/result.json", out)
-    append_ledger({"id": rid, "ts": NOW(), "title": title, "profile": prof, "status": status,
+    append_ledger({"id": rid, "ts": NOW(), "title": title, "profile": prof, "status": status, "scope": scope,
                    "backend": decision["backend"], "model": decision["model"], "effort": decision.get("effort"),
                    "tier": decision.get("tier"), "attempts": [{k: a[k] for k in a if k != "error_tail"} for a in attempts],
                    "error_class": out["error_class"],
@@ -7688,10 +7754,9 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                 return None, usage, error_class, 1, event_file, detail
             return None, usage, "risk_blocked" if spec.get("risk_blocks") else "exec_error", 1, event_file, "resident executor stdout closed"
         block = enforced_risk(msg, risk_policy, ws["path"], scope=spec.get("scope", "repo"))
-        if block:
-            if block.get("enforced") is False:
-                lane_record_event(event_file, {"type": "risk_warning", **block})
-                continue
+        if block and block.get("enforced") is False:
+            lane_record_event(event_file, {"type": "risk_warning", **block})
+        elif block:
             spec.setdefault("risk_blocks", []).append(block)
             spec["abort_requested"] = True
             set_status(rdir, risk_blocks=spec["risk_blocks"])
@@ -7957,6 +8022,7 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     pass_fields = exec_pass_fields(bool(fin.get("commit") or (changed and not read_only)), read_only_output,
                                    bool(spec.get("verify")), verify)
     append_ledger({"id": rid, "ts": NOW(), "title": title, "status": status, "lane": lane["name"],
+                   "scope": spec.get("scope", "repo"),
                    "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
                    "attempts": attempts, "error_class": error_class,
                    "seconds": round(sum(attempt["seconds"] for attempt in attempts), 3),
@@ -8155,6 +8221,7 @@ def lane_do_run(lane, spec, child, server, current):
         if ws is None:
             # Preserve a visible failed run even if lane worktree preparation was rejected.
             status = {"id": rid, "status": "failed", "title": spec.get("title"), "lane": lane["name"],
+                      "scope": spec.get("scope", "repo"),
                       "backend": lane["backend"], "model": lane["model"], "result": None,
                       "attempts": [{"backend": lane["backend"], "model": lane["model"], "rc": 1,
                                     "error_class": error_class, "error_tail": short(e, 500)}], "run_dir": rdir}
@@ -8162,6 +8229,7 @@ def lane_do_run(lane, spec, child, server, current):
             set_status(rdir, state="finished", status="failed", finished=NOW(), error_class=error_class,
                        last_error=short(e, 500))
             append_ledger({"id": rid, "ts": NOW(), "title": spec.get("title"), "status": "failed",
+                           "scope": spec.get("scope", "repo"),
                            "lane": lane["name"], "backend": lane["backend"], "model": lane["model"],
                            "error_class": error_class, "card_type": spec.get("card_type"),
                            "rework_of": spec.get("rework_of"),
