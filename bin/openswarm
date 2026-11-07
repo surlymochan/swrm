@@ -9860,7 +9860,7 @@ def watch_wait_for_change(path):
                 ev = select.kevent(fd, filter=select.KQ_FILTER_VNODE,
                                    flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
                                    fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_RENAME | select.KQ_NOTE_DELETE)
-                kq.control([ev], 0, 1.0)
+                kq.control([ev], 1, 1.0)
             finally:
                 kq.close()
         finally:
@@ -9903,16 +9903,32 @@ def cmd_watch_wake(args):
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.consumer) or args.consumer in (".", ".."):
             sys.exit("invalid consumer name")
         cursor_path = os.path.join(DATA, "cursors", args.consumer)
+    if cursor_path:
+        cursor_path = os.path.realpath(cursor_path)
+        os.makedirs(os.path.dirname(cursor_path), exist_ok=True)
+        # Hold ownership through load, wait, checkpoint and output. A contender
+        # loads the latest cursor only after the previous watcher has exited.
+        with open(cursor_path + ".lock", "a+b") as lock:
+            _flock(lock, LOCK_EX)
+            return watch_wake_locked(args, run_ids, cursor_path)
+    return watch_wake_locked(args, run_ids, None)
+
+
+def watch_wake_locked(args, run_ids, cursor_path):
     cursors = {}
+    notifications = {}
     if cursor_path:
         try:
             with open(cursor_path, encoding="utf-8") as f:
-                cursors = json.load(f).get("files", {})
+                saved = json.load(f)
+                cursors = saved.get("files", {})
+                notifications = saved.get("notifications", {})
+                if not isinstance(cursors, dict) or not isinstance(notifications, dict):
+                    raise ValueError("invalid cursor maps")
         except FileNotFoundError:
             pass
         except (OSError, ValueError, AttributeError):
             sys.exit(f"invalid watch cursor: {cursor_path}")
-    os.makedirs(os.path.dirname(os.path.abspath(cursor_path)), exist_ok=True) if cursor_path else None
     risks = [(re.compile(rx, re.I), name) for rx, name in DEFAULT_RISKS]
     risks += [(re.compile(rx, re.I), "custom") for rx in (args.risk or [])]
     last_activity = {}
@@ -9920,20 +9936,44 @@ def cmd_watch_wake(args):
     def save_cursor():
         if not cursor_path:
             return
-        tmp = cursor_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"version": 1, "files": cursors}, f, sort_keys=True)
-            f.write("\n")
-        os.replace(tmp, cursor_path)
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(cursor_path),
+                                             prefix=".watch-cursor-", delete=False) as f:
+                tmp = f.name
+                json.dump({"version": 1, "files": cursors, "notifications": notifications}, f, sort_keys=True)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, cursor_path)
+        except OSError as exc:
+            # Do not swallow checkpoint errors in the event-file read handler.
+            raise RuntimeError(f"cannot save watch cursor: {cursor_path}") from exc
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
 
     def emit(rid, kind, text):
+        save_cursor()
         label = args.label or rid[-6:]
         print(f"[{label} {time.strftime('%H:%M')}] {kind}: {text}", flush=True)
 
+    def notify(rid, kind, text):
+        key = f"{rid}:{kind}"
+        if notifications.get(key) == text:
+            return False
+        notifications[key] = text
+        emit(rid, kind, text)
+        return True
+
     def active_runs():
         if args.all:
-            return sorted((p.name for p in pathlib.Path(RUNS).iterdir() if p.is_dir()), reverse=True) if os.path.isdir(RUNS) else []
+            return sorted((name for name in os.listdir(RUNS) if os.path.isdir(os.path.join(RUNS, name))), reverse=True) if os.path.isdir(RUNS) else []
         return run_ids
+
+    def anchor(f, offset):
+        f.seek(max(0, offset - 64))
+        return hashlib.sha256(f.read(min(offset, 64))).hexdigest()
 
     while True:
         watch_path = None
@@ -9949,62 +9989,75 @@ def cmd_watch_wake(args):
             for path in dict.fromkeys(event_paths):
                 watch_path = path
                 try:
-                    stat = os.stat(path)
-                    identity = f"{stat.st_dev}:{stat.st_ino}"
-                    key = f"{rid}:{os.path.abspath(path)}"
-                    saved = cursors.get(key, {})
-                    offset = int(saved.get("offset", 0)) if saved.get("identity") == identity else 0
                     with open(path, "rb") as f:
+                        stat = os.fstat(f.fileno())
+                        identity = f"{stat.st_dev}:{stat.st_ino}"
+                        # Follow renamed files without replaying their old lines.
+                        # Path-based v1 cursors remain readable during migration.
+                        key = f"{rid}:inode:{identity}"
+                        saved = cursors.get(key, cursors.get(f"{rid}:{os.path.abspath(path)}", {}))
+                        known = saved.get("identity") == identity
+                        offset = int(saved.get("offset", 0)) if saved.get("identity") == identity else 0
+                        if offset > stat.st_size or (saved.get("anchor") and anchor(f, offset) != saved["anchor"]):
+                            offset = 0
+                        if not known and getattr(args, "from_end", False):
+                            offset = stat.st_size
+                            cursors[key] = {"identity": identity, "offset": offset, "anchor": anchor(f, offset)}
+                            save_cursor()
+                        elif known and key not in cursors:
+                            cursors[key] = saved
+                            save_cursor()
                         f.seek(offset)
                         while True:
                             raw = f.readline()
                             if not raw or not raw.endswith(b"\n"):
                                 break
                             offset = f.tell()
+                            cursors[key] = {"identity": identity, "offset": offset, "anchor": anchor(f, offset)}
+                            f.seek(offset)
                             last_activity[rid] = NOW()
                             try:
                                 event = json.loads(raw.decode("utf-8", errors="replace"))
                             except ValueError:
-                                cursors[key] = {"identity": identity, "offset": offset}
+                                save_cursor()
+                                continue
+                            if not isinstance(event, dict):
                                 save_cursor()
                                 continue
                             typ = event.get("type")
                             if typ == "risk_blocked":
                                 emit(rid, "RISK[{}]".format(event.get("risk")), short(event.get("command"), 220) + " (blocked)")
-                                cursors[key] = {"identity": identity, "offset": offset}
-                                save_cursor()
                                 return 0
                             if ((typ in ("extension_error", "auto_retry_end") and event.get("success") is False)
                                     or typ in ("error", "turn.failed")):
                                 emit(rid, "ERROR", short(event.get("error") or event, 300))
-                                cursors[key] = {"identity": identity, "offset": offset}
-                                save_cursor()
                                 return 0
                             kind, text = summarize_event(event)
+                            if kind == "error":
+                                emit(rid, "ERROR", short(text, 300))
+                                return 0
                             if kind == "cmd":
                                 for rx, name in risks:
                                     if rx.search(text):
                                         emit(rid, f"RISK[{name}]", short(text, 220))
-                                        cursors[key] = {"identity": identity, "offset": offset}
-                                        save_cursor()
                                         return 0
-                            cursors[key] = {"identity": identity, "offset": offset}
                             save_cursor()
                 except OSError:
                     continue
             if st.get("state") in ("finished", "unroutable"):
                 result = jload(os.path.join(rdir, "result.json"), {}) or {}
-                emit(rid, "DONE", f"status={result.get('status') or st.get('state')} backend={result.get('backend') or st.get('backend')}")
-                return 0
+                if notify(rid, "DONE", f"status={result.get('status') or st.get('state')} backend={result.get('backend') or st.get('backend')}"):
+                    return 0
+                continue
             if st.get("runner_pid") and not pid_alive(st["runner_pid"]):
-                emit(rid, "EXITED", f"runner process gone in state={st.get('state')}")
-                return 0
+                if notify(rid, "EXITED", f"runner process gone in state={st.get('state')}"):
+                    return 0
             if st.get("queue_reason") != "provider concurrency limit" and st.get("deadline") and now > st["deadline"] + 90:
-                emit(rid, "BUDGET", f"past budget ({st.get('budget_minutes')}m) and still {st.get('state')}")
-                return 0
+                if notify(rid, "BUDGET", f"past budget ({st.get('budget_minutes')}m) and still {st.get('state')}"):
+                    return 0
             if getattr(args, "stall_minutes", 10) > 0 and now - last_activity[rid] > getattr(args, "stall_minutes", 10) * 60:
-                emit(rid, "STALL", f"no events for {(now - last_activity[rid]) / 60:.1f}m")
-                return 0
+                if notify(rid, "STALL", f"no events for >{getattr(args, 'stall_minutes', 10):g}m"):
+                    return 0
         watch_wait_for_change(watch_path)
 
 
