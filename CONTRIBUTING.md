@@ -8,8 +8,13 @@ Thanks for helping. swrm is a single-file, standard-library-only Python CLI plus
 ```bash
 git clone https://github.com/surlymochan/swrm.git
 cd swrm
+mkdir -p .tmp/test-tmp
+export TMPDIR="$PWD/.tmp/test-tmp" TMP="$PWD/.tmp/test-tmp" TEMP="$PWD/.tmp/test-tmp"
 python3 -m unittest discover -s tests -v     # Python 3.9+; no Codex/OpenCode/network needed
 ```
+
+The stable test temp directory must be separate from `.openswarm-tmp`, which executor cleanup removes.
+The test loader isolates `OPENSWARM_HOME` and fleet-capacity paths; admission tests use explicit fixture coordinators.
 
 Try the CLI without any backend installed:
 
