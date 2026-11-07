@@ -79,6 +79,15 @@ attempts and heartbeats. Pi messages merge at `message_end`; Cursor chunks merge
 Heartbeats show elapsed time, commands, the worktree git diff summary (lanes too), and the last message (≤200 chars).
 Quiet watches still expire after their watch window, without printing `WATCH-EXPIRED`.
 
+For a Bash background job that should block indefinitely and wake only when something needs attention, use
+`--wake`. It emits the actionable event and exits with status 0; a named consumer or cursor file resumes at
+the next unread byte on the following invocation. `--all` also discovers runs created while it is waiting:
+```bash
+openswarm watch --all --wake --consumer planner &
+wait $!
+```
+Use `--cursor-file "$OPENSWARM_HOME/cursors/planner.json"` instead when you want to choose the cursor path.
+
 How to react:
 - `MSG`: check it against the task scope. If the executor is drifting, `$XS stop <id>`, tighten the prompt, and re-dispatch.
 - `RISK`: check it now. If it is out of bounds, stop the run. Codex reports commands before they run; opencode reports them only after they finish.

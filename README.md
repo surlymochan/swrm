@@ -174,6 +174,10 @@ For longer work, detach and watch:
 openswarm run --detach --cwd ~/code/myrepo --verify 'pytest -q' --task-file /tmp/task.md   # prints {"id": ...}
 openswarm watch <id1> <id2>          # one line per actionable event; exits on DONE or after 28 min
 openswarm watch <id1> <id2> --quiet  # alerts, heartbeats and terminal events only
+openswarm watch <id1> <id2> --wake --consumer planner
+                                      # Bash-friendly blocking wait; exits on next actionable event
+openswarm watch --all --wake --cursor-file "$OPENSWARM_HOME/cursors/all.json"
+                                      # include runs created later and resume from saved offsets
 openswarm resume                     # recover live runs, busy lanes and recent results after planner restart
 openswarm resume --since-hours 12 --json
 openswarm report --since-minutes 60  # one-screen digest for scheduled check-ins

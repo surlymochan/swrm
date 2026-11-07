@@ -89,6 +89,49 @@ class WatchTests(unittest.TestCase):
             self.assertTrue(beat.endswith(xs.short("last message " + "x" * 250, 200)))
             self.assertFalse(any(token in output.getvalue() for token in ("MSG:", "CMD:", "WATCH-EXPIRED:")))
 
+    def test_wake_reads_actionable_event_and_persists_byte_cursor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            rdir = root / "runs" / "r1"
+            rdir.mkdir(parents=True)
+            events = rdir / "events.jsonl"
+            events.write_text(json.dumps({"type": "message_end", "message": {"role": "user"}}) + "\n" +
+                              json.dumps({"type": "error", "error": "wake me"}) + "\n")
+            xs.jsave(str(rdir / "status.json"), {"state": "running", "events": str(events)})
+            cursor = root / "cursor.json"
+            args = argparse.Namespace(run_id=["r1"], all=False, consumer=None, cursor_file=str(cursor),
+                                      risk=[], label=None)
+            output = io.StringIO()
+            with mock.patch.object(xs, "DATA", str(root)), mock.patch.object(xs, "RUNS", str(root / "runs")), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(xs.cmd_watch_wake(args), 0)
+            self.assertIn("ERROR: wake me", output.getvalue())
+            saved = json.loads(cursor.read_text())
+            self.assertEqual(saved["version"], 1)
+            self.assertEqual(next(iter(saved["files"].values()))["offset"], events.stat().st_size)
+
+    def test_wake_idle_wait_uses_negligible_cpu(self):
+        start = __import__("time").process_time()
+        xs.watch_wait_for_change(None)
+        self.assertLess(__import__("time").process_time() - start, 0.1)
+
+    def test_wake_large_event_file_is_consumed_incrementally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            rdir = root / "runs" / "r1"
+            rdir.mkdir(parents=True)
+            events = rdir / "events.jsonl"
+            noise = json.dumps({"type": "message_end", "message": {"role": "user"}}) + "\n"
+            events.write_text(noise * 10000 + json.dumps({"type": "error", "error": "done"}) + "\n")
+            xs.jsave(str(rdir / "status.json"), {"state": "running", "events": str(events)})
+            args = argparse.Namespace(run_id=["r1"], all=False, consumer=None, cursor_file=None,
+                                      risk=[], label=None)
+            start = __import__("time").monotonic()
+            with mock.patch.object(xs, "DATA", str(root)), mock.patch.object(xs, "RUNS", str(root / "runs")), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                xs.cmd_watch_wake(args)
+            self.assertLess(__import__("time").monotonic() - start, 2.0)
+
 
 if __name__ == "__main__":
     unittest.main()
