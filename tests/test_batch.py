@@ -113,6 +113,15 @@ class BatchTests(FakeFleetFixture, unittest.TestCase):
         self.assertEqual(remote_args[remote_args.index("--paths") + 1:], ["src/widget.py"])
         self.assertEqual(remote_args[remote_args.index("--scope") + 1], "host")
 
+    def test_batch_host_scope_reaches_remote_run(self):
+        (self.cards / "one.md").write_text("host maintenance")
+        rc, summary, _ = self.run_batch(scope="host")
+        self.assertEqual(rc, 0)
+        self.assertEqual(summary["scope"], "host")
+        calls = [json.loads(line) for line in (self.root / "b1" / "data" / "calls.jsonl").read_text().splitlines()]
+        start = next(call for call in calls if call["event"] == "start")
+        self.assertEqual(start["args"]["scope"], "host")
+
     def test_budget_refuses_batch_before_launch(self):
         (self.cards / "one.md").write_text("one")
         policy = xs.deep_merge(xs.load_policy(), {"budget": {"daily_executor_minutes": 0}})
