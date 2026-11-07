@@ -3472,6 +3472,18 @@ TASK:
 
 """ + REPORT_INSTRUCTION
 
+HOST_SCOPE_PROMPT = """This is a host operations task. You may operate on paths outside the current worktree and on remote hosts listed in the task card. Keep repository changes inside the worktree; swrm will commit them. Do NOT push, switch branches, or print secrets.
+"""
+
+
+def execution_prompt(wd, task, scope="repo"):
+    if scope == "host":
+        return PROMPT_TMPL.replace(
+            "- Work only inside the current directory ({wd}). It is a dedicated git worktree; do NOT commit, push, or switch branches.",
+            HOST_SCOPE_PROMPT.strip(),
+        ).format(wd=wd, task=task)
+    return PROMPT_TMPL.format(wd=wd, task=task)
+
 MODEL_UNAVAILABLE_RE = re.compile(r"(at capacity|server.?overloaded|overloaded|try a different model|model is not supported|not supported when using|model .{0,40}not (found|available))", re.I)
 OPENCODE_ABORT_RE = re.compile(r"stream error.*(usage limit exceeded|insufficient balance|quota exceeded|rate.?limit)", re.I)
 RATE_LIMIT_RE = re.compile(r"(\b429\b|resource[_ -]?exhausted|rate.?limit|usage limit|quota|too many requests|insufficient balance|spend.?control)", re.I)
@@ -4118,7 +4130,7 @@ def codex_track_io_lost(streak, event, limit=CODEX_IO_LOST_STREAK):
     return streak, None
 
 
-def enforced_risk(event, policy, worktree):
+def enforced_risk(event, policy, worktree, scope="repo"):
     enforced = (policy.get("risk") or {}).get("enforce", ENFORCED_RISKS)
     aliases = {"git destructive/push": "push", "publish/release": "publish",
                "possible secret print": "secret print", "rm -r outside worktree": "rm outside worktree",
@@ -4142,12 +4154,18 @@ def enforced_risk(event, policy, worktree):
             shell_text = " ".join(words)
             for regex, name in rules:
                 if name in enabled and (name not in operations or op in operations[name]) and re.search(regex, shell_text, re.I):
-                    return {"risk": name, "command": redact_command(command)}
+                    finding = {"risk": name, "command": redact_command(command)}
+                    if scope == "host" and name in ("rm outside worktree", "sudo"):
+                        finding["enforced"] = False
+                    return finding
         if "rm outside worktree" in enabled:
             path_class = rm_outside_worktree_class(command, worktree)
             if path_class:
-                return {"risk": "rm outside worktree", "path_class": path_class,
-                        "command": redact_command(command)}
+                finding = {"risk": "rm outside worktree", "path_class": path_class,
+                           "command": redact_command(command)}
+                if scope == "host":
+                    finding["enforced"] = False
+                return finding
     return None
 
 
@@ -4185,7 +4203,8 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
             for line in lines:
                 try:
                     event = json.loads(line)
-                    block = enforced_risk(event, policy, cwd) if isinstance(event, dict) else None
+                    scope = (jload(os.path.join(rdir, "status.json"), {}) or {}).get("scope", "repo")
+                    block = enforced_risk(event, policy, cwd, scope=scope) if isinstance(event, dict) else None
                 except ValueError:
                     continue
                 if isinstance(event, dict):
@@ -4198,7 +4217,10 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                         kill_tree(p.pid, grace=0.1)
                         p.wait()
                         return 134
-                if block:
+                if block and block.get("enforced") is False:
+                    with open(out_path, "a") as ev:
+                        ev.write(json.dumps({"type": "risk_warning", **block}, ensure_ascii=False) + "\n")
+                elif block:
                     set_status(rdir, risk_blocks=[block], stop_requested=True)
                     kill_tree(p.pid, grace=0.1)
                     p.wait()
@@ -5022,6 +5044,7 @@ def new_run_id():
 
 
 def cmd_run(args, policy):
+    scope = getattr(args, "scope", "repo")
     card_type = getattr(args, "card_type", None)
     rework_of = getattr(args, "rework_of", None)
     validate_card_type(policy, card_type)
@@ -5046,6 +5069,7 @@ def cmd_run(args, policy):
         with open(f"{rdir}/task.md", "w") as f:
             f.write(task)
     title = args.title or task.strip().splitlines()[0][:72]
+    set_status(rdir, scope=scope)
     prof = profile_from_args(args)
     prof["read_only"] = (getattr(args, "read_only", False) or
                          prof.get("type") in READ_ONLY_CARD_TYPES or card_type in READ_ONLY_CARD_TYPES)
@@ -5062,6 +5086,7 @@ def cmd_run(args, policy):
                 except Exception:
                     pass
             output = {"id": rid, "status": "failed", "error_class": "bus_error", "error": bus_redact(str(error)),
+                      "scope": scope,
                       "title": title, "backend": "github-issue", "result": None, "branch": None,
                       "commit": None, "bus": {"issue_url": state.get("bus_issue_url"), "executor": None,
                                                 "pr_url": None}, "run_dir": rdir}
@@ -5077,8 +5102,8 @@ def cmd_run(args, policy):
     st = get_state(policy)
     decision = route(prof, st, policy)
     if not decision["ok"]:
-        out = {"id": rid, "status": "unroutable", "decision": decision}
-        set_status(rdir, state="unroutable")
+        out = {"id": rid, "status": "unroutable", "decision": decision, "scope": scope}
+        set_status(rdir, state="unroutable", scope=scope)
         append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "unroutable", "decision": decision,
                        "card_type": card_type, "rework_of": rework_of,
                        **exec_pass_fields(False, False, bool(args.verify), None)})
@@ -5088,8 +5113,8 @@ def cmd_run(args, policy):
     advice = routing_advice(prof, card_type, st, policy, decision)
     routing_fields = {"routing_advice": advice} if advice is not None else {}
     if args.dry_run:
-        set_status(rdir, state="dry-run")
-        print(json.dumps({"id": rid, "dry_run": True, "decision": decision,
+        set_status(rdir, state="dry-run", scope=scope)
+        print(json.dumps({"id": rid, "dry_run": True, "decision": decision, "scope": scope,
                           **routing_fields}, indent=2, ensure_ascii=False))
         return
     queued_at = (jload(f"{rdir}/status.json", {}) or {}).get("queued_at", NOW())
@@ -5100,10 +5125,11 @@ def cmd_run(args, policy):
         set_status(rdir, state="budget_rejected")
         budget_error(error)
     if args.detach and not args.run_id:
-        set_status(rdir, id=rid, state="queued", title=title, profile=prof, started=NOW(),
+        set_status(rdir, id=rid, state="queued", title=title, profile=prof, started=NOW(), scope=scope,
                    budget_minutes=budget_min, cwd=os.path.abspath(args.cwd))
         child = [sys.executable, os.path.realpath(__file__), "run", "--run-id", rid,
-                 "--cwd", os.path.abspath(args.cwd), "--title", title, "--budget-minutes", str(budget_min)]
+                 "--cwd", os.path.abspath(args.cwd), "--title", title, "--budget-minutes", str(budget_min),
+                 "--scope", scope]
         for flag in ("type", "difficulty", "context_tokens", "backend", "model", "effort"):
             v = getattr(args, flag, None)
             if v:
@@ -5132,7 +5158,7 @@ def cmd_run(args, policy):
         print(json.dumps({"id": rid, "state": "started", "runner_pid": p.pid, "run_dir": rdir,
                           "watch": f"openswarm watch {rid}", "result": f"{rdir}/result.json"}, indent=2))
         return
-    set_status(rdir, id=rid, state="routing", title=title, profile=prof, started=NOW(),
+    set_status(rdir, id=rid, state="routing", title=title, profile=prof, started=NOW(), scope=scope,
                budget_minutes=budget_min, runner_pid=os.getpid(), cwd=os.path.abspath(args.cwd))
     ws = prepare_workspace(os.path.abspath(args.cwd), rid, not args.no_worktree or prof["read_only"], getattr(args, "base", None))
     if prof["read_only"] and ws["mode"] != "worktree":
@@ -5152,7 +5178,7 @@ def cmd_run(args, policy):
                    "worktree": ws.get("root") if args.keep_worktree else None, "merge_hint": None}
             if not args.keep_worktree:
                 cleanup_worktree(ws, None)
-            out = {"id": rid, "status": "failed", "error_class": "prepare_failed", "title": title,
+            out = {"id": rid, "status": "failed", "error_class": "prepare_failed", "title": title, "scope": scope,
                    "prepare": prepare, "workspace_note": note, "backend": decision["backend"],
                    "model": decision["model"], "effort": decision.get("effort"), "usage": None,
                    "seconds": prepared["seconds"], "result": None,
@@ -5175,7 +5201,7 @@ def cmd_run(args, policy):
         if rewritten != args.verify:
             set_status(rdir, verify_note="verify paths rewritten from base repo to worktree")
             args.verify = rewritten
-    prompt = PROMPT_TMPL.format(wd=ws["path"], task=task)
+    prompt = execution_prompt(ws["path"], task, scope)
     if args.verify:
         prompt += (f"\nAfter you finish, the planner runs this acceptance command on the host, outside your sandbox: "
                    f"`{args.verify}`. If your sandbox blocks running it (ports, network, missing deps), say so in "
@@ -5300,7 +5326,7 @@ def cmd_run(args, policy):
     out = {
         "id": rid, "status": status, "error_class": "budget_exceeded_daily" if budget_denial else "prepare_failed" if prepare_error else attempts[-1]["error_class"],
         **({"budget_error": budget_denial, "error": "budget_exceeded_daily"} if budget_denial else {}),
-        "title": title, "prepare": prepare, "workspace_note": note, "verify": verify, "verify_note": verify_note,
+        "title": title, "scope": scope, "prepare": prepare, "workspace_note": note, "verify": verify, "verify_note": verify_note,
         "backend": decision["backend"], "model": decision["model"], "effort": decision.get("effort"),
         "usage": usage, "seconds": wall_seconds,
         "queued_seconds": (jload(f"{rdir}/status.json", {}) or {}).get("queued_seconds", 0),
@@ -7256,7 +7282,8 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                         with open(os.path.join(rdir, "task.md"), "w") as f:
                             f.write(task)
                         spec = {k: req.get(k) for k in ("title", "verify", "verify_baseline", "budget_minutes", "base",
-                                                        "card_type", "rework_of", "paths", "regress_label", "read_only")}
+                                                        "card_type", "rework_of", "paths", "regress_label", "read_only", "scope")}
+                        spec["scope"] = spec.get("scope") or "repo"
                         spec["budget_minutes"] = budget
                         provider = execution_provider(lane["backend"], policy=load_policy(), lane=lane)
                         spec.update({"run_id": rid, "task": task, "started": NOW(), "provider": provider})
@@ -7269,7 +7296,7 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                         set_status(rdir, id=rid, state="queued", title=spec.get("title") or task.strip().splitlines()[0][:72],
                                    backend=lane["backend"], model=lane["model"], effort=lane.get("effort"), lane=lane["name"],
                                    provider=provider, concurrency_keys=concurrency_keys(lane["backend"], provider),
-                                   started=spec["started"], budget_minutes=spec.get("budget_minutes"),
+                                   started=spec["started"], budget_minutes=spec.get("budget_minutes"), scope=spec["scope"],
                                    cwd=lane["repo"], runner_pid=os.getpid(), events=spec["_event_file"])
                         answer = {"ok": True, "id": rid, "state": "queued"}
             elif op in ("steer", "abort", "down"):
@@ -7654,8 +7681,11 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                 error_class, detail = lane_failure("resident executor stdout closed")
                 return None, usage, error_class, 1, event_file, detail
             return None, usage, "risk_blocked" if spec.get("risk_blocks") else "exec_error", 1, event_file, "resident executor stdout closed"
-        block = enforced_risk(msg, risk_policy, ws["path"])
+        block = enforced_risk(msg, risk_policy, ws["path"], scope=spec.get("scope", "repo"))
         if block:
+            if block.get("enforced") is False:
+                lane_record_event(event_file, {"type": "risk_warning", **block})
+                continue
             spec.setdefault("risk_blocks", []).append(block)
             spec["abort_requested"] = True
             set_status(rdir, risk_blocks=spec["risk_blocks"])
@@ -7905,6 +7935,7 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
         lane_git(["checkout", "--detach", detach_at], ws["root"])
     out = {"id": rid, "status": status, "error_class": error_class, "title": title, "lane": lane["name"],
            "prepare": ws.get("prepare", []), "workspace_note": ws.get("workspace_note"), "verify": verify,
+           "scope": spec.get("scope", "repo"),
            "verify_note": verify_note, "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
            **({"resolved_model": model} if lane["backend"] in ("cursor", "copilot") else {}),
            "risk_blocks": spec.get("risk_blocks", []), "review_changes_discarded": bool(read_only and changed),
@@ -7933,7 +7964,8 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
                    **({"regress_label": spec["regress_label"]} if spec.get("regress_label") else {}),
                    "lessons_injected": spec.get("lessons_injected", []),
                    "patterns_injected": spec.get("patterns_injected", [])})
-    set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"])
+    set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"],
+               scope=spec.get("scope", "repo"))
     cleanup_executor_tmp(ws.get("root") or ws["path"])
     return out
 
@@ -7971,7 +8003,7 @@ def lane_do_run(lane, spec, child, server, current):
                 spec["verify"] = rewritten
                 set_status(rdir, verify_note="verify paths rewritten from base repo to lane worktree")
         task = spec["task"]
-        prompt = PROMPT_TMPL.format(wd=ws["path"], task=task)
+        prompt = execution_prompt(ws["path"], task, spec.get("scope", "repo"))
         if spec.get("verify"):
             prompt += (f"\nAfter you finish, the planner runs this acceptance command on the host, outside your sandbox: "
                        f"`{spec['verify']}`. If your sandbox blocks running it (ports, network, missing deps), say so in "
@@ -8426,7 +8458,8 @@ def cmd_lane_assign(args):
                                          "card_type": getattr(args, "card_type", None),
                                          "rework_of": getattr(args, "rework_of", None),
                                          "paths": getattr(args, "paths", None) or [],
-                                         "read_only": getattr(args, "read_only", False)})
+                                         "read_only": getattr(args, "read_only", False),
+                                         "scope": getattr(args, "scope", "repo")})
     if response.get("ok"):
         response.update({"lane": lane["name"], "watch": f"openswarm watch {rid}",
                          "result": os.path.join(RUNS, rid, "result.json")})
@@ -9376,7 +9409,8 @@ def batch_launch(spec, row):
               "stream = os.fdopen(fd, 'wb'); stream.write(sys.stdin.buffer.read()); stream.close(); print(path)")
     path = host_require(host, host_python(host, source, input=card), "card copy").decode().strip()
     try:
-        args = ["run", "--detach", "--cwd", spec["repos"][row["host"]], "--task-file", path, "--base", spec["base"]]
+        args = ["run", "--detach", "--cwd", spec["repos"][row["host"]], "--task-file", path, "--base", spec["base"],
+                "--scope", spec.get("scope", "repo")]
         for key in ("backend", "model", "effort", "verify", "budget_minutes", "card_type", "rework_of"):
             if spec.get(key) is not None:
                 args += ["--" + key.replace("_", "-"), str(spec[key])]
@@ -9575,9 +9609,11 @@ def cmd_batch(args, policy):
             "concurrency": concurrency_caps, "model": args.model, "effort": args.effort,
             "card_type": getattr(args, "card_type", None), "rework_of": getattr(args, "rework_of", None),
             "paths": getattr(args, "paths", None) or [],
-            "verify": args.verify, "budget_minutes": args.budget_minutes or round(policy["run"]["timeout_seconds"] / 60),
+            "verify": args.verify, "scope": getattr(args, "scope", "repo"),
+            "budget_minutes": args.budget_minutes or round(policy["run"]["timeout_seconds"] / 60),
             "poll_seconds": args.poll_seconds}
-    summary = {"id": bid, "repo": args.repo, "base": base, "state": "queued", "started": NOW(), "cards": [
+    summary = {"id": bid, "repo": args.repo, "base": base, "scope": getattr(args, "scope", "repo"),
+               "state": "queued", "started": NOW(), "cards": [
         {"card": os.path.basename(path), "path": path, "host": names[i % len(names)], "state": "queued", "status": "queued",
          "verify_rc": None, "branch": None, "commit": None, "seconds": None, "summary": ""} for i, path in enumerate(paths)]}
     directory = os.path.join(DATA, "batches", bid)
@@ -9911,6 +9947,9 @@ def cmd_watch(args, policy):
                     out("RATELIMIT", f"retry {o.get('retry')}/{o.get('max_retries')} after {o.get('wait_seconds')}s")
                     seen_rate_limits.add(key)
                 continue
+            if o.get("type") == "risk_warning":
+                out(f"RISK[{o.get('risk')}]", short(o.get("command"), 220) + " (warning; host scope)")
+                continue
             for kind, text in messages.feed(o):
                 if kind == "msg":
                     last_msg = text
@@ -9950,7 +9989,7 @@ def cmd_watch(args, policy):
                             out("RATELIMIT", f"retry {event.get('retry')}/{event.get('max_retries')} after {event.get('wait_seconds')}s")
                             seen_rate_limits.add(key)
             r = jload(f"{rdir}/result.json", {}) or {}
-            out("DONE", f"status={r.get('status')} backend={r.get('backend')}/{r.get('model')} "
+            out("DONE", f"scope={r.get('scope', st.get('scope', 'repo'))} status={r.get('status')} backend={r.get('backend')}/{r.get('model')} "
                         f"commit={(r.get('commit') or '-')[:10]} files={len((r.get('result') or {}).get('files_changed') or [])} "
                         f"summary={short((r.get('result') or {}).get('summary'), 240)}")
             return
@@ -9972,7 +10011,7 @@ def cmd_watch(args, policy):
             last_evt = now
         if now - last_beat > args.heartbeat_minutes * 60:
             el = int((now - st.get("started", now)) / 60)
-            out("HEARTBEAT", f"{st.get('state')} {st.get('backend')}/{st.get('model')} {el}m/{st.get('budget_minutes')}m "
+            out("HEARTBEAT", f"scope={st.get('scope', 'repo')} {st.get('state')} {st.get('backend')}/{st.get('model')} {el}m/{st.get('budget_minutes')}m "
                              f"cmds={cmds} files={watch_diffstat(st)} last: {short(last_msg, 200)}")
             last_beat = now
         if args.max_minutes and now - t_start > args.max_minutes * 60:
@@ -10007,6 +10046,7 @@ def run_digest(rid):
                         last = text
     end = st.get("finished") or now
     out = {"id": rid, "state": state, "status": st.get("status") or r.get("status"), "title": st.get("title"),
+           "scope": st.get("scope", r.get("scope", "repo")),
            "backend": st.get("backend"), "model": st.get("model"), "effort": st.get("effort"),
            "provider": st.get("provider"), "concurrency_keys": st.get("concurrency_keys") or [],
            "elapsed_min": round((end - st.get("started", end)) / 60, 1), "budget_min": st.get("budget_minutes"),
@@ -11439,6 +11479,7 @@ def main():
                            card_type_help="optional task card type from knowledge/card-types.yaml",
                            rework_of_help="run id this task is reworking")
     sp.add_argument("--cwd", default=os.getcwd())
+    sp.add_argument("--scope", choices=("repo", "host"), default="repo", help="task scope (repo by default; host for authorized host operations)")
     sp.add_argument("--base", help="base commit for an isolated worktree; defaults to HEAD")
     sp.add_argument("--no-worktree", action="store_true")
     add_dispatch_arguments(sp, "verify-baseline", "verify",
@@ -11567,6 +11608,7 @@ def main():
     add_dispatch_arguments(sp, "backend", "model", "effort", "verify", "budget",
                            backend_choices=list(PLANNERS), budget_type=int)
     sp.add_argument("--base")
+    sp.add_argument("--scope", choices=("repo", "host"), default="repo", help="task scope (repo by default; host for authorized host operations)")
     sp.add_argument("--detach", action="store_true")
     add_dispatch_arguments(sp, "card-type", "rework-of", "paths",
                            card_type_help="optional task card type from knowledge/card-types.yaml",
@@ -11613,6 +11655,7 @@ def main():
     add_dispatch_arguments(lp, "task-source", "title", "verify", "verify-baseline", "budget",
                            task_source_required=True)
     lp.add_argument("--base")
+    lp.add_argument("--scope", choices=("repo", "host"), default="repo", help="task scope (repo by default; host for authorized host operations)")
     add_dispatch_arguments(lp, "card-type", "rework-of", "paths", "read-only",
                            card_type_help="optional task card type from knowledge/card-types.yaml",
                            rework_of_help="run id this task is reworking")

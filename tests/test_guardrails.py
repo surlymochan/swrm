@@ -58,6 +58,23 @@ class GuardrailsTests(unittest.TestCase):
             xs.check_budget(self.policy, [("codex", 6)])
         self.assertEqual(e.exception.detail["scope"], "per_run")
 
+    def test_host_scope_prompt_and_risk_softening(self):
+        repo_prompt = xs.execution_prompt("/tmp/wt", "task")
+        self.assertIn("Work only inside the current directory (/tmp/wt)", repo_prompt)
+        host_prompt = xs.execution_prompt("/tmp/wt", "task", "host")
+        self.assertIn("This is a host operations task", host_prompt)
+        self.assertIn("Keep repository changes inside the worktree", host_prompt)
+        self.assertNotIn("Work only inside the current directory", host_prompt)
+
+        sudo_event = {"type": "tool_use", "part": {"tool": "bash", "state": {
+            "input": {"command": "sudo launchctl kickstart system/example"}}}}
+        host_finding = xs.enforced_risk(sudo_event, {}, "/tmp/wt", scope="host")
+        self.assertEqual(host_finding["risk"], "sudo")
+        self.assertFalse(host_finding["enforced"])
+        repo_finding = xs.enforced_risk(sudo_event, {}, "/tmp/wt")
+        self.assertEqual(repo_finding["risk"], "sudo")
+        self.assertNotIn("enforced", repo_finding)
+
     def test_budget_reserves_concurrent_admissions_and_releases_finished(self):
         import os
         xs.admit_budget(self.policy, "pi", 5, str(self.root / "runs" / "first"),

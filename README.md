@@ -713,6 +713,13 @@ and `risk_blocks` with redacted commands. An empty list disables enforcement.
 This is event-based containment: backends that emit commands after execution cannot
 prevent the command's initial side effects. Executor sandbox restrictions still matter.
 
+Use `--scope host` for explicitly authorized host operations with `run`, `lane assign`, or `batch`.
+The default `--scope repo` keeps the executor inside its worktree. Host scope allows task-card-listed
+paths outside the worktree and remote-host operations; repository edits still stay in the worktree
+and are committed by swrm. `rm outside worktree` and `sudo` are recorded as RISK warnings in host
+scope; push, publish, and secret-print enforcement remains active. `status.json`, `result.json`,
+`report`, and `watch` include the selected scope. `fleet exec` passes `--scope` through to `run`.
+
 `openswarm report --daily --date YYYY-MM-DD --html report.html --json` writes one
 self-contained HTML page with light/dark styling and emits the same day's JSON.
 Omit `--date` for today in the policy timezone. Reports read local ledger data without
