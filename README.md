@@ -187,10 +187,13 @@ openswarm stop <id>                  # kill the executor; partial work is still 
 Pi messages appear once at `message_end`; Cursor chunks are merged until a prompt turn ends or a tool call starts.
 With `--wake`, a cursor records event offsets and reported terminal states, so re-arming `--all` advances
 past completed runs. Watchers sharing a consumer or cursor file serialize under an exclusive lock.
-Progress is saved atomically before printing: a checkpoint failure produces no alert, while interruption
-between checkpoint and output can lose that alert (there is no output acknowledgement protocol).
+Each wake line includes a stable `id=<sha256>` for consumer deduplication. Progress is saved atomically
+only after stdout has been written and flushed (at-least-once delivery). Output failure leaves the event
+pending; interruption or checkpoint failure after flushing can replay the same ID on restart.
 `--from-end` skips existing bytes only for files without a saved cursor; saved progress takes precedence.
-Replaced or truncated event files restart at byte zero, including truncation followed by regrowth.
+Replaced or detected truncated event files restart at byte zero with a new generation ID. Size, a cursor
+anchor and nanosecond mtime detect truncation, including identical same-size rewrites; metadata changes
+without growth conservatively replay. Ordinary appends and renamed files retain their progress.
 Codex events keep their existing behavior. `--quiet` keeps only `DONE`, `EXITED`, `RISK`, `STALL`, `ERROR`,
 `BUDGET`, `ATTEMPT`, and `HEARTBEAT`. Heartbeats include elapsed time, command count, the worktree's git diff
 summary (including lane worktrees), and the last completed message truncated to 200 characters. The watch window

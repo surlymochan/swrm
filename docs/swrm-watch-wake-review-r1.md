@@ -1,5 +1,8 @@
 # swrm-watch-wake 第一轮修复证据
 
+第一轮历史记录；其中“先持久化再输出”的实现已被第二轮撤销。当前语义与验证见
+[第二轮修复证据](swrm-watch-wake-review-r2.md)。
+
 所有测试的临时数据均在当前 worktree 内；不提交、不推送、不切换分支。
 
 ## 复现与验证命令
@@ -45,12 +48,12 @@ git diff --check
 | BLOCKER：kqueue 忙等 | `kqueue.control` 的 `max_events` 改为 1 | `test_real_kqueue_existing_file_waits_without_busy_spin` 在 macOS 对真实存在文件连续等待 4 次，断言墙钟至少 3.6 秒且进程 CPU 小于 0.2 秒；本次在 Darwin 实际运行，未跳过 |
 | MAJOR：DONE 不持久化、饿死其他 run | 游标保存已报告状态；重启跳过已报告 DONE 并继续扫描 | `test_all_checkpoints_done_and_reaches_other_run_on_restart`：第一次 DONE、第二次另一 run 的 ERROR、第三次进入等待，无重复输出 |
 | MAJOR：同 inode 截断漏报 | 同时检查文件大小与游标前 64 字节的 SHA-256 | `test_same_inode_truncation_and_regrowth`：确认 inode 不变，分别覆盖缩短和截断后增长超过旧 offset |
-| MAJOR：并发、固定临时文件、先打印后保存 | 在加载游标前获取独占锁并持有到返回；唯一临时文件、fsync、原子替换；先持久化再输出，保存失败抛错 | `test_concurrent_cli_watchers_share_consumer_without_duplicate_or_lost_offset`：两个真实 CLI 进程消费同一 consumer，各输出一个不同事件且最终 offset 等于文件大小；`test_checkpoint_failure_emits_nothing_and_cleans_temp` 注入保存失败；`test_interruption_at_output_does_not_replay_checkpointed_event` 注入输出时中断 |
+| MAJOR：并发、固定临时文件、投递顺序 | 独占锁、唯一临时文件、fsync、原子替换保留；先持久化再输出会漏报，已于第二轮改为 stdout flush 后提交 | 并发测试保留；原先要求中断后不重放的两项测试已改为验证 at-least-once 与稳定事件 ID，见第二轮证据 |
 | MAJOR：忽略规范化 error | 处理 `summarize_event` 的 `error` 返回值 | `test_normalized_backend_errors_are_not_consumed_silently` 顺序验证 JSON-RPC `turn/failed`、`error`、agy ERROR 和 INVALID，全部逐次唤醒 |
 | MINOR：`--from-end` 与覆盖不足 | 未建游标的文件从末尾开始，已有游标优先；文件身份跨路径保持进度，兼容旧路径游标 | `test_from_end_skips_history_but_preserves_saved_progress`；`test_rotation_and_incomplete_line` 验证改名轮转且等待半行补全；`test_legacy_path_cursor_migrates_before_file_is_renamed` 验证旧格式迁移后轮转不重放；其余测试覆盖 `--all`、并发和真实 kqueue |
 
-## 投递边界
+## 投递边界（第二轮修正）
 
-持久化先于输出，可防止保存失败或输出中断后重复消费。stdout 没有接收方确认协议，
-因此在保存完成、打印发生之前被终止，仍可能丢失该条输出；这不是 exactly-once 投递。
+先写 stdout 并 flush，成功后才提交对应事件偏移或状态通知。输出失败保持待投递；
+flush 后、提交前中断会重放相同 ID，由消费方去重。保存失败抛错，也允许重放。
 共享同一 consumer 的第二个 watcher 会等待第一个退出后才加载最新游标。

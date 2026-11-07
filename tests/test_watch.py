@@ -4,6 +4,8 @@ import io
 import json
 import os
 import pathlib
+import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -51,6 +53,9 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(messages.feed({"type": "result", "result": "first second"}), [("msg", "first second")])
         self.assertEqual(messages.feed({"type": "item.completed", "item": {
             "type": "agent_message", "text": "codex"}}), [("msg", "codex")])
+        self.assertEqual(messages.feed({"type": "tool_call", "command": "git push"}), [("cmd", "git push")])
+        self.assertEqual(messages.feed({"type": "tool_call", "tool_call": {"command": "sudo test"}}),
+                         [("cmd", "sudo test")])
 
     def test_quiet_keeps_alerts_and_heartbeat_has_lane_diff_and_last_message(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,22 +237,157 @@ class WakeRegressionTests(unittest.TestCase):
         saved = json.loads(self.cursor.read_text())
         self.assertEqual(next(iter(saved["files"].values()))["offset"], path.stat().st_size)
 
-    def test_checkpoint_failure_emits_nothing_and_cleans_temp(self):
+    def event_id(self, output):
+        found = re.search(r"\bid=([0-9a-f]{64})\b", output)
+        self.assertIsNotNone(found, output)
+        return found.group(1)
+
+    def test_checkpoint_failure_replays_flushed_event_with_same_id_and_cleans_temp(self):
         self.run_fixture(events=[{"type": "error", "error": "retry"}])
         output = io.StringIO()
         with mock.patch.object(xs.os, "replace", side_effect=OSError("disk failure")), \
                 contextlib.redirect_stdout(output), self.assertRaisesRegex(RuntimeError, "cannot save watch cursor"):
             xs.cmd_watch_wake(self.args)
-        self.assertEqual(output.getvalue(), "")
+        self.assertIn("ERROR: retry", output.getvalue())
         self.assertEqual(list(self.root.glob(".watch-cursor-*")), [])
-        self.assertIn("retry", self.wake())
+        self.assertEqual(self.event_id(output.getvalue()), self.event_id(self.wake()))
 
-    def test_interruption_at_output_does_not_replay_checkpointed_event(self):
+    def test_interruption_at_output_replays_uncommitted_event(self):
         self.run_fixture(events=[{"type": "error", "error": "first"},
                                  {"type": "error", "error": "second"}])
         with mock.patch("builtins.print", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
             xs.cmd_watch_wake(self.args)
+        self.assertIn("ERROR: first", self.wake())
         self.assertIn("ERROR: second", self.wake())
+
+    def test_identical_event_lines_have_distinct_ids_at_distinct_offsets(self):
+        self.run_fixture(events=[{"type": "error", "error": "same"}] * 2)
+        self.assertNotEqual(self.event_id(self.wake()), self.event_id(self.wake()))
+
+    def test_state_alerts_replay_after_output_interruption_with_same_id(self):
+        for kind, state in (("DONE", {"state": "finished"}),
+                            ("EXITED", {"runner_pid": 12345}),
+                            ("BUDGET", {"deadline": 900, "budget_minutes": 1}),
+                            ("STALL", {})):
+            with self.subTest(kind=kind):
+                self.cursor.unlink(missing_ok=True)
+                path = self.run_fixture()
+                xs.jsave(str(path.parent / "status.json"), {"state": "running", "events": str(path), **state})
+                self.args.stall_minutes = 1
+                with mock.patch.object(xs, "NOW", side_effect=[1000, 1061, 1000, 1061]), \
+                        mock.patch.object(xs, "pid_alive", return_value=False), \
+                        mock.patch.object(xs, "watch_wait_for_change"):
+                    with mock.patch("builtins.print", side_effect=KeyboardInterrupt) as interrupted:
+                        with self.assertRaises(KeyboardInterrupt):
+                            xs.cmd_watch_wake(self.args)
+                    replay = self.wake()
+                self.assertIn(kind + ":", replay)
+                self.assertEqual(self.event_id(interrupted.call_args.args[0]), self.event_id(replay))
+
+    def test_failed_stdout_flush_does_not_checkpoint(self):
+        self.run_fixture(events=[{"type": "error", "error": "flush failed"}])
+        class BrokenOutput(io.StringIO):
+            def flush(self):
+                raise OSError("broken pipe")
+        with contextlib.redirect_stdout(BrokenOutput()), self.assertRaisesRegex(RuntimeError, "stdout"):
+            xs.cmd_watch_wake(self.args)
+        self.assertIn("ERROR: flush failed", self.wake())
+
+    def test_same_content_truncation_has_new_generation_but_retry_id_is_stable(self):
+        path = self.run_fixture(events=[{"type": "error", "error": "same"}])
+        first = self.wake()
+        before = path.stat()
+        path.write_bytes(path.read_bytes())
+        os.utime(path, ns=(before.st_atime_ns, max(path.stat().st_mtime_ns, before.st_mtime_ns + 1)))
+        self.assertEqual(path.stat().st_ino, before.st_ino)
+        with mock.patch.object(xs, "watch_wait_for_change", side_effect=AssertionError("missed rewrite")), \
+                mock.patch("builtins.print", side_effect=KeyboardInterrupt) as interrupted:
+            with self.assertRaises(KeyboardInterrupt):
+                xs.cmd_watch_wake(self.args)
+        retry = self.wake()
+        self.assertNotEqual(self.event_id(first), self.event_id(retry))
+        self.assertEqual(self.event_id(interrupted.call_args.args[0]), self.event_id(retry))
+
+    def test_legacy_cursor_is_upgraded_even_without_new_events(self):
+        path = self.run_fixture(events=[{"type": "error", "error": "legacy"}])
+        self.wake()
+        saved = json.loads(self.cursor.read_text())
+        for entry in saved["files"].values():
+            for key in ("size", "mtime_ns", "generation"):
+                entry.pop(key)
+        self.cursor.write_text(json.dumps(saved))
+        with mock.patch.object(xs, "watch_wait_for_change", side_effect=InterruptedError("idle")):
+            with self.assertRaises(InterruptedError):
+                self.wake()
+        upgraded = next(iter(json.loads(self.cursor.read_text())["files"].values()))
+        self.assertEqual(upgraded["size"], path.stat().st_size)
+        path.write_bytes(path.read_bytes())
+        os.utime(path, ns=(path.stat().st_atime_ns, upgraded["mtime_ns"] + 1))
+        with mock.patch.object(xs, "watch_wait_for_change", side_effect=AssertionError("missed rewrite")):
+            self.assertIn("ERROR: legacy", self.wake())
+
+    def test_cursor_one_shot_tool_calls_wake_for_risk(self):
+        self.run_fixture(events=[{"type": "tool_call", "command": "git push origin HEAD"},
+                                 {"type": "tool_call", "tool_call": {"command": "sudo dangerous"}},
+                                 {"type": "tool_call", "command": "custom-danger"}])
+        self.args.risk = ["custom-danger"]
+        with mock.patch.object(xs, "watch_wait_for_change", side_effect=AssertionError("missed tool call")):
+            self.assertIn("RISK[git destructive/push]: git push", self.wake())
+            self.assertIn("RISK[system service / sudo]: sudo", self.wake())
+            self.assertIn("RISK[custom]: custom-danger", self.wake())
+
+    @unittest.skipUnless(hasattr(signal, "SIGKILL"), "requires SIGKILL")
+    def test_cli_sigkill_at_delivery_boundaries_never_loses_event_or_done(self):
+        script = '''
+import builtins, os, runpy, signal, sys
+module = runpy.run_path(sys.argv[1], run_name="watch_crash")
+mode, cursor = sys.argv[2:4]
+sys.argv = [sys.argv[1], "watch", "r1", "--wake", "--cursor-file", cursor, "--stall-minutes", "0"]
+original_print, original_replace = builtins.print, os.replace
+def kill():
+    os.kill(os.getpid(), signal.SIGKILL)
+def print_alert(*args, **kwargs):
+    if mode == "before-print":
+        kill()
+    original_print(*args, **kwargs)
+    if mode == "after-flush":
+        kill()
+def replace(*args):
+    if mode == "before-save":
+        kill()
+    original_replace(*args)
+    if mode == "after-save":
+        kill()
+builtins.print, os.replace = print_alert, replace
+module["main"]()
+'''
+        for terminal in (False, True):
+            for mode in ("before-print", "after-flush", "before-save", "after-save"):
+                with self.subTest(terminal=terminal, mode=mode):
+                    self.cursor.unlink(missing_ok=True)
+                    self.run_fixture(events=[] if terminal else [
+                        {"type": "error", "error": "first"}, {"type": "error", "error": "second"}],
+                        state="finished" if terminal else "running")
+                    crashed = subprocess.run([sys.executable, "-c", script, xs.__file__, mode, str(self.cursor)],
+                                             env={**os.environ, "OPENSWARM_HOME": str(self.root)},
+                                             capture_output=True, text=True, timeout=8)
+                    self.assertEqual(crashed.returncode, -signal.SIGKILL, crashed.stderr)
+                    if mode == "after-save":
+                        self.assertTrue(crashed.stdout)
+                        if terminal:
+                            with mock.patch.object(xs, "watch_wait_for_change", side_effect=InterruptedError("idle")):
+                                with self.assertRaises(InterruptedError):
+                                    self.wake()
+                        else:
+                            self.assertIn("ERROR: second", self.wake())
+                    else:
+                        with mock.patch.object(xs, "watch_wait_for_change", side_effect=AssertionError("lost alert")):
+                            replay = self.wake()
+                        self.assertIn("DONE:" if terminal else "ERROR: first", replay)
+                        if mode == "before-print":
+                            self.assertEqual(crashed.stdout, "")
+                        else:
+                            self.assertEqual(self.event_id(crashed.stdout), self.event_id(replay))
 
     def test_from_end_skips_history_but_preserves_saved_progress(self):
         path = self.run_fixture(events=[{"type": "error", "error": "history"}])
