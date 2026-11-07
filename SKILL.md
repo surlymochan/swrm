@@ -189,7 +189,9 @@ Use `--scope host` for task-card-authorized host maintenance with `run`, `lane a
 The default `--scope repo` keeps the existing worktree-only prompt. Host scope permits listed
 outside-worktree paths and remote-host operations while keeping repository edits in the worktree
 for swrm to commit. `rm outside worktree` and `sudo` become recorded RISK warnings; push, publish,
-and secret-print enforcement still stops the run. `fleet exec` forwards this option to `run`.
+and secret-print enforcement still stops the run, including later fragments of the same command
+(e.g. `sudo true; cat .env`). Compact reports and daily HTML/JSON task rows include scope
+(legacy entries default to `repo`). `fleet exec` forwards this option to `run`.
 
 A finished run gives you `status`, `result` (`summary`, `files_changed`, `tests`, `followups`), `branch` (`openswarm/<id>`), `commit`, `diffstat`, `patch`, and `attempts` (backend, model, effort, seconds, error class, quota before and after).
 - The executor worked in `~/.claude/openswarm/worktrees/...` based on `HEAD`. **Uncommitted changes in the main tree are not visible to it**, and `workspace.note` warns about this. Commit or stash before dispatching.

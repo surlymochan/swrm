@@ -4148,6 +4148,8 @@ def enforced_risk(event, policy, worktree, scope="repo"):
     operations = {"push": {"git"}, "publish": {"npm", "pnpm", "yarn", "twine", "gh"},
                   "secret print": {"cat", "less", "more", "head", "tail", "bat", "printenv", "echo", "printf"},
                   "sudo": {"sudo"}}
+    # Defer host warnings until every command has been checked for enforced risks.
+    warning = None
     for command in event_commands(event):
         for words, _ in shell_invocations(command, worktree):
             op = os.path.basename(words[0])
@@ -4157,6 +4159,8 @@ def enforced_risk(event, policy, worktree, scope="repo"):
                     finding = {"risk": name, "command": redact_command(command)}
                     if scope == "host" and name in ("rm outside worktree", "sudo"):
                         finding["enforced"] = False
+                        warning = warning or finding
+                        continue
                     return finding
         if "rm outside worktree" in enabled:
             path_class = rm_outside_worktree_class(command, worktree)
@@ -4165,8 +4169,10 @@ def enforced_risk(event, policy, worktree, scope="repo"):
                            "command": redact_command(command)}
                 if scope == "host":
                     finding["enforced"] = False
+                    warning = warning or finding
+                    continue
                 return finding
-    return None
+    return warning
 
 
 def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
@@ -10208,6 +10214,7 @@ def daily_report(policy, date=None):
             saved = jload(os.path.join(RUNS, rid, "result.json"), {}) or {}
             summary = (saved.get("result") or {}).get("summary") or saved.get("summary")
         rows.append({"id": rid, "backend": entry.get("backend"), "lane": lane, "status": entry.get("status"),
+                     "scope": entry.get("scope", "repo"),
                      "executor_minutes": seconds / 60, "summary": short(summary or entry.get("title"), 220)})
     return {"date": day, "timezone": timezone, "totals": totals, "per_backend": per_backend, "per_lane": per_lane,
             "budget": budget_status(policy, day, entries), "risks": risks,
@@ -10232,8 +10239,8 @@ def daily_report_html(report):
             ["Name", "Runs", "Done", "Partial", "Failed", "Stopped", "Executor min", "Tokens", "Risk blocks"], rows) + "</section>"
 
     def runs(title, rows):
-        return f"<section><h2>{title}</h2>" + table(["Run", "Backend", "Lane", "Status", "Executor min", "Summary"],
-               [[r["id"], r["backend"], r["lane"], r["status"], f"{r['executor_minutes']:.2f}", r["summary"]] for r in rows]) + "</section>"
+        return f"<section><h2>{title}</h2>" + table(["Run", "Backend", "Lane", "Scope", "Status", "Executor min", "Summary"],
+               [[r["id"], r["backend"], r["lane"], r.get("scope", "repo"), r["status"], f"{r['executor_minutes']:.2f}", r["summary"]] for r in rows]) + "</section>"
 
     budget = report["budget"]
     cap = lambda value: "unlimited" if value is None else f"{value:g}"
@@ -10321,7 +10328,7 @@ def cmd_report(args, policy):
         if r["state"] == "running" and r["budget_min"] and r["elapsed_min"] > r["budget_min"]:
             warn.append("over budget")
         print(f"  {r['id']} {r['backend']}/{r['model']}"
-              f"{' lane=' + r['lane'] if r.get('lane') else ''} {r['elapsed_min']}m/{r['budget_min']}m cmds={r['cmds']} "
+              f"{' lane=' + r['lane'] if r.get('lane') else ''} scope={r.get('scope', 'repo')} {r['elapsed_min']}m/{r['budget_min']}m cmds={r['cmds']} "
               f"{'⚠ ' + ', '.join(warn) if warn else ''}\n    {r['title']} — {r['last_msg'][:140]}")
     tally = {}
     for r in recent:
@@ -10329,7 +10336,7 @@ def cmd_report(args, policy):
     print(f"finished in last {args.since_minutes}m: {len(recent)} {tally if tally else ''}")
     for r in recent:
         print(f"  {r['status']:<15} {r['backend']}/{r['model']}"
-              f"{' lane=' + r['lane'] if r.get('lane') else ''} {r['elapsed_min']}m  {r['title']}"
+              f"{' lane=' + r['lane'] if r.get('lane') else ''} scope={r.get('scope', 'repo')} {r['elapsed_min']}m  {r['title']}"
               f"{'  commit ' + r['commit'][:10] if r.get('commit') else ''}")
     needs = [r for r in active if r["state"] == "dead" or (r["state"] == "running" and r["budget_min"] and r["elapsed_min"] > r["budget_min"])]
     needs += [r for r in recent if r["status"] not in ("done",)]
