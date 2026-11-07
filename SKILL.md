@@ -80,7 +80,7 @@ Heartbeats show elapsed time, commands, the worktree git diff summary (lanes too
 Quiet watches still expire after their watch window, without printing `WATCH-EXPIRED`.
 
 For a Bash background job that should block indefinitely and wake only when something needs attention, use
-`--wake`. It emits the actionable event and exits with status 0; a named consumer or cursor file resumes at
+`--wake` (equivalently `--max-minutes 0`). It emits the actionable event and exits with status 0; a named consumer or cursor file resumes at
 the next unread byte on the following invocation. `--all` also discovers runs created while it is waiting:
 ```bash
 openswarm watch --all --wake --consumer planner &
@@ -175,7 +175,7 @@ Use `openswarm report --daily [--date YYYY-MM-DD] --html report.html --json` for
 local, self-contained daily report (policy timezone). It includes backend/lane outcomes,
 executor minutes/tokens, budget use, risk blocks, slowest runs and failed summaries.
 
-- Every run has a hard `--budget-minutes`. Every watch has `--max-minutes`. Nothing runs open-ended.
+- Every run has a hard `--budget-minutes`. Default watches expire after `--max-minutes`; `--wake` or `--max-minutes 0` waits indefinitely for an actionable event.
 - For multi-hour batches, check in on a schedule instead of polling. Use **ScheduleWakeup** (inside `/loop`) or a cron-style scheduled task that runs:
   ```bash
   $XS report --since-minutes 60
