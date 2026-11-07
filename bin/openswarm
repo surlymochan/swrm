@@ -9778,6 +9778,8 @@ def summarize_event(o):
     if t == "tool_execution_start":
         args = o.get("args") or {}
         return "cmd", args.get("command") or f"{o.get('toolName', 'tool')}"
+    if t == "tool_call":  # Cursor one-shot stream-json
+        return "cmd", o.get("command") or (o.get("tool_call") or {}).get("command") or o.get("subtype") or "tool"
     if t == "agent_end":
         return "end", ""
     if t in ("extension_error", "auto_retry_end") and o.get("success") is False:
@@ -9832,9 +9834,6 @@ class WatchMessages:
                 return rows
             if tool_id:
                 self.tools.add(tool_id)
-        if event.get("type") == "tool_call":
-            return rows + [("cmd", event.get("command") or event.get("tool_call", {}).get("command")
-                            or event.get("subtype") or "tool")]
         kind, text = summarize_event(event)
         return rows + ([(kind, text)] if kind else [])
 
@@ -9849,9 +9848,256 @@ def watch_diffstat(state):
     return text.strip().splitlines()[-1].strip() if rc == 0 and text.strip() else "0 files changed"
 
 
+def watch_wait_for_change(path):
+    # kqueue provides an event-driven wait on macOS. Other platforms use a
+    # one-second floor so idle watches never spin or repeatedly reread logs.
+    if hasattr(select, "kqueue") and path and os.path.exists(path):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            kq = select.kqueue()
+            try:
+                ev = select.kevent(fd, filter=select.KQ_FILTER_VNODE,
+                                   flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                                   fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_RENAME | select.KQ_NOTE_DELETE)
+                kq.control([ev], 1, 1.0)
+            finally:
+                kq.close()
+        finally:
+            os.close(fd)
+    elif sys.platform.startswith("linux") and path:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        init = getattr(libc, "inotify_init1", None)
+        add = getattr(libc, "inotify_add_watch", None)
+        if init and add:
+            fd = init(os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+            if fd >= 0:
+                try:
+                    mask = 0x00000002 | 0x00000004 | 0x00000008 | 0x00000080 | 0x00000100
+                    if add(fd, os.fsencode(os.path.dirname(path) or "."), mask) >= 0:
+                        select.select([fd], [], [], 1.0)
+                    else:
+                        time.sleep(1.0)
+                finally:
+                    os.close(fd)
+            else:
+                time.sleep(1.0)
+        else:
+            time.sleep(1.0)
+    else:
+        time.sleep(1.0)
+
+
+def cmd_watch_wake(args):
+    """Block on appended run events and return after the first actionable line."""
+    run_ids = list(args.run_id or [])
+    if args.all and run_ids:
+        sys.exit("watch --all cannot be combined with run ids")
+    if not args.all and not run_ids:
+        sys.exit("watch requires run ids or --all")
+    if args.consumer and args.cursor_file:
+        sys.exit("use only one of --consumer and --cursor-file")
+    cursor_path = args.cursor_file
+    if args.consumer:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.consumer) or args.consumer in (".", ".."):
+            sys.exit("invalid consumer name")
+        cursor_path = os.path.join(DATA, "cursors", args.consumer)
+    if cursor_path:
+        cursor_path = os.path.realpath(cursor_path)
+        os.makedirs(os.path.dirname(cursor_path), exist_ok=True)
+        # Hold ownership through load, wait, output and checkpoint. A contender
+        # loads the latest cursor only after the previous watcher has exited.
+        with open(cursor_path + ".lock", "a+b") as lock:
+            _flock(lock, LOCK_EX)
+            return watch_wake_locked(args, run_ids, cursor_path)
+    return watch_wake_locked(args, run_ids, None)
+
+
+def watch_wake_locked(args, run_ids, cursor_path):
+    cursors = {}
+    notifications = {}
+    if cursor_path:
+        try:
+            with open(cursor_path, encoding="utf-8") as f:
+                saved = json.load(f)
+                cursors = saved.get("files", {})
+                notifications = saved.get("notifications", {})
+                if not isinstance(cursors, dict) or not isinstance(notifications, dict):
+                    raise ValueError("invalid cursor maps")
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, AttributeError):
+            sys.exit(f"invalid watch cursor: {cursor_path}")
+    risks = [(re.compile(rx, re.I), name) for rx, name in DEFAULT_RISKS]
+    risks += [(re.compile(rx, re.I), "custom") for rx in (args.risk or [])]
+    last_activity = {}
+
+    def save_cursor():
+        if not cursor_path:
+            return
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(cursor_path),
+                                             prefix=".watch-cursor-", delete=False) as f:
+                tmp = f.name
+                json.dump({"version": 1, "files": cursors, "notifications": notifications}, f, sort_keys=True)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, cursor_path)
+        except OSError as exc:
+            # Do not swallow checkpoint errors in the event-file read handler.
+            raise RuntimeError(f"cannot save watch cursor: {cursor_path}") from exc
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+
+    def event_id(*parts):
+        return hashlib.sha256(json.dumps(parts, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    def emit(rid, kind, text, delivery_id=None):
+        label = args.label or rid[-6:]
+        delivery_id = delivery_id or event_id(rid, kind, text)
+        try:
+            print(f"[{label} {time.strftime('%H:%M')} id={delivery_id}] {kind}: {text}", flush=True)
+        except OSError as exc:
+            # Escape the event-file OSError handler without committing progress.
+            raise RuntimeError("cannot write watch event to stdout") from exc
+        # At-least-once: a crash or checkpoint failure here replays the same id.
+        save_cursor()
+
+    def notify(rid, kind, text):
+        key = f"{rid}:{kind}"
+        if notifications.get(key) == text:
+            return False
+        notifications[key] = text
+        emit(rid, kind, text)
+        return True
+
+    def active_runs():
+        if args.all:
+            return sorted((name for name in os.listdir(RUNS) if os.path.isdir(os.path.join(RUNS, name))), reverse=True) if os.path.isdir(RUNS) else []
+        return run_ids
+
+    def anchor(f, offset):
+        f.seek(max(0, offset - 64))
+        return hashlib.sha256(f.read(min(offset, 64))).hexdigest()
+
+    while True:
+        watch_path = None
+        for rid in active_runs():
+            rdir = os.path.join(RUNS, rid)
+            st = jload(os.path.join(rdir, "status.json"), {}) or {}
+            now = NOW()
+            last_activity.setdefault(rid, now)
+            event_paths = []
+            if st.get("events") and os.path.isfile(st["events"]):
+                event_paths.append(st["events"])
+            event_paths.extend(sorted(glob.glob(os.path.join(rdir, "events.*.jsonl"))))
+            for path in dict.fromkeys(event_paths):
+                watch_path = path
+                try:
+                    with open(path, "rb") as f:
+                        stat = os.fstat(f.fileno())
+                        identity = f"{stat.st_dev}:{stat.st_ino}"
+                        # Follow renamed files without replaying their old lines.
+                        # Path-based v1 cursors remain readable during migration.
+                        key = f"{rid}:inode:{identity}"
+                        saved = cursors.get(key, cursors.get(f"{rid}:{os.path.abspath(path)}", {}))
+                        known = saved.get("identity") == identity
+                        offset = int(saved.get("offset", 0)) if saved.get("identity") == identity else 0
+                        generation = saved.get("generation", identity)
+                        # Equal bytes can still belong to a new copytruncate
+                        # generation. Metadata changes without growth replay
+                        # conservatively; ordinary appends retain the cursor.
+                        rewritten = (known and saved.get("size") is not None
+                                     and stat.st_size <= saved["size"]
+                                     and stat.st_mtime_ns != saved.get("mtime_ns"))
+                        reset = (offset > stat.st_size or rewritten
+                                 or (saved.get("anchor") and anchor(f, offset) != saved["anchor"]))
+                        if reset:
+                            offset = 0
+                            generation = event_id(identity, generation, stat.st_mtime_ns, stat.st_size)
+
+                        def checkpoint(position):
+                            return {"identity": identity, "offset": position, "anchor": anchor(f, position),
+                                    "generation": generation, "size": max(stat.st_size, position),
+                                    "mtime_ns": stat.st_mtime_ns}
+
+                        if reset:
+                            # Persist only the rewind, never an undelivered event.
+                            # This keeps the generation/id stable if output fails.
+                            cursors[key] = checkpoint(0)
+                            save_cursor()
+                        if not known and getattr(args, "from_end", False):
+                            offset = stat.st_size
+                            cursors[key] = checkpoint(offset)
+                            save_cursor()
+                        elif known and (key not in cursors or "size" not in saved):
+                            cursors[key] = checkpoint(offset)
+                            save_cursor()
+                        f.seek(offset)
+                        while True:
+                            raw = f.readline()
+                            if not raw or not raw.endswith(b"\n"):
+                                break
+                            delivery_id = event_id(rid, identity, generation, offset, hashlib.sha256(raw).hexdigest())
+                            offset = f.tell()
+                            cursors[key] = checkpoint(offset)
+                            f.seek(offset)
+                            last_activity[rid] = NOW()
+                            try:
+                                event = json.loads(raw.decode("utf-8", errors="replace"))
+                            except ValueError:
+                                save_cursor()
+                                continue
+                            if not isinstance(event, dict):
+                                save_cursor()
+                                continue
+                            typ = event.get("type")
+                            if typ == "risk_blocked":
+                                emit(rid, "RISK[{}]".format(event.get("risk")), short(event.get("command"), 220) + " (blocked)", delivery_id)
+                                return 0
+                            if ((typ in ("extension_error", "auto_retry_end") and event.get("success") is False)
+                                    or typ in ("error", "turn.failed")):
+                                emit(rid, "ERROR", short(event.get("error") or event, 300), delivery_id)
+                                return 0
+                            kind, text = summarize_event(event)
+                            if kind == "error":
+                                emit(rid, "ERROR", short(text, 300), delivery_id)
+                                return 0
+                            if kind == "cmd":
+                                for rx, name in risks:
+                                    if rx.search(text):
+                                        emit(rid, f"RISK[{name}]", short(text, 220), delivery_id)
+                                        return 0
+                            save_cursor()
+                except OSError:
+                    continue
+            if st.get("state") in ("finished", "unroutable"):
+                result = jload(os.path.join(rdir, "result.json"), {}) or {}
+                if notify(rid, "DONE", f"status={result.get('status') or st.get('state')} backend={result.get('backend') or st.get('backend')}"):
+                    return 0
+                continue
+            if st.get("runner_pid") and not pid_alive(st["runner_pid"]):
+                if notify(rid, "EXITED", f"runner process gone in state={st.get('state')}"):
+                    return 0
+            if st.get("queue_reason") != "provider concurrency limit" and st.get("deadline") and now > st["deadline"] + 90:
+                if notify(rid, "BUDGET", f"past budget ({st.get('budget_minutes')}m) and still {st.get('state')}"):
+                    return 0
+            if getattr(args, "stall_minutes", 10) > 0 and now - last_activity[rid] > getattr(args, "stall_minutes", 10) * 60:
+                if notify(rid, "STALL", f"no events for >{getattr(args, 'stall_minutes', 10):g}m"):
+                    return 0
+        watch_wait_for_change(watch_path)
+
+
 def cmd_watch(args, policy):
     """Stream one line per actionable event for a run; designed to be wrapped by Claude's Monitor tool.
     Exits on run completion, budget expiry, or after --max-minutes (re-arm to keep watching)."""
+    if getattr(args, "wake", False):
+        return cmd_watch_wake(args)
+    if not args.run_id:
+        sys.exit("watch requires at least one run id")
     if len(args.run_id) > 1:  # one Monitor for a whole batch: fan out one child watcher per run
         procs = []
         for rid in args.run_id:
@@ -11496,7 +11742,11 @@ def main():
     rp.add_argument("--fleet", action="store_true", help="read the merged fleet ledger")
 
     sp = sub.add_parser("watch", help="stream actionable events of a run (for Claude's Monitor tool)")
-    sp.add_argument("run_id", nargs="+", help="one or more run ids; several ids are watched together")
+    sp.add_argument("run_id", nargs="*", help="one or more run ids; several ids are watched together")
+    sp.add_argument("--all", action="store_true", help="watch all runs, including runs created later")
+    sp.add_argument("--wake", action="store_true", help="block indefinitely (equivalent to --max-minutes 0); exit on an actionable event")
+    sp.add_argument("--cursor-file", help="persist consumed event offsets in this file")
+    sp.add_argument("--consumer", help="persist offsets under $OPENSWARM_HOME/cursors/NAME")
     sp.add_argument("--label")
     sp.add_argument("--from-end", action="store_true", help="skip events already written (use when re-arming)")
     sp.add_argument("--quiet", action="store_true", help="only terminal, risk, stall, error, budget, attempt and heartbeat events")
