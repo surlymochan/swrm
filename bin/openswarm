@@ -4076,7 +4076,9 @@ def rm_target_path_class(target, cwd, root):
 
 def rm_outside_worktree_class(command, worktree):
     workdir = os.path.realpath(worktree)
-    root = executor_worktree_root(workdir)
+    # Keep the classification root in the same canonical form as shell CWDs.
+    # On macOS tempfile paths can use /var while realpath returns /private/var.
+    root = os.path.realpath(executor_worktree_root(workdir))
     for words, cwd in shell_invocations(command, workdir):
         if os.path.basename(words[0]) != "rm":
             continue

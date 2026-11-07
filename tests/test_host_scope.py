@@ -68,6 +68,12 @@ class HostScopeTests(unittest.TestCase):
                 self.assertTrue(xs.rm_outside_worktree(f"{prefix} bash -lc 'rm local'", str(self.root)))
                 self.assertFalse(xs.rm_outside_worktree(f"{prefix} true; rm local", str(self.root)))
 
+    def test_rm_scope_canonicalizes_symlinked_worktree_root(self):
+        alias = self.root.parent / (self.root.name + "-alias")
+        alias.symlink_to(self.root, target_is_directory=True)
+        with mock.patch.object(xs, "executor_worktree_root", return_value=str(alias)):
+            self.assertFalse(xs.rm_outside_worktree("rm local", str(self.root)))
+
     def test_fake_executor_records_warnings_and_stops_wrapped_enforced_risks(self):
         repo = self.root / "repo"
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
