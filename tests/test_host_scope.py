@@ -108,12 +108,21 @@ class HostScopeTests(unittest.TestCase):
                     complete = {"method": "turn/completed", "params": {"turn": {}}} if backend == "codex" else {
                         "id": "prompt", "result": {"stopReason": "end_turn"}}
                     child = mock.Mock(pid=os.getpid(), lane=lane)
+                    expected = ({"outcome": {"outcome": "selected", "optionId": "once"}} if backend == "cursor"
+                                else {"decision": "approved" if method == "execCommandApproval" else "accept"})
+                    final = {"status": "done", "summary": "fake command completed"}
+                    message = {"method": "item/completed", "params": {
+                        "item": {"type": "agentMessage", "text": json.dumps(final)}}}
                     # A second read must have a reply: otherwise the executor would hang.
                     def read_event(_timeout):
                         if not getattr(read_event, "requested", False):
                             read_event.requested = True
                             return request
                         self.assertTrue(child.send.called, "permission request was skipped after warning")
+                        self.assertEqual(child.send.call_args.args[0]["result"], expected)
+                        if backend == "codex" and not getattr(read_event, "reported", False):
+                            read_event.reported = True
+                            return message
                         return complete
                     child.next_event.side_effect = read_event
                     spec = {"scope": "host", "started": xs.NOW(), "budget_minutes": 1}
@@ -121,15 +130,58 @@ class HostScopeTests(unittest.TestCase):
                             mock.patch.object(xs, "lane_abort_child") as abort:
                         result = xs.lane_run_turn(lane, child, spec, "task", {"path": str(self.root)},
                                                   str(rdir), None, {"cursor_prompt_id": "prompt"}, [])
-                    self.assertEqual(result[2], "no_report")
+                    self.assertEqual(result[2], None if backend == "codex" else "no_report")
+                    if backend == "codex":
+                        self.assertEqual(result[0], final)
+                        self.assertEqual(result[3], 0)
                     abort.assert_not_called()
                     reply = child.send.call_args.args[0]
                     self.assertEqual(reply["id"], "permission")
-                    expected = ({"outcome": {"outcome": "selected", "optionId": "once"}} if backend == "cursor"
-                                else {"decision": "abort" if method == "execCommandApproval" else "decline"})
                     self.assertEqual(reply["result"], expected)
                     events = [json.loads(line) for line in Path(result[4]).read_text().splitlines()]
                     self.assertTrue(any(event.get("type") == "risk_warning" for event in events))
+                    self.assertFalse(any(event.get("type") == "error" for event in events))
+
+    def test_codex_lane_keeps_repo_and_other_host_risk_approvals_denied(self):
+        for method in ("item/commandExecution/requestApproval", "execCommandApproval"):
+            for scope, command, risk in (("repo", "sudo launchctl list", "sudo"),
+                                         ("repo", "rm -rf /outside", "rm outside worktree"),
+                                         ("host", "sudo git push origin main", "push"),
+                                         ("host", "rm -rf /outside; cat .env", "secret print"),
+                                         ("host", "sudo npm publish", "publish"),
+                                         ("host", "echo safe", None)):
+                with self.subTest(method=method, scope=scope, command=command):
+                    rdir = self.root / "runs" / str(len(list((self.root / 'runs').glob('*'))))
+                    rdir.mkdir(parents=True)
+                    lane = {"name": "fake", "backend": "codex", "model": "fake"}
+                    child = mock.Mock(pid=os.getpid(), lane=lane)
+                    child.next_event.side_effect = [
+                        {"id": "permission", "method": method, "params": {"command": command}},
+                        {"method": "turn/completed", "params": {"turn": {}}}]
+                    spec = {"scope": scope, "started": xs.NOW(), "budget_minutes": 1}
+                    with mock.patch.object(xs, "lane_begin_turn"), mock.patch.object(xs, "lane_control_messages"), \
+                            mock.patch.object(xs, "lane_abort_child") as abort:
+                        result = xs.lane_run_turn(lane, child, spec, "task", {"path": str(self.root)},
+                                                  str(rdir), None, {}, [])
+                    self.assertEqual(child.send.call_args.args[0]["result"],
+                                     {"decision": "abort" if method == "execCommandApproval" else "decline"})
+                    self.assertEqual(result[2], "risk_blocked" if risk else "no_report")
+                    if risk:
+                        self.assertEqual(spec["risk_blocks"][0]["risk"], risk)
+                        abort.assert_called()
+                    else:
+                        abort.assert_not_called()
+
+    def test_host_warning_does_not_approve_file_or_permission_requests(self):
+        for method, expected in (("item/fileChange/requestApproval", {"decision": "decline"}),
+                                 ("applyPatchApproval", {"decision": "abort"}),
+                                 ("item/permissions/requestApproval", {"permissions": {}})):
+            with self.subTest(method=method):
+                child = mock.Mock()
+                events = self.root / "events.jsonl"
+                self.assertTrue(xs.lane_approval_response(child, {"id": "permission", "method": method},
+                                                         str(events), host_warning=True))
+                self.assertEqual(child.send.call_args.args[0]["result"], expected)
 
     def test_run_and_lane_write_scope_through_ledger_to_daily_report(self):
         final = {"status": "done", "summary": "fake completed", "files_changed": ["result.txt"]}

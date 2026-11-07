@@ -3472,7 +3472,7 @@ TASK:
 
 """ + REPORT_INSTRUCTION
 
-HOST_SCOPE_PROMPT = """This is a host operations task. You may operate on paths outside the current worktree and on remote hosts listed in the task card. Keep repository changes inside the worktree; swrm will commit them. Do NOT push, switch branches, or print secrets.
+HOST_SCOPE_PROMPT = """This is a host operations task. You may operate on paths outside the current worktree and on remote hosts. Both outside-worktree paths and remote hosts must be explicitly listed in the task card. Do NOT operate on unlisted paths or hosts. Keep repository changes inside the worktree; swrm will commit them. Do NOT push, switch branches, or print secrets.
 """
 
 
@@ -7624,12 +7624,17 @@ def lane_acp_request(child, msg, event_file):
     return True
 
 
-def lane_approval_response(child, msg, event_file):
+def lane_approval_response(child, msg, event_file, host_warning=False):
     method = msg.get("method", "")
     req_id = msg.get("id")
     if method not in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
                       "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval"):
         return False
+    if host_warning and method in ("item/commandExecution/requestApproval", "execCommandApproval"):
+        # Only command requests already classified as host warnings may proceed, once.
+        decision = "approved" if method == "execCommandApproval" else "accept"
+        child.send({"jsonrpc": "2.0", "id": req_id, "result": {"decision": decision}})
+        return True
     lane_record_event(event_file, {"type": "error", "error": f"declined unexpected approval request: {method}"})
     result = {"decision": "decline"}
     if method == "item/permissions/requestApproval":
@@ -7770,7 +7775,8 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
             continue
         if lane["backend"] == "codex":
             if "method" in msg and "id" in msg:
-                if lane_approval_response(child, msg, event_file):
+                if lane_approval_response(child, msg, event_file,
+                                          host_warning=bool(block and block.get("enforced") is False)):
                     continue
             lane_record_event(event_file, msg)
             method = msg.get("method")

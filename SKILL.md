@@ -187,11 +187,13 @@ post-execution command events cannot prevent initial side effects.
 
 Use `--scope host` for task-card-authorized host maintenance with `run`, `lane assign`, or `batch`.
 The default `--scope repo` keeps the existing worktree-only prompt. Host scope permits listed
-outside-worktree paths and remote-host operations while keeping repository edits in the worktree
+outside-worktree paths and remote hosts; both must be explicitly listed in the task card.
+Unlisted paths and hosts are forbidden. Repository edits stay in the worktree
 for swrm to commit. `rm outside worktree` and `sudo` become recorded RISK warnings; push, publish,
 and secret-print enforcement still stops the run, including later fragments and inner commands
-wrapped by `sudo`, `env`, `nohup`, or `timeout` (e.g. `sudo cat .env`). Warning-only lane permission
-requests still receive the normal protocol response. Run/lane ledger records, compact reports,
+wrapped by `sudo`, `env`, `nohup`, or `timeout` (e.g. `sudo cat .env`). Warning-only Codex lane command
+approvals are accepted once, including legacy exec approvals; other unexpected Codex approvals
+remain denied. Run/lane ledger records, compact reports,
 and daily HTML/JSON task rows include scope
 (legacy entries default to `repo`). `fleet exec` forwards this option to `run`.
 

@@ -60,9 +60,12 @@ class GuardrailsTests(unittest.TestCase):
 
     def test_host_scope_prompt_and_risk_softening(self):
         repo_prompt = xs.execution_prompt("/tmp/wt", "task")
+        self.assertEqual(repo_prompt, xs.PROMPT_TMPL.format(wd="/tmp/wt", task="task"))
         self.assertIn("Work only inside the current directory (/tmp/wt)", repo_prompt)
         host_prompt = xs.execution_prompt("/tmp/wt", "task", "host")
         self.assertIn("This is a host operations task", host_prompt)
+        self.assertIn("Both outside-worktree paths and remote hosts must be explicitly listed in the task card", host_prompt)
+        self.assertIn("Do NOT operate on unlisted paths or hosts", host_prompt)
         self.assertIn("Keep repository changes inside the worktree", host_prompt)
         self.assertNotIn("Work only inside the current directory", host_prompt)
 
