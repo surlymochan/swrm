@@ -367,8 +367,10 @@ class WakeRegressionTests(unittest.TestCase):
         first = self.wake()
         before = path.stat()
         path.write_bytes(path.read_bytes())
-        os.utime(path, ns=(before.st_atime_ns, max(path.stat().st_mtime_ns, before.st_mtime_ns + 1)))
+        rewritten_mtime_ns = max(path.stat().st_mtime_ns, before.st_mtime_ns + 1_000_000_000)
+        os.utime(path, ns=(before.st_atime_ns, rewritten_mtime_ns))
         self.assertEqual(path.stat().st_ino, before.st_ino)
+        self.assertNotEqual(path.stat().st_mtime_ns, before.st_mtime_ns)
         with mock.patch.object(xs, "watch_wait_for_change", side_effect=AssertionError("missed rewrite")), \
                 mock.patch("builtins.print", side_effect=KeyboardInterrupt) as interrupted:
             with self.assertRaises(KeyboardInterrupt):
@@ -391,7 +393,9 @@ class WakeRegressionTests(unittest.TestCase):
         upgraded = next(iter(json.loads(self.cursor.read_text())["files"].values()))
         self.assertEqual(upgraded["size"], path.stat().st_size)
         path.write_bytes(path.read_bytes())
-        os.utime(path, ns=(path.stat().st_atime_ns, upgraded["mtime_ns"] + 1))
+        rewritten_mtime_ns = max(path.stat().st_mtime_ns, upgraded["mtime_ns"] + 1_000_000_000)
+        os.utime(path, ns=(path.stat().st_atime_ns, rewritten_mtime_ns))
+        self.assertNotEqual(path.stat().st_mtime_ns, upgraded["mtime_ns"])
         with mock.patch.object(xs, "watch_wait_for_change", side_effect=AssertionError("missed rewrite")):
             self.assertIn("ERROR: legacy", self.wake())
 
