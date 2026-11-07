@@ -9852,18 +9852,23 @@ def watch_wait_for_change(path):
     # kqueue provides an event-driven wait on macOS. Other platforms use a
     # one-second floor so idle watches never spin or repeatedly reread logs.
     if hasattr(select, "kqueue") and path and os.path.exists(path):
-        fd = os.open(path, os.O_RDONLY)
         try:
-            kq = select.kqueue()
+            fd = os.open(path, os.O_RDONLY)
             try:
-                ev = select.kevent(fd, filter=select.KQ_FILTER_VNODE,
-                                   flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
-                                   fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_RENAME | select.KQ_NOTE_DELETE)
-                kq.control([ev], 1, 1.0)
+                kq = select.kqueue()
+                try:
+                    ev = select.kevent(fd, filter=select.KQ_FILTER_VNODE,
+                                       flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                                       fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_RENAME | select.KQ_NOTE_DELETE)
+                    kq.control([ev], 1, 1.0)
+                finally:
+                    kq.close()
             finally:
-                kq.close()
-        finally:
-            os.close(fd)
+                os.close(fd)
+        except OSError:
+            # Rotation can remove the path between exists/open or invalidate
+            # vnode registration. Retry discovery after a bounded idle wait.
+            time.sleep(1.0)
     elif sys.platform.startswith("linux") and path:
         import ctypes
         libc = ctypes.CDLL(None, use_errno=True)
@@ -9971,7 +9976,10 @@ def watch_wake_locked(args, run_ids, cursor_path):
         if notifications.get(key) == text:
             return False
         notifications[key] = text
-        emit(rid, kind, text)
+        # A new activity episode must also have a new consumer deduplication ID.
+        progress = sorted((key, value.get("generation"), value.get("offset"))
+                          for key, value in cursors.items() if key.startswith(f"{rid}:"))
+        emit(rid, kind, text, event_id(rid, kind, text, progress) if kind == "STALL" else None)
         return True
 
     def active_runs():
@@ -10046,6 +10054,7 @@ def watch_wake_locked(args, run_ids, cursor_path):
                             cursors[key] = checkpoint(offset)
                             f.seek(offset)
                             last_activity[rid] = NOW()
+                            notifications.pop(f"{rid}:STALL", None)
                             try:
                                 event = json.loads(raw.decode("utf-8", errors="replace"))
                             except ValueError:
@@ -10094,7 +10103,7 @@ def watch_wake_locked(args, run_ids, cursor_path):
 def cmd_watch(args, policy):
     """Stream one line per actionable event for a run; designed to be wrapped by Claude's Monitor tool.
     Exits on run completion, budget expiry, or after --max-minutes (re-arm to keep watching)."""
-    if getattr(args, "wake", False):
+    if getattr(args, "wake", False) or args.max_minutes == 0:
         return cmd_watch_wake(args)
     if not args.run_id:
         sys.exit("watch requires at least one run id")
@@ -11752,7 +11761,7 @@ def main():
     sp.add_argument("--quiet", action="store_true", help="only terminal, risk, stall, error, budget, attempt and heartbeat events")
     sp.add_argument("--stall-minutes", type=float, default=10)
     sp.add_argument("--heartbeat-minutes", type=float, default=15)
-    sp.add_argument("--max-minutes", type=float, default=28, help="watch window; exits so the caller re-arms")
+    sp.add_argument("--max-minutes", type=float, default=28, help="watch window; 0 is equivalent to --wake")
     sp.add_argument("--risk", action="append", help="extra regex to flag in executor shell commands")
 
     sp = sub.add_parser("runs", help="report recent/active runs (for scheduled check-ins)")

@@ -191,6 +191,75 @@ class WakeRegressionTests(unittest.TestCase):
                 self.assertEqual(path.stat().st_ino, inode)
                 self.assertIn(replacement[:20], self.wake())
 
+    def test_stall_rearms_after_activity_with_new_delivery_id(self):
+        path = self.run_fixture()
+        self.args.stall_minutes = 1
+        with mock.patch.object(xs, "NOW", side_effect=[1000, 1061]), \
+                mock.patch.object(xs, "watch_wait_for_change"):
+            first = self.wake()
+        with path.open("a") as f:
+            f.write(json.dumps({"type": "message_end", "message": {"role": "user"}}) + "\n")
+        # Reading new activity clears the old episode, including on restart.
+        with mock.patch.object(xs, "NOW", return_value=1100), \
+                mock.patch.object(xs, "watch_wait_for_change", side_effect=InterruptedError("idle")):
+            with self.assertRaises(InterruptedError):
+                self.wake()
+        saved = json.loads(self.cursor.read_text())
+        self.assertNotIn("r1:STALL", saved["notifications"])
+        with mock.patch.object(xs, "NOW", side_effect=[1100, 1161]), \
+                mock.patch.object(xs, "watch_wait_for_change"):
+            second = self.wake()
+        self.assertIn("STALL:", second)
+        self.assertNotEqual(self.event_id(first), self.event_id(second))
+        with mock.patch.object(xs, "NOW", side_effect=[1200, 1261]), \
+                mock.patch.object(xs, "watch_wait_for_change", side_effect=[None, InterruptedError("idle")]):
+            with self.assertRaises(InterruptedError):
+                self.wake()
+
+    def test_kqueue_open_rotation_race_backs_off_and_rediscovers_events(self):
+        path = self.run_fixture()
+        original_wait = xs.watch_wait_for_change
+        def rotate(_):
+            with mock.patch.object(xs.select, "kqueue", create=True), \
+                    mock.patch.object(xs.os, "open", side_effect=FileNotFoundError("rotated")), \
+                    mock.patch.object(xs.time, "sleep") as sleep:
+                original_wait(str(path))
+            sleep.assert_called_once_with(1.0)
+            path.rename(path.with_name("events.1.jsonl"))
+            path.write_text(json.dumps({"type": "error", "error": "after rotation"}) + "\n")
+        with mock.patch.object(xs, "watch_wait_for_change", side_effect=rotate):
+            self.assertIn("ERROR: after rotation", self.wake())
+
+    @unittest.skipUnless(hasattr(xs.select, "kqueue"), "requires macOS kqueue constants")
+    def test_kqueue_registration_race_closes_resources_and_backs_off(self):
+        path = self.run_fixture()
+        kq = mock.Mock()
+        kq.control.side_effect = OSError("vnode disappeared")
+        original_close = xs.os.close
+        with mock.patch.object(xs.select, "kqueue", return_value=kq), \
+                mock.patch.object(xs.os, "close", wraps=original_close) as close, \
+                mock.patch.object(xs.time, "sleep") as sleep:
+            xs.watch_wait_for_change(str(path))
+        kq.close.assert_called_once_with()
+        close.assert_called_once()
+        sleep.assert_called_once_with(1.0)
+
+    def test_cli_max_minutes_zero_matches_wake_for_errors_and_risks(self):
+        for event, expected in (({"type": "error", "error": "wake me"}, "ERROR: wake me"),
+                                ({"type": "tool_call", "command": "git push origin HEAD"}, "RISK[")):
+            for flags in (["--wake"], ["--max-minutes", "0"]):
+                with self.subTest(event=event, flags=flags):
+                    self.run_fixture(events=[{"type": "tool_call", "command": "echo ordinary"}, event])
+                    result = subprocess.run([sys.executable, xs.__file__, "watch", "--all", *flags,
+                                             "--heartbeat-minutes", "0.000001"],
+                                            env={**os.environ, "OPENSWARM_HOME": str(self.root)},
+                                            capture_output=True, text=True, timeout=8)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(expected, result.stdout)
+                    self.assertEqual(len(result.stdout.splitlines()), 1)
+                    self.assertNotIn("CMD:", result.stdout)
+                    self.assertNotIn("HEARTBEAT:", result.stdout)
+
     def test_all_discovers_runs_created_while_waiting(self):
         self.args.run_id, self.args.all = [], True
         def create_run(_):
