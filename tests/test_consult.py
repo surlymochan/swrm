@@ -170,7 +170,18 @@ class ConsultTests(unittest.TestCase):
     def test_consult_outside_git_uses_temporary_worktrees(self):
         outside = os.path.join(self.tmp, "outside")
         os.mkdir(outside)
-        with mock.patch("openswarm_consult.os.getcwd", return_value=outside):
+        # The test temp dir may sit inside a checkout (CONTRIBUTING sets
+        # TMPDIR under the repo). Without a ceiling, git's upward search
+        # from `outside` finds the enclosing repo and consult hands the
+        # executors a worktree of the whole checkout instead of the empty
+        # seed worktree -- the same widening #87 fixed for the rm guard --
+        # while every assertion below still passes. Pin the premise so the
+        # test fails loudly instead of passing vacuously.
+        with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": self.tmp}), \
+                mock.patch("openswarm_consult.os.getcwd", return_value=outside):
+            probe = subprocess.run(["git", "-C", outside, "rev-parse", "--verify", "HEAD"],
+                                   capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(probe.returncode, 0, "outside must be outside any git repo")
             code, result = self.run_consult(["codex", "agy"])
         self.assertEqual(code, 0)
         self.assertTrue(all(row["valid"] for row in result["answers"]))
