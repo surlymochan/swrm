@@ -4075,11 +4075,17 @@ def rm_target_path_class(target, cwd, root):
 
 
 def rm_outside_worktree_class(command, worktree):
-    workdir = os.path.realpath(worktree)
-    # Keep the classification root in the same canonical form as shell CWDs.
-    # On macOS tempfile paths can use /var while realpath returns /private/var.
-    root = os.path.realpath(executor_worktree_root(workdir))
-    for words, cwd in shell_invocations(command, workdir):
+    # The given worktree is the boundary: do not widen it to the enclosing
+    # repo via git rev-parse --show-toplevel. A scratch worktree nested
+    # inside a checkout (e.g. a test temp dir under an in-repo TMPDIR) must
+    # not inherit the whole checkout as its allowed zone, or `rm -rf
+    # ../outside` escapes the guard. Real worktrees already are their own
+    # toplevel, so this only tightens the in-place-subdirectory case, and
+    # fail-closed is the right direction for a destructive command.
+    # On macOS tempfile paths can use /var while realpath returns /private/var,
+    # so keep the classification root in the same canonical form as shell CWDs.
+    root = os.path.realpath(worktree)
+    for words, cwd in shell_invocations(command, root):
         if os.path.basename(words[0]) != "rm":
             continue
         operands = iter(words[1:])
