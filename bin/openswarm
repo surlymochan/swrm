@@ -4966,6 +4966,53 @@ def failing_tests(output):
     return found
 
 
+# Slice 1 of #93 (closed-loop repair): exactly one automatic rework per run.
+# Bounded retries (default 2) and escalation to a stronger backend tier on
+# repeated failure are follow-ups, not part of this slice.
+AUTO_REWORK_MAX_ATTEMPTS = 1
+
+
+def build_rework_task(task, verify, attempt=1):
+    """Rework task carrying the host-verify failure evidence for the executor."""
+    failing = ", ".join(verify.get("failing") or []) or "(no failing test ids parsed)"
+    return (task.rstrip() + "\n\n## Rework: host verification failed "
+            f"(auto rework attempt {attempt}/{AUTO_REWORK_MAX_ATTEMPTS})\n"
+            "Your previous change did not pass host verification. Fix the failures below; "
+            "do not re-argue them, and do not weaken or delete the failing tests.\n"
+            f"- verify command: `{verify.get('cmd')}`\n"
+            f"- exit code: {verify.get('rc')}\n"
+            f"- failing tests: {failing}\n"
+            "- verify output tail:\n```\n"
+            f"{(verify.get('tail') or '')[-1500:]}\n```\n")
+
+
+def auto_rework_eligible(verify, auto_rework, attempts=0):
+    """True when a verify failure may trigger one automatic rework dispatch."""
+    if not auto_rework or not isinstance(verify, dict):
+        return False
+    if verify.get("rc") in (0, 124, None):
+        # Pass, or timed out: a timeout is not a code failure, so never rework it.
+        return False
+    return attempts < AUTO_REWORK_MAX_ATTEMPTS
+
+
+def host_verify(cmd, ws, timeout, baseline=False):
+    """Run host verify once; with baseline, pass when no failures are new."""
+    verify = run_verify(cmd, ws["path"], timeout)
+    if verify["rc"] not in (0, 124) and baseline and ws["mode"] == "worktree":
+        # Repos often carry known failures; judge the run by failures it introduced, not by the suite's exit code.
+        base = verify_against_baseline(cmd, ws, timeout)
+        if base.get("rc") is not None:
+            base_fail = failing_tests(base.get("output", ""))
+            new_fail = sorted(set(verify["failing"]) - base_fail)
+            verify["baseline"] = {"rc": base["rc"], "failing": sorted(base_fail), "new_failures": new_fail}
+            if verify["failing"] and not new_fail:
+                verify["rc_raw"], verify["rc"] = verify["rc"], 0
+        else:
+            verify["baseline"] = {"error": base.get("error")}
+    return verify
+
+
 def verify_against_baseline(cmd, ws, timeout):
     """Run the verify command on the run's base commit in a sibling worktree (dependencies linked).
     Returns the baseline verify dict including the full output for failure comparison."""
@@ -5208,6 +5255,8 @@ def cmd_run(args, policy):
             child += ["--base", args.base]
         if getattr(args, "verify_baseline", False):
             child.append("--verify-baseline")
+        if getattr(args, "auto_rework", False):
+            child.append("--auto-rework")
         for flag in ("no_worktree", "keep_worktree", "no_fallback"):
             if getattr(args, flag):
                 child.append(f"--{flag.replace('_', '-')}")
@@ -5341,18 +5390,52 @@ def cmd_run(args, policy):
                     prepare_error = prepared
         if not prepare_error:
             set_status(rdir, state="verifying")
-            verify = run_verify(args.verify, ws["path"], max(60, min(600, int(deadline - NOW()) + 300)))
-    if verify and verify["rc"] not in (0, 124) and getattr(args, "verify_baseline", False) and ws["mode"] == "worktree":
-        # Repos often carry known failures; judge the run by failures it introduced, not by the suite's exit code.
-        base = verify_against_baseline(args.verify, ws, max(60, min(600, int(deadline - NOW()) + 300)))
-        if base.get("rc") is not None:
-            base_fail = failing_tests(base.get("output", ""))
-            new_fail = sorted(set(verify["failing"]) - base_fail)
-            verify["baseline"] = {"rc": base["rc"], "failing": sorted(base_fail), "new_failures": new_fail}
-            if verify["failing"] and not new_fail:
-                verify["rc_raw"], verify["rc"] = verify["rc"], 0
+            verify = host_verify(args.verify, ws, max(60, min(600, int(deadline - NOW()) + 300)),
+                                 baseline=getattr(args, "verify_baseline", False))
+    # Closed-loop repair, slice 1 of #93: on a verify failure, dispatch exactly
+    # one rework with the failure evidence injected, then re-verify once.
+    auto_rework = None
+    if getattr(args, "auto_rework", False) and verify is not None and not prepare_error and not read_only:
+        auto_rework = {"attempts": 0,
+                       "first_verify": {"rc": verify.get("rc"), "failing": sorted(verify.get("failing") or [])},
+                       "recovered": False}
+        if auto_rework_eligible(verify, True, 0) and deadline - NOW() >= 120:
+            rework_task = build_rework_task(task, verify, attempt=1)
+            with open(f"{rdir}/rework-prompt.md", "w") as f:
+                f.write(rework_task)
+            set_status(rdir, state="reworking", auto_rework_attempt=1)
+            rework_prompt = execution_prompt(ws["path"], rework_task, scope)
+            if args.verify:
+                rework_prompt += (f"\nAfter you finish, the planner runs this acceptance command on the host, outside your sandbox: "
+                                  f"`{args.verify}`. If your sandbox blocks running it (ports, network, missing deps), say so in "
+                                  f"`tests` instead of treating it as a code failure.\n")
+            rework_prompt, _ = add_lessons_to_prompt(
+                rework_prompt, policy, card_type, decision["backend"], rework_task, getattr(args, "paths", None))
+            rework_prompt, _ = add_patterns_to_prompt(
+                rework_prompt, policy, card_type, decision["backend"], rework_task, getattr(args, "paths", None))
+            rework_attempts, rework_final, rework_err = run_executor_with_rate_limit(
+                decision["backend"], decision, st, rework_prompt, ws["path"], rdir, deadline, policy,
+                first_attempt=len(attempts) + 1)
+            attempts.extend(rework_attempts)
+            if rework_final is not None:
+                result = rework_final
+            auto_rework["attempts"] = 1
+            auto_rework["rework_error_class"] = rework_err
+            fin = finalize_workspace(ws, title, decision["backend"], rdir, keep=True)
+            changed = changed_paths(ws.get("repo") or ws.get("path"), ws.get("base"), fin.get("commit"),
+                                    (result or {}).get("files_changed"))
+            workspace_changed = ws["mode"] == "worktree" and bool(git(["status", "--porcelain"], ws["root"])[1].strip())
+            if rework_err not in ("risk_blocked", "rate_limit") and (result is not None or workspace_changed or changed):
+                set_status(rdir, state="verifying")
+                verify = host_verify(args.verify, ws, max(60, min(600, int(deadline - NOW()) + 300)),
+                                     baseline=getattr(args, "verify_baseline", False))
+            auto_rework["rework_verify"] = ({"rc": verify.get("rc"), "failing": sorted(verify.get("failing") or [])}
+                                            if verify else None)
+            auto_rework["recovered"] = bool(verify and verify.get("rc") == 0)
+        elif not auto_rework_eligible(verify, True, 0):
+            auto_rework["skipped"] = "verify passed or timed out"
         else:
-            verify["baseline"] = {"error": base.get("error")}
+            auto_rework["skipped"] = "budget_exhausted"
     has_changes = bool(fin.get("commit") or workspace_changed or (changed and not read_only))
     pass_fields = exec_pass_fields(has_changes, read_only_output, bool(args.verify), verify)
     if read_only and args.keep_worktree and verify:
@@ -5389,6 +5472,7 @@ def cmd_run(args, policy):
         "id": rid, "status": status, "error_class": "budget_exceeded_daily" if budget_denial else "prepare_failed" if prepare_error else attempts[-1]["error_class"],
         **({"budget_error": budget_denial, "error": "budget_exceeded_daily"} if budget_denial else {}),
         "title": title, "scope": scope, "prepare": prepare, "workspace_note": note, "verify": verify, "verify_note": verify_note,
+        **({"auto_rework": auto_rework} if getattr(args, "auto_rework", False) else {}),
         "backend": decision["backend"], "model": decision["model"], "effort": decision.get("effort"),
         "usage": usage, "seconds": wall_seconds,
         "queued_seconds": (jload(f"{rdir}/status.json", {}) or {}).get("queued_seconds", 0),
@@ -5407,6 +5491,7 @@ def cmd_run(args, policy):
                    "commit": fin.get("commit"), "files": len((result or {}).get("files_changed") or []),
                    **pass_fields,
                    "branch": fin.get("branch"), "verify": verify,
+                   **({"auto_rework": auto_rework} if getattr(args, "auto_rework", False) else {}),
                    "files_changed": changed,
                    "card_type": card_type, "rework_of": rework_of,
                    **({"regress_label": args.regress_label} if getattr(args, "regress_label", None) else {}),
@@ -11798,6 +11883,9 @@ def main():
                            verify_baseline_help="when verify fails, rerun it on the base commit and pass if no failures are new",
                            verify_help="acceptance command run on the host in the worktree after the executor finishes; "
                                        "its exit code overrides a sandbox-limited partial/done")
+    sp.add_argument("--auto-rework", action="store_true",
+                    help="on host verify failure, dispatch one automatic rework with the failure evidence injected, "
+                         "then re-verify once (slice 1 of #93; bounded retries and backend escalation are follow-ups)")
     sp.add_argument("--keep-worktree", action="store_true")
     sp.add_argument("--no-fallback", action="store_true")
     add_dispatch_arguments(sp, "budget", budget_help="hard wall-clock budget; executor is killed when exceeded")
