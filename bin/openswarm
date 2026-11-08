@@ -6081,7 +6081,7 @@ def bus_comment(repo, number, body):
 
 
 def bus_cancel_issue(repo, number, cfg, reason):
-    states = {state: bus_label(cfg, state) for state in BUS_STATES}
+    states = bus_label_names(cfg)
     bus_set_issue_labels(repo, number, cfg, add=[states["cancelled"]],
                          remove=[states[s] for s in ("queued", "claimed", "done", "failed")])
     bus_comment(repo, number, f"openswarm cancelled this run: {bus_redact(reason)}")
@@ -6397,7 +6397,7 @@ def cmd_bus_run(args, policy, rid, rdir, task, title, budget_min):
         return
     started = NOW()
     deadline = started + budget_min * 60
-    states = {state: bus_label(cfg, state) for state in BUS_STATES}
+    states = bus_label_names(cfg)
     event_path = f"{rdir}/events.jsonl"
     set_status(rdir, id=rid, state="running", title=title, started=started, budget_minutes=budget_min,
                deadline=deadline, backend="github-issue", events=event_path, cwd=root, bus_repo=cfg["repo"],
@@ -6500,7 +6500,7 @@ def cmd_bus_init(args, policy):
 
 def cmd_bus_status(args, policy):
     cfg = bus_config(policy, getattr(args, "repo", None))
-    states = {state: bus_label(cfg, state) for state in BUS_STATES}
+    states = bus_label_names(cfg)
     rows = []
     for issue in gh_pages(f"repos/{cfg['repo']}/issues?state=open"):
         if "pull_request" in issue:
@@ -6577,7 +6577,7 @@ def bus_worker_run(issue, cfg, args, policy):
     allowed_repos = bus_worker_repos(args, policy)
     if task["repo"] not in allowed_repos:
         return False
-    labels = {state: bus_label(cfg, state) for state in BUS_STATES}
+    labels = bus_label_names(cfg)
     names = issue_label_names(issue)
     if labels["queued"] not in names or labels["cancelled"] in names:
         return False

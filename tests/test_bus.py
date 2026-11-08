@@ -372,6 +372,54 @@ class BusTests(unittest.TestCase):
         self.assertNotIn(secret, comment)
         self.assertIn("[REDACTED]", comment)
 
+    def test_bus_label_map_call_sites_use_bus_label_names(self):
+        """bus_label_names is the single definition of the state->label map.
+
+        bus_cancel_issue, cmd_bus_status and bus_worker_run used to inline
+        the {state: bus_label(cfg, state) for state in BUS_STATES}
+        comprehension instead of calling the helper; a patched helper
+        returning sentinel labels must flow through each call site.
+        """
+        sentinel = {state: f"sentinel:{state}" for state in xs.BUS_STATES}
+        created = xs.bus_create_issue("org/bus", self.cfg, "cancel", "test wiring", {
+            "run_id": "wiring-cancel", "repo": "org/target", "base": self.base,
+            "budget_minutes": 1, "report_schema": xs.RESULT_SCHEMA})
+        seen = {}
+        with mock.patch.object(xs, "bus_label_names", return_value=sentinel), \
+                mock.patch.object(xs, "bus_set_issue_labels",
+                                  side_effect=lambda repo, number, cfg, add=(), remove=():
+                                  seen.setdefault("set", (list(add), list(remove)))), \
+                mock.patch.object(xs, "bus_comment", return_value={}):
+            xs.bus_cancel_issue("org/bus", created["number"], self.cfg, "wiring")
+        self.assertEqual(seen["set"][0], ["sentinel:cancelled"])
+        self.assertEqual(sorted(seen["set"][1]),
+                         sorted(f"sentinel:{s}" for s in ("queued", "claimed", "done", "failed")))
+
+        issue = {"number": 7, "title": "plain title", "labels": [{"name": "sentinel:queued"}],
+                 "created_at": "2026-11-08T00:00:00Z", "html_url": "https://example.invalid/7"}
+        args = argparse.Namespace(repo=None, json=True)
+        with mock.patch.object(xs, "bus_label_names", return_value=sentinel), \
+                mock.patch.object(xs, "gh_pages", return_value=[issue]), \
+                mock.patch.object(xs, "bus_comments", return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            xs.cmd_bus_status(args, self.policy)
+        rows = json.loads(out.getvalue())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["state"], "queued")
+
+        metadata = {"run_id": "wiring-worker", "repo": "org/target", "base": self.base,
+                    "branch_hint": "openswarm/wiring-worker", "budget_minutes": 1,
+                    "report_schema": xs.RESULT_SCHEMA}
+        worker_issue = xs.bus_create_issue("org/bus", self.cfg, "worker", "write a file", metadata)
+        current = self.issue(worker_issue["number"])
+        worker_args = argparse.Namespace(bus="org/bus", name="external-agent", backend="pi", model=None,
+                                         budget_minutes=1, once=True, repos="org/target", verify=None,
+                                         card_type="fix", paths=None)
+        with mock.patch.object(xs, "bus_label_names", return_value=sentinel), \
+                mock.patch.object(xs, "gh_transport",
+                                  side_effect=AssertionError("label gate must reject before any gh call")):
+            self.assertFalse(xs.bus_worker_run(current, self.cfg, worker_args, self.policy))
+
     def test_result_branch_validation_matches_run_id_pattern(self):
         report = {"status": "done", "summary": "ok", "files_changed": [], "tests": "",
                   "followups": [], "branch": "openswarm/a_B-9", "commit": None}
