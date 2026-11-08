@@ -146,6 +146,30 @@ class LessonsTests(unittest.TestCase):
         self.assertIn("skipping lesson file", warning.getvalue())
         self.assertIn("unsupported applies_to key 'unknown'", warning.getvalue())
 
+    def test_load_lesson_records_returns_pairs_skips_bad_and_missing_dir(self):
+        self.write_lesson("good.yaml", "L-0011", "valid")
+        (self.lessons / "bad.yaml").write_text(
+            "id: L-0012\nrule: nope\nguard_level: L2\napplies_to:\n  unknown: [value]\n", encoding="utf-8")
+        warning = io.StringIO()
+        with contextlib.redirect_stderr(warning):
+            records = xs.load_lesson_records(str(self.lessons))
+        self.assertEqual([lesson["id"] for lesson, _ in records], ["L-0011"])
+        self.assertEqual(records[0][1], str(self.lessons / "good.yaml"))
+        self.assertIn("skipping lesson file", warning.getvalue())
+        self.assertEqual(xs.load_lesson_records(str(self.root / "absent")), [])
+        with mock.patch.object(os, "listdir", side_effect=PermissionError("denied")):
+            with self.assertRaisesRegex(ValueError, "cannot read lessons directory"):
+                xs.load_lesson_records(str(self.lessons))
+
+    def test_lesson_scan_sites_share_load_lesson_records(self):
+        sentinel = {"id": "L-0099", "rule": "sentinel rule", "guard_level": "L2",
+                    "applies_to": {"card_types": [], "paths": [], "backends": []}}
+        pair = (sentinel, str(self.lessons / "sentinel.yaml"))
+        with mock.patch.object(xs, "load_lesson_records", return_value=[pair]):
+            self.assertEqual(xs.select_lessons(self.policy, "fix", "codex")[1], ["L-0099"])
+            self.assertEqual(xs.lesson_existing_records(str(self.root)), [sentinel])
+            self.assertEqual(xs.lesson_records_with_paths(str(self.root)), [pair])
+
     def test_yaml_scalar_subset_accepts_null_booleans_integers_and_strings(self):
         lesson = xs.parse_lesson_yaml(
             "id: L-0014\nrule: a plain string\nguard_level: L2\nguard_ref: null\n"
