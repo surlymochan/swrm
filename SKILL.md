@@ -49,8 +49,8 @@ $XS run --cwd <repo> --type impl --difficulty 3 --budget-minutes 15 --title "...
 local port binding, network, or keychain access, so they often report `partial` for purely environmental reasons.
 swrm commits the executor's edit first, then runs the verify command on the host in that committed worktree (suites that refuse dirty trees pass); its exit code wins
 (`partial`→`done` when it passes, `done`→`partial` when it fails) and is recorded in `result.verify`.
-`--auto-rework` adds one automatic rework on verify failure (failing tests and output tail injected into the
-rework prompt, then re-verified once; recorded in `result.auto_rework` and the ledger).
+`--auto-rework [N]` adds up to N automatic reworks on verify failure (default 2; failing tests and output tail injected into the
+rework prompt, then re-verified after each; on exhaustion it escalates once to a stronger backend tier; recorded in `result.auto_rework` and the ledger).
 Gitignored dependency dirs (`node_modules`, `.venv`, `venv`; override with `workspace.link_dirs` in policy) are
 symlinked from the base repo into the worktree and never committed, so imports resolve. Worktrees are created
 beside the base repo (`.openswarm-wt-<repo>-<id>`) so committed relative links to sibling repos keep resolving

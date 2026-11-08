@@ -4966,20 +4966,40 @@ def failing_tests(output):
     return found
 
 
-# Slice 1 of #93 (closed-loop repair): exactly one automatic rework per run.
-# Bounded retries (default 2) and escalation to a stronger backend tier on
-# repeated failure are follow-ups, not part of this slice.
-AUTO_REWORK_MAX_ATTEMPTS = 1
+# Slice 2 of #93/#95 (closed-loop repair): bounded retries (default 2) on the
+# same backend, then one escalation to a stronger backend tier on repeated
+# failure. Slice 1 (v0.4.19) dispatched exactly one rework.
+AUTO_REWORK_DEFAULT_ATTEMPTS = 2
+TIER_ORDER = ("fast", "balanced", "deep")
+# Difficulty that routes to a tier (see policy difficulty_map): fast 1-2,
+# balanced 3-4, deep 5.
+TIER_DIFFICULTY = {"fast": 2, "balanced": 4, "deep": 5}
 
 
-def build_rework_task(task, verify, attempt=1):
+def auto_rework_max_attempts(auto_rework):
+    """Retry cap for --auto-rework: True (flag with no value) means the default (2)."""
+    if auto_rework is True:
+        return AUTO_REWORK_DEFAULT_ATTEMPTS
+    if isinstance(auto_rework, int) and auto_rework > 0:
+        return auto_rework
+    return 0
+
+
+def build_rework_task(task, verify, attempt=1, max_attempts=AUTO_REWORK_DEFAULT_ATTEMPTS,
+                      escalated_from=None):
     """Rework task carrying the host-verify failure evidence for the executor."""
     failing = ", ".join(verify.get("failing") or []) or "(no failing test ids parsed)"
-    return (task.rstrip() + "\n\n## Rework: host verification failed "
-            f"(auto rework attempt {attempt}/{AUTO_REWORK_MAX_ATTEMPTS})\n"
+    header = (f"(escalated rework after {max_attempts}/{max_attempts} failed retries)"
+              if escalated_from else f"(auto rework attempt {attempt}/{max_attempts})")
+    text = (task.rstrip() + "\n\n## Rework: host verification failed "
+            f"{header}\n"
             "Your previous change did not pass host verification. Fix the failures below; "
-            "do not re-argue them, and do not weaken or delete the failing tests.\n"
-            f"- verify command: `{verify.get('cmd')}`\n"
+            "do not re-argue them, and do not weaken or delete the failing tests.\n")
+    if escalated_from:
+        text += (f"This task was escalated to you from backend `{escalated_from}` after its reworks "
+                 "kept failing: you are the stronger backend on this task, so fix it properly rather "
+                 "than repeating the previous approach.\n")
+    return (text + f"- verify command: `{verify.get('cmd')}`\n"
             f"- exit code: {verify.get('rc')}\n"
             f"- failing tests: {failing}\n"
             "- verify output tail:\n```\n"
@@ -4987,13 +5007,26 @@ def build_rework_task(task, verify, attempt=1):
 
 
 def auto_rework_eligible(verify, auto_rework, attempts=0):
-    """True when a verify failure may trigger one automatic rework dispatch."""
+    """True when a verify failure may trigger another automatic rework dispatch."""
     if not auto_rework or not isinstance(verify, dict):
         return False
     if verify.get("rc") in (0, 124, None):
         # Pass, or timed out: a timeout is not a code failure, so never rework it.
         return False
-    return attempts < AUTO_REWORK_MAX_ATTEMPTS
+    return attempts < auto_rework_max_attempts(auto_rework)
+
+
+def escalation_profile(prof, tier):
+    """Profile one tier stronger than `tier` for backend escalation (deep caps at deep).
+
+    Returns (profile, stronger_tier): the profile drops any forced backend/model
+    so the router can pick a different, stronger backend, and raises difficulty
+    to the next tier. An already-deep run stays deep and escalates by switching
+    backend at the same tier.
+    """
+    idx = TIER_ORDER.index(tier) if tier in TIER_ORDER else len(TIER_ORDER) - 1
+    stronger = TIER_ORDER[min(idx + 1, len(TIER_ORDER) - 1)]
+    return {**prof, "backend": None, "model": None, "difficulty": TIER_DIFFICULTY[stronger]}, stronger
 
 
 def host_verify(cmd, ws, timeout, baseline=False):
@@ -5257,6 +5290,8 @@ def cmd_run(args, policy):
             child.append("--verify-baseline")
         if getattr(args, "auto_rework", False):
             child.append("--auto-rework")
+            if isinstance(args.auto_rework, int) and not isinstance(args.auto_rework, bool):
+                child.append(str(args.auto_rework))
         for flag in ("no_worktree", "keep_worktree", "no_fallback"):
             if getattr(args, flag):
                 child.append(f"--{flag.replace('_', '-')}")
@@ -5392,36 +5427,44 @@ def cmd_run(args, policy):
             set_status(rdir, state="verifying")
             verify = host_verify(args.verify, ws, max(60, min(600, int(deadline - NOW()) + 300)),
                                  baseline=getattr(args, "verify_baseline", False))
-    # Closed-loop repair, slice 1 of #93: on a verify failure, dispatch exactly
-    # one rework with the failure evidence injected, then re-verify once.
+    # Closed-loop repair, slice 2 of #93/#95: bounded retries (default 2) on the
+    # same backend with fresh failure evidence each round, then one escalation
+    # to a stronger backend tier when retries are exhausted.
     auto_rework = None
     if getattr(args, "auto_rework", False) and verify is not None and not prepare_error and not read_only:
-        auto_rework = {"attempts": 0,
+        max_attempts = auto_rework_max_attempts(args.auto_rework)
+        auto_rework = {"attempts": 0, "max_attempts": max_attempts,
                        "first_verify": {"rc": verify.get("rc"), "failing": sorted(verify.get("failing") or [])},
-                       "recovered": False}
-        if auto_rework_eligible(verify, True, 0) and deadline - NOW() >= 120:
-            rework_task = build_rework_task(task, verify, attempt=1)
+                       "recovered": False, "verifies": []}
+
+        def dispatch_rework(backend, backend_decision, backend_state, rework_task, attempt_label):
+            """One rework dispatch on `backend`; returns (final_report, error_class)."""
+            with open(f"{rdir}/rework-prompt-{attempt_label}.md", "w") as f:
+                f.write(rework_task)
             with open(f"{rdir}/rework-prompt.md", "w") as f:
                 f.write(rework_task)
-            set_status(rdir, state="reworking", auto_rework_attempt=1)
+            set_status(rdir, state="reworking", auto_rework_attempt=attempt_label)
             rework_prompt = execution_prompt(ws["path"], rework_task, scope)
             if args.verify:
                 rework_prompt += (f"\nAfter you finish, the planner runs this acceptance command on the host, outside your sandbox: "
                                   f"`{args.verify}`. If your sandbox blocks running it (ports, network, missing deps), say so in "
                                   f"`tests` instead of treating it as a code failure.\n")
             rework_prompt, _ = add_lessons_to_prompt(
-                rework_prompt, policy, card_type, decision["backend"], rework_task, getattr(args, "paths", None))
+                rework_prompt, policy, card_type, backend, rework_task, getattr(args, "paths", None))
             rework_prompt, _ = add_patterns_to_prompt(
-                rework_prompt, policy, card_type, decision["backend"], rework_task, getattr(args, "paths", None))
+                rework_prompt, policy, card_type, backend, rework_task, getattr(args, "paths", None))
             rework_attempts, rework_final, rework_err = run_executor_with_rate_limit(
-                decision["backend"], decision, st, rework_prompt, ws["path"], rdir, deadline, policy,
+                backend, backend_decision, backend_state, rework_prompt, ws["path"], rdir, deadline, policy,
                 first_attempt=len(attempts) + 1)
             attempts.extend(rework_attempts)
+            return rework_final, rework_err
+
+        def reverify_after_rework(backend, rework_final, rework_err):
+            """Commit the rework and re-run host verify; returns the new verify dict."""
+            nonlocal result, fin, changed, workspace_changed, verify
             if rework_final is not None:
                 result = rework_final
-            auto_rework["attempts"] = 1
-            auto_rework["rework_error_class"] = rework_err
-            fin = finalize_workspace(ws, title, decision["backend"], rdir, keep=True)
+            fin = finalize_workspace(ws, title, backend, rdir, keep=True)
             changed = changed_paths(ws.get("repo") or ws.get("path"), ws.get("base"), fin.get("commit"),
                                     (result or {}).get("files_changed"))
             workspace_changed = ws["mode"] == "worktree" and bool(git(["status", "--porcelain"], ws["root"])[1].strip())
@@ -5429,13 +5472,67 @@ def cmd_run(args, policy):
                 set_status(rdir, state="verifying")
                 verify = host_verify(args.verify, ws, max(60, min(600, int(deadline - NOW()) + 300)),
                                      baseline=getattr(args, "verify_baseline", False))
-            auto_rework["rework_verify"] = ({"rc": verify.get("rc"), "failing": sorted(verify.get("failing") or [])}
-                                            if verify else None)
-            auto_rework["recovered"] = bool(verify and verify.get("rc") == 0)
-        elif not auto_rework_eligible(verify, True, 0):
+            return verify
+
+        if not auto_rework_eligible(verify, args.auto_rework, 0):
             auto_rework["skipped"] = "verify passed or timed out"
-        else:
+        elif deadline - NOW() < 120:
             auto_rework["skipped"] = "budget_exhausted"
+        else:
+            last_rework_err = None
+            while auto_rework_eligible(verify, args.auto_rework, auto_rework["attempts"]) \
+                    and deadline - NOW() >= 120:
+                attempt_no = auto_rework["attempts"] + 1
+                rework_task = build_rework_task(task, verify, attempt=attempt_no, max_attempts=max_attempts)
+                rework_final, last_rework_err = dispatch_rework(
+                    decision["backend"], decision, st, rework_task, attempt_no)
+                auto_rework["attempts"] = attempt_no
+                auto_rework["rework_error_class"] = last_rework_err
+                verify = reverify_after_rework(decision["backend"], rework_final, last_rework_err)
+                auto_rework["verifies"].append(
+                    {"attempt": attempt_no, "rc": verify.get("rc") if verify else None,
+                     "failing": sorted((verify or {}).get("failing") or [])})
+                auto_rework["rework_verify"] = ({"rc": verify.get("rc"),
+                                                 "failing": sorted(verify.get("failing") or [])}
+                                                if verify else None)
+                auto_rework["recovered"] = bool(verify and verify.get("rc") == 0)
+                if auto_rework["recovered"] or last_rework_err in ("risk_blocked", "rate_limit"):
+                    break
+            if not auto_rework["recovered"] and auto_rework["attempts"] < max_attempts \
+                    and last_rework_err not in ("risk_blocked", "rate_limit"):
+                auto_rework["budget_exhausted"] = True
+            if (not auto_rework["recovered"] and auto_rework["attempts"] >= 1
+                    and last_rework_err != "risk_blocked" and deadline - NOW() >= 120
+                    and verify is not None and verify.get("rc") not in (0, 124, None)):
+                # Retries exhausted on this backend: one rework on a stronger
+                # tier / different backend, then a final re-verify.
+                esc_prof, stronger_tier = escalation_profile(prof, decision.get("tier"))
+                st_esc = probe(policy)
+                esc = route(esc_prof, st_esc, policy, exclude=[decision["backend"]])
+                if not esc.get("ok"):
+                    auto_rework["escalation"] = {"skipped": "no stronger backend available",
+                                                 "tier": stronger_tier, "reasons": esc.get("reasons")}
+                elif esc["backend"] == decision["backend"]:
+                    auto_rework["escalation"] = {"skipped": "router returned the same backend",
+                                                 "tier": stronger_tier}
+                else:
+                    esc_task = build_rework_task(task, verify, attempt=auto_rework["attempts"] + 1,
+                                                 max_attempts=max_attempts,
+                                                 escalated_from=decision["backend"])
+                    esc_final, esc_err = dispatch_rework(
+                        esc["backend"], esc, st_esc, esc_task, "escalation")
+                    verify = reverify_after_rework(esc["backend"], esc_final, esc_err)
+                    esc_verify = ({"rc": verify.get("rc"), "failing": sorted(verify.get("failing") or [])}
+                                  if verify else None)
+                    auto_rework["escalation"] = {"from_backend": decision["backend"],
+                                                 "to_backend": esc["backend"], "tier": esc.get("tier"),
+                                                 "model": esc.get("model"), "error_class": esc_err,
+                                                 "verify": esc_verify,
+                                                 "recovered": bool(verify and verify.get("rc") == 0)}
+                    auto_rework["rework_verify"] = esc_verify
+                    auto_rework["recovered"] = auto_rework["escalation"]["recovered"]
+                    if auto_rework["recovered"]:
+                        decision = esc
     has_changes = bool(fin.get("commit") or workspace_changed or (changed and not read_only))
     pass_fields = exec_pass_fields(has_changes, read_only_output, bool(args.verify), verify)
     if read_only and args.keep_worktree and verify:
@@ -11883,9 +11980,11 @@ def main():
                            verify_baseline_help="when verify fails, rerun it on the base commit and pass if no failures are new",
                            verify_help="acceptance command run on the host in the worktree after the executor finishes; "
                                        "its exit code overrides a sandbox-limited partial/done")
-    sp.add_argument("--auto-rework", action="store_true",
-                    help="on host verify failure, dispatch one automatic rework with the failure evidence injected, "
-                         "then re-verify once (slice 1 of #93; bounded retries and backend escalation are follow-ups)")
+    sp.add_argument("--auto-rework", nargs="?", const=2, type=int, default=False, metavar="N",
+                    help="on host verify failure, dispatch up to N automatic reworks (default 2 when the "
+                         "flag has no value), each with the fresh failure evidence injected, re-verifying "
+                         "after each; when retries are exhausted, escalate once to a stronger backend "
+                         "tier (#95)")
     sp.add_argument("--keep-worktree", action="store_true")
     sp.add_argument("--no-fallback", action="store_true")
     add_dispatch_arguments(sp, "budget", budget_help="hard wall-clock budget; executor is killed when exceeded")

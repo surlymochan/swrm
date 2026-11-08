@@ -6,7 +6,7 @@ usage: openswarm run [-h] [--type TYPE] [--difficulty DIFFICULTY]
                      [--prompt PROMPT] [--task-file TASK_FILE] [--title TITLE]
                      [--cwd CWD] [--scope {repo,host}] [--base BASE]
                      [--no-worktree] [--verify-baseline] [--verify VERIFY]
-                     [--auto-rework] [--keep-worktree] [--no-fallback]
+                     [--auto-rework [N]] [--keep-worktree] [--no-fallback]
                      [--budget-minutes BUDGET_MINUTES] [--detach] [--dry-run]
                      [--read-only] [--executor EXECUTOR]
 
@@ -43,10 +43,11 @@ options:
   --verify VERIFY       acceptance command run on the host in the worktree
                         after the executor finishes; its exit code overrides a
                         sandbox-limited partial/done
-  --auto-rework         on host verify failure, dispatch one automatic rework
-                        with the failure evidence injected, then re-verify
-                        once (slice 1 of #93; bounded retries and backend
-                        escalation are follow-ups)
+  --auto-rework [N]     on host verify failure, dispatch up to N automatic
+                        reworks (default 2 when the flag has no value), each
+                        with the fresh failure evidence injected, re-verifying
+                        after each; when retries are exhausted, escalate once
+                        to a stronger backend tier (#95)
   --keep-worktree
   --no-fallback
   --budget-minutes BUDGET_MINUTES

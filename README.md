@@ -129,7 +129,7 @@ Routing decisions use live quota data, not guesses.
 - **Host-side verification.** `--verify '<cmd>'` runs your test command on the committed worktree.
   - Its exit code overrides the executor's self-report.
   - `--verify-baseline` ignores failures that already exist on the base commit.
-  - `--auto-rework` dispatches one automatic rework on verify failure, with the failing tests and output tail injected into the rework prompt, then re-verifies once; the loop is recorded in `result.auto_rework` and the ledger.
+  - `--auto-rework [N]` dispatches up to N automatic reworks on verify failure (default 2 when the flag has no value), each with the fresh failing tests and output tail injected into the rework prompt and re-verified after each; when retries are exhausted it escalates once to a stronger backend tier and re-verifies; the loop is recorded in `result.auto_rework` and the ledger.
 - **Automatic fallback.** One-shot Pi, Codex and Cursor runs retry visible 429s in the same session; other fallback-eligible rate limits and model-at-capacity errors can move to another backend.
 - **Rate-limit recovery and provider caps.** Resident lanes retry visible provider 429s in the same session using `rate_limit.backoff_seconds` (default `[30, 60, 120, 240]`) and `rate_limit.max_retries` (default `4`). `concurrency` accepts provider/backend caps plus `total`; defaults are `{"codex": 4, "minimax-cn": 6, "total": 10}`. Excess local turns queue across lanes and runs.
 - **Risk alerts.** `openswarm watch` streams progress and flags dangerous executor commands (push, `rm -rf ..`, secret prints, `sudo`, publish). It also reports stalls and heartbeats.
@@ -248,7 +248,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm fleet exec` | Run an swrm command on another host; stdout and the exit code are forwarded. | `openswarm fleet exec worker -- lane status` |
 | `openswarm fleet ledger pull` | Merge the host ledgers into one fleet ledger file. | `openswarm fleet ledger pull --hosts worker,sandbox` |
 | `openswarm run --rework-of` | Resume an earlier run's task as a rework, linked in the ledger as `rework_of`. | `openswarm run --rework-of <run-id> --cwd ~/code/myrepo --task-file /tmp/task.md` |
-| `openswarm run --auto-rework` | On host verify failure, dispatch one automatic rework with the failure evidence injected, then re-verify once; recorded in `result.auto_rework` and the ledger. | `openswarm run --auto-rework --cwd ~/code/myrepo --verify 'pytest -q' --task-file /tmp/task.md` |
+| `openswarm run --auto-rework` | On host verify failure, dispatch up to 2 automatic reworks (or N with `--auto-rework N`), each with the failure evidence injected, re-verifying after each; on exhaustion escalate once to a stronger backend tier; recorded in `result.auto_rework` and the ledger. | `openswarm run --auto-rework --cwd ~/code/myrepo --verify 'pytest -q' --task-file /tmp/task.md` |
 
 ### Learn
 
