@@ -413,17 +413,21 @@ def lesson_path_matches(pattern, card_text, paths):
     return False
 
 
-def select_lessons(policy, card_type=None, backend=None, card_text="", paths=None):
-    repo = os.path.expanduser(str((policy.get("knowledge") or {}).get("repo") or DEFAULT_KNOWLEDGE_REPO))
-    directory = os.path.join(repo, "lessons")
+def load_lesson_records(directory):
+    """Load every parseable lesson file in directory as (lesson, path) pairs.
+
+    Bad files are warned about and skipped; a missing directory yields no
+    records; an unreadable directory raises ValueError. This is the single
+    scan shared by select_lessons, lesson_existing_records and
+    lesson_records_with_paths.
+    """
     try:
         filenames = sorted(name for name in os.listdir(directory) if name.endswith(".yaml"))
     except FileNotFoundError:
-        return "", []
+        return []
     except OSError as error:
-        print(f"openswarm: warning: cannot read lessons directory {directory}: {error}", file=sys.stderr)
-        return "", []
-    matched = []
+        raise ValueError(f"cannot read lessons directory {directory}: {error}") from error
+    records = []
     for filename in filenames:
         path = os.path.join(directory, filename)
         try:
@@ -432,6 +436,20 @@ def select_lessons(policy, card_type=None, backend=None, card_text="", paths=Non
         except (OSError, ValueError) as error:
             print(f"openswarm: warning: skipping lesson file {path}: {error}", file=sys.stderr)
             continue
+        records.append((lesson, path))
+    return records
+
+
+def select_lessons(policy, card_type=None, backend=None, card_text="", paths=None):
+    repo = os.path.expanduser(str((policy.get("knowledge") or {}).get("repo") or DEFAULT_KNOWLEDGE_REPO))
+    directory = os.path.join(repo, "lessons")
+    try:
+        records = load_lesson_records(directory)
+    except ValueError as error:
+        print(f"openswarm: warning: {error}", file=sys.stderr)
+        return "", []
+    matched = []
+    for lesson, _path in records:
         if lesson["guard_level"] not in ("L2", "L3"):
             continue
         applies = lesson["applies_to"]
@@ -1051,23 +1069,7 @@ def lesson_paths_overlap(existing, changed):
 
 def lesson_existing_records(repo):
     directory = os.path.join(repo, "lessons")
-    records = []
-    try:
-        filenames = sorted(name for name in os.listdir(directory) if name.endswith(".yaml"))
-    except FileNotFoundError:
-        return records
-    except OSError as error:
-        raise ValueError(f"cannot read lessons directory {directory}: {error}") from error
-    for filename in filenames:
-        path = os.path.join(directory, filename)
-        try:
-            with open(path, encoding="utf-8") as stream:
-                lesson = parse_lesson_yaml(stream.read())
-        except (OSError, ValueError) as error:
-            print(f"openswarm: warning: skipping lesson file {path}: {error}", file=sys.stderr)
-            continue
-        records.append(lesson)
-    return records
+    return [lesson for lesson, _ in load_lesson_records(directory)]
 
 
 def lesson_next_id(repo, existing, seen_comments=None):
@@ -1430,23 +1432,7 @@ def lesson_guard_proposal(lesson, lesson_file, recurrence_proposals, recurrences
 
 def lesson_records_with_paths(repo):
     directory = os.path.join(repo, "lessons")
-    records = []
-    try:
-        filenames = sorted(name for name in os.listdir(directory) if name.endswith(".yaml"))
-    except FileNotFoundError:
-        return records
-    except OSError as error:
-        raise ValueError(f"cannot read lessons directory {directory}: {error}") from error
-    for filename in filenames:
-        path = os.path.join(directory, filename)
-        try:
-            with open(path, encoding="utf-8") as stream:
-                lesson = parse_lesson_yaml(stream.read())
-        except (OSError, ValueError) as error:
-            print(f"openswarm: warning: skipping lesson file {path}: {error}", file=sys.stderr)
-            continue
-        records.append((lesson, path))
-    return records
+    return load_lesson_records(directory)
 
 
 def cmd_lessons_escalate(args, policy):
