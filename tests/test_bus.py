@@ -111,6 +111,34 @@ class BusTests(unittest.TestCase):
                                   keep_worktree=False, no_fallback=False, budget_minutes=budget,
                                   detach=False, run_id=None, dry_run=False, executor=executor)
 
+    def test_bus_run_dry_run_wires_base_commit_and_task_metadata_helpers(self):
+        args = self.run_args(budget=1.0)
+        args.dry_run = True
+        rdir = str(self.data / "runs" / "bushelper1")
+        os.makedirs(rdir, exist_ok=True)
+        output = io.StringIO()
+        with mock.patch.object(xs, "bus_remote", return_value=(str(self.repo), str(self.bare), "org/target")), \
+                mock.patch.object(xs, "bus_base_commit", wraps=xs.bus_base_commit) as base_commit, \
+                mock.patch.object(xs, "bus_task_metadata", wraps=xs.bus_task_metadata) as task_metadata, \
+                contextlib.redirect_stdout(output):
+            xs.cmd_bus_run(args, self.policy, "bushelper1", rdir, "create a file", "bus test", 1.0)
+        self.assertTrue(base_commit.called, "cmd_bus_run must resolve the base via bus_base_commit")
+        self.assertTrue(task_metadata.called, "cmd_bus_run must build metadata via bus_task_metadata")
+        printed = json.loads(output.getvalue())
+        self.assertTrue(printed["dry_run"])
+        self.assertEqual(printed["base"], self.base)
+
+    def test_bus_base_commit_and_task_metadata_helpers(self):
+        self.assertEqual(xs.bus_base_commit(str(self.repo), str(self.bare), self.base), self.base)
+        with self.assertRaises(xs.BusError):
+            xs.bus_base_commit(str(self.repo), str(self.bare), "deadbeef" * 5)
+        with self.assertRaises(xs.BusError):
+            xs.bus_task_metadata("bad id!", "org/target", self.base, self.run_args(), 1.0)
+        metadata = xs.bus_task_metadata("bushelper1", "org/target", self.base, self.run_args(), 1.0)
+        self.assertEqual(metadata["run_id"], "bushelper1")
+        self.assertEqual(metadata["branch_hint"], "openswarm/bushelper1")
+        self.assertEqual(metadata["base"], self.base)
+
     def start_planner(self, budget=1.0, task="create a file", executor=None):
         outcome = {}
 

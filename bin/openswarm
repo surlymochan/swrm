@@ -2780,10 +2780,6 @@ def backfill_exec_pass_details(entry):
     return exec_pass_assessment(changed, entry.get("read_only_output") is True, verify_requested, verify)
 
 
-def backfill_exec_pass(entry):
-    return backfill_exec_pass_details(entry)[0]
-
-
 def budget_status(policy, date=None, entries=None):
     day, timezone, start, end = policy_day(policy, date)
     cfg = policy.get("budget") or {}
@@ -6366,22 +6362,8 @@ def bus_finish_run(rid, rdir, title, root, remote, issue, result, executor, stat
 def cmd_bus_run(args, policy, rid, rdir, task, title, budget_min):
     cfg = bus_config(policy)
     root, remote, target_repo = bus_remote(os.path.abspath(args.cwd))
-    code, base, _ = git(["rev-parse", "--verify", "--end-of-options", f"{getattr(args, 'base', None) or 'HEAD'}^{{commit}}"], root)
-    if code:
-        raise BusError("base commit is unavailable locally")
-    base = base.strip()
-    code, remote_refs, _ = git(["ls-remote", "--heads", "--tags", remote], root, timeout=60)
-    if code or base not in {line.split()[0] for line in remote_refs.splitlines() if line.split()}:
-        raise BusError("push the base first")
-    metadata = {"run_id": rid, "repo": target_repo, "base": base,
-                "branch_hint": f"openswarm/{rid}", "budget_minutes": budget_min,
-                "report_schema": RESULT_SCHEMA}
-    if args.verify:
-        metadata["verify"] = args.verify
-    if getattr(args, "card_type", None):
-        metadata["card_type"] = args.card_type
-    if getattr(args, "rework_of", None):
-        metadata["rework_of"] = args.rework_of
+    base = bus_base_commit(root, remote, getattr(args, "base", None))
+    metadata = bus_task_metadata(rid, target_repo, base, args, budget_min)
     if args.dry_run:
         set_status(rdir, id=rid, state="dry-run", title=title, backend="github-issue", bus_repo=cfg["repo"])
         print(json.dumps({"id": rid, "dry_run": True, "backend": "github-issue", "bus_repo": cfg["repo"],

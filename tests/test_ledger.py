@@ -196,6 +196,10 @@ class LedgerTests(unittest.TestCase):
         self.assertTrue(xs.exec_pass_value("done", False, True, False, None))  # read-only output file
         self.assertIsNone(xs.exec_pass_value("done", True, False, None, None))
 
+    def test_dead_backfill_exec_pass_wrapper_is_gone(self):
+        self.assertFalse(hasattr(xs, "backfill_exec_pass"),
+                         "backfill_exec_pass has no callers; backfill_exec_pass_details is the live path")
+
         output = self.root / "review.md"
         output.write_text("review")
         self.assertTrue(xs.read_only_output_exists(str(self.root), ["review.md"]))
