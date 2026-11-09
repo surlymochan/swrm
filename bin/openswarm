@@ -5046,6 +5046,112 @@ def host_verify(cmd, ws, timeout, baseline=False):
     return verify
 
 
+# --verify-evalid (M2 slice 1, #99): first-class evalid verification on `run`.
+# Claim: the executor's reported status + its `tests` text. Replay: evalid
+# (`xflow audit`) re-runs the claimed test command in a clean clone at the
+# run's head commit. The claim-vs-replay verdict lands in the ledger
+# (`verify_evalid`) so any run can be re-checked. A missing/unusable evalid
+# is a loud error, never a silent downgrade to plain --verify.
+def resolve_evalid_bin(explicit=None, sibling_root=None):
+    """Locate the evalid CLI: --evalid-bin > EVALID_BIN > `xflow` on PATH >
+    sibling ../evalid checkout (run via node). Returns (argv, source) or
+    (None, reason). Never raises for a missing binary."""
+    if explicit:
+        if explicit.endswith(".js"):
+            if not os.path.isfile(explicit):
+                return None, "--evalid-bin points at a missing file: %s" % explicit
+            node = shutil.which("node")
+            if not node:
+                return None, "--evalid-bin points at %s but no node binary was found" % explicit
+            return [node, explicit], "--evalid-bin"
+        if os.access(explicit, os.X_OK):
+            return [explicit], "--evalid-bin"
+        return None, "--evalid-bin points at a missing/non-executable file: %s" % explicit
+    env_bin = os.environ.get("EVALID_BIN") or envvar("EVALID_BIN")
+    if env_bin:
+        return resolve_evalid_bin(explicit=env_bin, sibling_root=sibling_root)
+    found = shutil.which("xflow")
+    if found:
+        return ["xflow"], "PATH"
+    if sibling_root is None:
+        sibling_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    js = os.path.join(sibling_root, "evalid", "bin", "xflow.js")
+    if os.path.isfile(js):
+        node = shutil.which("node")
+        if not node:
+            return None, "sibling evalid checkout found at %s but no node binary was found" % js
+        return [node, js], "sibling checkout"
+    return None, ("evalid not found: set --evalid-bin or EVALID_BIN, put xflow on PATH, "
+                  "or check out evalid next to swrm (../evalid/bin/xflow.js)")
+
+
+def build_evalid_claims(verify_cmd, executor_status, executor_tests):
+    """Claims text for `xflow audit`: the executor's own `tests` report, plus
+    one swrm line stating the acceptance command it claims passes (exit 0)
+    — added only when the executor reported done. A non-done executor gets
+    no pass fabricated for it: audit can only check what it itself claimed,
+    and no extractable claim comes back as an explicit error, never a pass."""
+    lines = []
+    if executor_tests and str(executor_tests).strip():
+        lines.append(str(executor_tests).strip())
+    if executor_status == "done":
+        lines.append("`%s` — claimed exit 0" % verify_cmd)
+    return "\n".join(lines)
+
+
+def evalid_verdict_from_audit(report):
+    """Map an `xflow audit` verdict to the ledger verdict: verified -> pass,
+    mismatch -> mismatch, anything else (unverifiable / no_claims / misuse /
+    unknown) -> error. Only `verified` ever counts as a pass."""
+    verdict = (report or {}).get("verdict")
+    if verdict == "verified":
+        return "pass"
+    if verdict == "mismatch":
+        return "mismatch"
+    return "error"
+
+
+def run_evalid_verify(verify_cmd, repo, base_ref, head_ref, executor_status, executor_tests,
+                      timeout=300, evalid_bin=None):
+    """Replay the executor's claimed test run through evalid and map the audit
+    report to {mode, verdict, claim, claims_text, replay, error}. Never raises
+    for a missing binary or a failed audit: those are verdict=error, recorded
+    in the ledger, and never counted as a pass."""
+    claims_text = build_evalid_claims(verify_cmd, executor_status, executor_tests)
+    out = {"mode": "verify-evalid", "verdict": "error", "claim": claims_text,
+           "claims_text": claims_text, "replay": None, "error": None}
+    argv, source = resolve_evalid_bin(explicit=evalid_bin)
+    if argv is None:
+        out["error"] = "evalid-unavailable: %s" % source
+        return out
+    if not base_ref or not head_ref:
+        out["error"] = ("evalid-unavailable: no base/head commit to audit "
+                        "(base=%s head=%s)" % (base_ref, head_ref))
+        return out
+    cmd = argv + ["audit", "--base", base_ref, "--head", head_ref,
+                  "--claims", claims_text, "--repo", repo, "--json", "--timeout", str(int(timeout))]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 120)
+    except subprocess.TimeoutExpired:
+        out["error"] = "evalid audit timed out after %ss" % timeout
+        return out
+    except OSError as exc:
+        out["error"] = "evalid audit could not run (%s): %s" % (source, exc)
+        return out
+    try:
+        report = json.loads(proc.stdout)
+    except ValueError:
+        out["error"] = ("evalid audit returned unparsable output (exit %s): %s"
+                        % (proc.returncode, (proc.stdout + proc.stderr)[-300:]))
+        return out
+    out["replay"] = report
+    out["verdict"] = evalid_verdict_from_audit(report)
+    if out["verdict"] == "error":
+        out["error"] = "evalid audit verdict %s: %s" % (
+            report.get("verdict"), report.get("error") or "see replay report")
+    return out
+
+
 def verify_against_baseline(cmd, ws, timeout):
     """Run the verify command on the run's base commit in a sibling worktree (dependencies linked).
     Returns the baseline verify dict including the full output for failure comparison."""
@@ -5212,6 +5318,30 @@ def cmd_run(args, policy):
             f.write(task)
     title = args.title or task.strip().splitlines()[0][:72]
     set_status(rdir, scope=scope)
+    if getattr(args, "verify_evalid", False):
+        # Fail fast and on the record: --verify-evalid without --verify is a
+        # usage error, and an unresolvable evalid binary must never silently
+        # become a plain --verify run. Both are ledger failures, not passes.
+        evalid_error = None
+        if not getattr(args, "verify", None):
+            evalid_error = ("usage_error", "--verify-evalid requires --verify: "
+                            "evalid can only replay a claimed acceptance command")
+        else:
+            _argv, _reason = resolve_evalid_bin(explicit=getattr(args, "evalid_bin", None))
+            if _argv is None:
+                evalid_error = ("evalid_unavailable", "evalid-unavailable: %s" % _reason)
+        if evalid_error is not None:
+            error_class, error = evalid_error
+            out = {"id": rid, "status": "failed", "error_class": error_class, "error": error,
+                   "title": title, "scope": scope, "run_dir": rdir}
+            jsave(f"{rdir}/result.json", out)
+            append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "failed", "scope": scope,
+                           "error_class": error_class, "summary": error[:300],
+                           "card_type": card_type, "rework_of": rework_of,
+                           **exec_pass_fields(False, False, bool(args.verify), None)})
+            set_status(rdir, state="finished", status="failed", error_class=error_class, finished=NOW())
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+            sys.exit(2)
     prof = profile_from_args(args)
     prof["read_only"] = (getattr(args, "read_only", False) or
                          prof.get("type") in READ_ONLY_CARD_TYPES or card_type in READ_ONLY_CARD_TYPES)
@@ -5284,6 +5414,10 @@ def cmd_run(args, policy):
             child += ["--paths", *args.paths]
         if getattr(args, "verify", None):
             child += ["--verify", args.verify]
+        if getattr(args, "verify_evalid", False):
+            child.append("--verify-evalid")
+        if getattr(args, "evalid_bin", None):
+            child += ["--evalid-bin", args.evalid_bin]
         if getattr(args, "base", None):
             child += ["--base", args.base]
         if getattr(args, "verify_baseline", False):
@@ -5533,6 +5667,17 @@ def cmd_run(args, policy):
                     auto_rework["recovered"] = auto_rework["escalation"]["recovered"]
                     if auto_rework["recovered"]:
                         decision = esc
+    # --verify-evalid (M2 slice 1, #99): once, on the final verify/commit after
+    # any rework loop, replay the executor's claim through evalid in a clean
+    # clone and record claim, replay and verdict in the ledger.
+    verify_evalid = None
+    if getattr(args, "verify_evalid", False):
+        set_status(rdir, state="verifying-evalid")
+        verify_evalid = run_evalid_verify(
+            args.verify, ws.get("repo") or ws["path"], ws.get("base"), fin.get("commit"),
+            (result or {}).get("status"), (result or {}).get("tests"),
+            timeout=max(60, min(600, int(deadline - NOW()) + 300)),
+            evalid_bin=getattr(args, "evalid_bin", None))
     has_changes = bool(fin.get("commit") or workspace_changed or (changed and not read_only))
     pass_fields = exec_pass_fields(has_changes, read_only_output, bool(args.verify), verify)
     if read_only and args.keep_worktree and verify:
@@ -5563,12 +5708,20 @@ def cmd_run(args, policy):
     status, verify_note = adjust_status_for_change_evidence(
         status, verify_note, commit=fin.get("commit"), workspace_changed=workspace_changed, changed=changed,
         read_only=read_only, verify=verify)
+    if verify_evalid is not None and verify_evalid["verdict"] in ("mismatch", "error") and status == "done":
+        # The claim did not survive evalid replay (or could not be checked):
+        # a run whose evidence does not back its done claim is partial, not done.
+        note = "evalid replay %s: %s" % (verify_evalid["verdict"],
+                                         verify_evalid.get("error") or "see verify_evalid")
+        status = "partial"
+        verify_note = (verify_note + "; " + note) if verify_note else note
     usage = (attempts[-1].get("meta") or {}).get("usage")
     wall_seconds = round(sum(a["seconds"] for a in attempts), 3)
     out = {
         "id": rid, "status": status, "error_class": "budget_exceeded_daily" if budget_denial else "prepare_failed" if prepare_error else attempts[-1]["error_class"],
         **({"budget_error": budget_denial, "error": "budget_exceeded_daily"} if budget_denial else {}),
         "title": title, "scope": scope, "prepare": prepare, "workspace_note": note, "verify": verify, "verify_note": verify_note,
+        **({"verify_evalid": verify_evalid} if verify_evalid is not None else {}),
         **({"auto_rework": auto_rework} if getattr(args, "auto_rework", False) else {}),
         "backend": decision["backend"], "model": decision["model"], "effort": decision.get("effort"),
         "usage": usage, "seconds": wall_seconds,
@@ -5588,6 +5741,7 @@ def cmd_run(args, policy):
                    "commit": fin.get("commit"), "files": len((result or {}).get("files_changed") or []),
                    **pass_fields,
                    "branch": fin.get("branch"), "verify": verify,
+                   **({"verify_evalid": verify_evalid} if verify_evalid is not None else {}),
                    **({"auto_rework": auto_rework} if getattr(args, "auto_rework", False) else {}),
                    "files_changed": changed,
                    "card_type": card_type, "rework_of": rework_of,
@@ -11985,6 +12139,14 @@ def main():
                          "flag has no value), each with the fresh failure evidence injected, re-verifying "
                          "after each; when retries are exhausted, escalate once to a stronger backend "
                          "tier (#95)")
+    sp.add_argument("--verify-evalid", action="store_true",
+                    help="verify with evalid: replay the executor's claimed test command in a clean clone "
+                         "via `xflow audit` and record the claim-vs-replay verdict in the ledger (#99); "
+                         "requires --verify; fails loudly when evalid is unavailable, never falls back to "
+                         "plain verify")
+    sp.add_argument("--evalid-bin", help="evalid binary: path to xflow, or to a bin/xflow.js checkout "
+                                         "(run via node); overrides EVALID_BIN, xflow on PATH, and the "
+                                         "sibling ../evalid checkout")
     sp.add_argument("--keep-worktree", action="store_true")
     sp.add_argument("--no-fallback", action="store_true")
     add_dispatch_arguments(sp, "budget", budget_help="hard wall-clock budget; executor is killed when exceeded")
