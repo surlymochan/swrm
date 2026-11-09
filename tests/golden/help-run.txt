@@ -6,9 +6,11 @@ usage: openswarm run [-h] [--type TYPE] [--difficulty DIFFICULTY]
                      [--prompt PROMPT] [--task-file TASK_FILE] [--title TITLE]
                      [--cwd CWD] [--scope {repo,host}] [--base BASE]
                      [--no-worktree] [--verify-baseline] [--verify VERIFY]
-                     [--auto-rework [N]] [--keep-worktree] [--no-fallback]
-                     [--budget-minutes BUDGET_MINUTES] [--detach] [--dry-run]
-                     [--read-only] [--executor EXECUTOR]
+                     [--auto-rework [N]] [--verify-evalid]
+                     [--evalid-bin EVALID_BIN] [--keep-worktree]
+                     [--no-fallback] [--budget-minutes BUDGET_MINUTES]
+                     [--detach] [--dry-run] [--read-only]
+                     [--executor EXECUTOR]
 
 options:
   -h, --help            show this help message and exit
@@ -48,6 +50,15 @@ options:
                         with the fresh failure evidence injected, re-verifying
                         after each; when retries are exhausted, escalate once
                         to a stronger backend tier (#95)
+  --verify-evalid       verify with evalid: replay the executor's claimed test
+                        command in a clean clone via `xflow audit` and record
+                        the claim-vs-replay verdict in the ledger (#99);
+                        requires --verify; fails loudly when evalid is
+                        unavailable, never falls back to plain verify
+  --evalid-bin EVALID_BIN
+                        evalid binary: path to xflow, or to a bin/xflow.js
+                        checkout (run via node); overrides EVALID_BIN, xflow
+                        on PATH, and the sibling ../evalid checkout
   --keep-worktree
   --no-fallback
   --budget-minutes BUDGET_MINUTES
