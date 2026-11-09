@@ -83,7 +83,7 @@ class ResolveEvalidBin(unittest.TestCase):
                 argv, source = xs.resolve_evalid_bin(sibling_root="/nonexistent-dir-for-test")
             finally:
                 os.environ["PATH"] = old_path
-            self.assertEqual(argv, [fake])
+            self.assertEqual([os.path.normcase(p) for p in argv], [os.path.normcase(fake)])
             self.assertEqual(source, "PATH")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
