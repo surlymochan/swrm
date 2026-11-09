@@ -70,9 +70,12 @@ class ResolveEvalidBin(unittest.TestCase):
     def test_path_xflow_is_found(self):
         tmp = tempfile.mkdtemp(prefix="openswarm-evalid-bin-")
         try:
-            fake = os.path.join(tmp, "xflow")
+            # Windows only executes PATHEXT names (a bare extensionless
+            # script is invisible to which()); the fixture carries .cmd there.
+            name = "xflow.cmd" if os.name == "nt" else "xflow"
+            fake = os.path.join(tmp, name)
             with open(fake, "w") as fh:
-                fh.write("#!/bin/sh\necho fake\n")
+                fh.write("@echo off\r\necho fake\r\n" if os.name == "nt" else "#!/bin/sh\necho fake\n")
             os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC)
             old_path = os.environ.get("PATH", "")
             os.environ["PATH"] = tmp + os.pathsep + old_path
@@ -80,7 +83,7 @@ class ResolveEvalidBin(unittest.TestCase):
                 argv, source = xs.resolve_evalid_bin(sibling_root="/nonexistent-dir-for-test")
             finally:
                 os.environ["PATH"] = old_path
-            self.assertEqual(argv, ["xflow"])
+            self.assertEqual(argv, [fake])
             self.assertEqual(source, "PATH")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -231,6 +234,8 @@ class VerifyEvalidRun(unittest.TestCase):
         with open(os.path.join(xs.RUNS, entry["id"], "result.json")) as f:
             return entry, json.load(f)
 
+    @unittest.skipIf(os.name == "nt", "worktree dispatch relies on POSIX symlinks and shell prepare steps; "
+                                       "Windows git/symlink semantics differ (same reason as test_workspace)")
     def test_pass_verdict_lands_in_ledger_and_keeps_done(self):
         self.assertEqual(self.dispatch(), 0)
         entry, result = self.last_result()
@@ -241,6 +246,8 @@ class VerifyEvalidRun(unittest.TestCase):
         self.assertIn("node --test tests/test_calc.mjs", ve["claim"])
         self.assertIn("replay", ve)
 
+    @unittest.skipIf(os.name == "nt", "worktree dispatch relies on POSIX symlinks and shell prepare steps; "
+                                       "Windows git/symlink semantics differ (same reason as test_workspace)")
     def test_mismatch_verdict_downgrades_done_to_partial(self):
         os.environ["FAKE_EVALID_VERDICT"] = "mismatch"
         self.assertEqual(self.dispatch(), 1)

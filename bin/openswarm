@@ -5072,7 +5072,7 @@ def resolve_evalid_bin(explicit=None, sibling_root=None):
         return resolve_evalid_bin(explicit=env_bin, sibling_root=sibling_root)
     found = shutil.which("xflow")
     if found:
-        return ["xflow"], "PATH"
+        return [found], "PATH"
     if sibling_root is None:
         sibling_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     js = os.path.join(sibling_root, "evalid", "bin", "xflow.js")
@@ -5131,7 +5131,10 @@ def run_evalid_verify(verify_cmd, repo, base_ref, head_ref, executor_status, exe
     cmd = argv + ["audit", "--base", base_ref, "--head", head_ref,
                   "--claims", claims_text, "--repo", repo, "--json", "--timeout", str(int(timeout))]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 120)
+        # _spawnable: on Windows a python-shebang script cannot be
+        # CreateProcess'd directly (WinError 193); re-invoke via this
+        # interpreter, the same fix the executor paths already use.
+        proc = subprocess.run(_spawnable(cmd), capture_output=True, text=True, timeout=timeout + 120)
     except subprocess.TimeoutExpired:
         out["error"] = "evalid audit timed out after %ss" % timeout
         return out
