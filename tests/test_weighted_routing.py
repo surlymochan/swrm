@@ -126,6 +126,44 @@ class WeightedRoutingTests(unittest.TestCase):
         self.assertEqual(info["margin"], 0.10)
         self.assertTrue(any("weighted routing" in r for r in new["reasons"]))
 
+    def test_weighted_on_switches_to_advised_custom_backend(self):
+        """M6 slice 2 blocker (#117): advice must see custom backends.
+
+        Regression test for the slice-1 bug where routing_advice() only
+        checked the built-in PLANNERS table, so a custom backend with a
+        1.00 pass rate against a 0.00 default pick never got advice and
+        weighted routing never rerouted to it (two real runs stayed on
+        echo-bad and failed; evidence in m6-slice2-evidence-2026-11-11.md).
+        """
+        policy = weighted_policy(weighted=True)
+        policy["routing"]["default_order"] = ["echo-bad", "echo-good"]
+        st = scenario()
+        custom = [
+            {"id": "echo-bad", "name": "Echo Bad", "command": ["python3", "--version"],
+             "env": {}, "quota_source": "none", "model": "echo-bad-1"},
+            {"id": "echo-good", "name": "Echo Good", "command": ["python3", "--version"],
+             "env": {}, "quota_source": "none", "model": "echo-good-1"},
+        ]
+        decision = xs.route(prof(), st, policy, custom_backends=custom)
+        self.assertTrue(decision["ok"], f"unroutable: {decision}")
+        self.assertEqual(decision["backend"], "echo-bad")
+        rows = rows_for("echo-bad", "echo-bad-1", 0) + rows_for("echo-good", "echo-good-1", 8)
+        self.write_ledger(rows)
+        advice = xs.routing_advice(prof(), "fix", st, policy, decision, custom_backends=custom)
+        self.assertEqual(advice["backend"], "echo-good")
+        self.assertEqual(advice["pass_rate"], 1.0)
+        self.assertEqual(advice["actual_pass_rate"], 0.0)
+        new, info = xs.apply_weighted_routing(prof(), "fix", st, policy, decision,
+                                              custom_backends=custom)
+        self.assertEqual(new["backend"], "echo-good")
+        self.assertEqual(new["model"], "echo-good-1")
+        self.assertTrue(new["routed_by_advice"])
+        self.assertEqual(new["routed_from"], {"backend": "echo-bad", "model": "echo-bad-1"})
+        self.assertEqual(new["advice_pass_rate"], 1.0)
+        self.assertEqual(new["actual_pass_rate"], 0.0)
+        self.assertTrue(info["applied"])
+        self.assertAlmostEqual(info["advantage"], 1.0)
+
     def test_margin_blocks_small_advantage(self):
         policy = weighted_policy(weighted=True, advice_margin=0.8)
         st = scenario()
