@@ -387,5 +387,190 @@ class CustomBackendRun(unittest.TestCase):
         self.assertIn("{prompt}", str(cm.exception))
 
 
+# ---------------------------------------------------------------- M3 slice 2, #103
+# Second custom backend ("patcher"): a different command template, env,
+# and quota source (file) from echo — still config-only, no registry code.
+# The shipped config's quota_file is relative to the repo root, so the
+# tests that route through it run with the repo root as the working dir.
+
+PATCHER_EXAMPLES = os.path.join(xs.SKILL_DIR, "examples")
+PATCHER_CONFIG = os.path.join(PATCHER_EXAMPLES, "custom-backends.patch.json")
+PATCHER_SCRIPT = os.path.join(PATCHER_EXAMPLES, "patch-cli.py")
+PATCHER_QUOTA = os.path.join(PATCHER_EXAMPLES, "patch-quota.json")
+
+
+class ChdirRootMixin:
+    def setUp(self):
+        self._saved_cwd = os.getcwd()
+        os.chdir(xs.SKILL_DIR)
+
+    def tearDown(self):
+        os.chdir(self._saved_cwd)
+
+
+class ShippedPatcherConfig(ChdirRootMixin, unittest.TestCase):
+    def load_shipped(self):
+        loaded = xs.load_custom_backends(policy=POLICY, explicit=PATCHER_CONFIG)
+        self.assertEqual(len(loaded), 1)
+        return loaded[0]
+
+    def test_shipped_config_loads_and_differs_from_echo_in_all_three_dimensions(self):
+        got = self.load_shipped()
+        self.assertEqual(got["id"], "patcher")
+        self.assertEqual(got["model"], "patcher-1")
+        # command template: different verb and flag names from echo
+        self.assertNotEqual(got["command"], ECHO_CFG["command"])
+        self.assertIn("run", got["command"])
+        self.assertIn("--task", got["command"])
+        self.assertIn("--dir", got["command"])
+        self.assertIn("--engine", got["command"])
+        self.assertNotIn("--prompt", got["command"])
+        self.assertNotIn("--workdir", got["command"])
+        # env: different variables, and one value carries a placeholder
+        self.assertEqual(set(got["env"]), {"PATCHER_PREFIX", "PATCHER_ENGINE"})
+        self.assertEqual(got["env"]["PATCHER_PREFIX"], "patcher-note")
+        self.assertEqual(got["env"]["PATCHER_ENGINE"], "{model}")
+        # quota source: file, not echo's none
+        self.assertEqual(got["quota_source"], "file")
+        self.assertNotEqual(got["quota_source"], ECHO_CFG["quota_source"])
+        self.assertTrue(got["quota_file"].endswith("patch-quota.json"))
+        with open(PATCHER_QUOTA) as fh:
+            self.assertEqual(json.load(fh), {"remaining": 100})
+
+    def test_shipped_patcher_routes_with_positive_quota(self):
+        st = copy.deepcopy(BASE)
+        r = xs.route({"type": "impl", "difficulty": 3, "backend": "patcher"}, st, POLICY,
+                     custom_backends=[self.load_shipped()])
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["backend"], "patcher")
+        self.assertEqual(r["model"], "patcher-1")
+
+    def test_patcher_not_in_automatic_order(self):
+        st = copy.deepcopy(BASE)
+        r = xs.route({"type": "impl", "difficulty": 3}, st, POLICY,
+                     custom_backends=[self.load_shipped()])
+        self.assertTrue(r["ok"], r)
+        self.assertNotEqual(r["backend"], "patcher")
+
+    def test_quota_file_zero_remaining_is_unavailable(self):
+        tmp = tempfile.mkdtemp(prefix="openswarm-patcher-quota-")
+        try:
+            qfile = os.path.join(tmp, "quota.json")
+            with open(qfile, "w") as fh:
+                json.dump({"remaining": 0}, fh)
+            good = xs.validate_custom_backends(
+                doc({"id": "patcher",
+                     "command": [sys.executable, "{prompt}"],
+                     "quota_source": "file", "quota_file": qfile}), "t.json")[0]
+            d, why = xs.plan_custom_backend(good, {"type": "impl", "difficulty": 3},
+                                            copy.deepcopy(BASE), POLICY, True, [])
+            self.assertIsNone(d)
+            self.assertIn("remaining", why)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_quota_file_missing_is_unavailable_with_reason(self):
+        good = xs.validate_custom_backends(
+            doc({"id": "patcher",
+                 "command": [sys.executable, "{prompt}"],
+                 "quota_source": "file",
+                 "quota_file": "/definitely/not/a/quota-file.json"}), "t.json")[0]
+        d, why = xs.plan_custom_backend(good, {"type": "impl", "difficulty": 3},
+                                        copy.deepcopy(BASE), POLICY, True, [])
+        self.assertIsNone(d)
+        self.assertIn("unreadable", why)
+
+
+class ExecPatchCli(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="openswarm-patcher-exec-")
+        self.wd = os.path.join(self.tmp, "work")
+        os.makedirs(self.wd)
+        self.rdir = os.path.join(self.tmp, "run")
+        os.makedirs(self.rdir)
+        self.cfg = xs.load_custom_backends(policy=POLICY, explicit=PATCHER_CONFIG)[0]
+        self.decision = {"backend": "patcher", "model": "patcher-1",
+                         "custom_backend": self.cfg}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_patch_cli_runs_and_reports_done(self):
+        evp = os.path.join(self.rdir, "events.1.patcher.jsonl")
+        rc, final, meta, err = xs.exec_custom_cli(
+            self.decision, copy.deepcopy(BASE), "add patch-note.md with a note",
+            self.wd, self.rdir, 60, evp)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((final or {}).get("status"), "done")
+        self.assertIn("patch-note.md", (final or {}).get("files_changed", []))
+        with open(os.path.join(self.wd, "patch-note.md")) as fh:
+            body = fh.read()
+        self.assertIn("add patch-note.md with a note", body)
+        self.assertIn("patcher-note", body)
+        self.assertIn("patcher-1", body)
+        self.assertEqual(meta.get("custom_backend"), "patcher")
+
+
+class PatcherRun(ChdirRootMixin, unittest.TestCase):
+    def setUp(self):
+        ChdirRootMixin.setUp(self)
+        self.tmp = tempfile.mkdtemp(prefix="openswarm-patcher-e2e-")
+        self.cwd = os.path.join(self.tmp, "work")
+        os.makedirs(self.cwd)
+        subprocess.run(["git", "init", "-q"], cwd=self.cwd, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=self.cwd, check=True)
+        subprocess.run(["git", "config", "user.name", "test"], cwd=self.cwd, check=True)
+        with open(os.path.join(self.cwd, "README.md"), "w") as fh:
+            fh.write("# demo\n")
+        subprocess.run(["git", "add", "."], cwd=self.cwd, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=self.cwd, check=True)
+        self._env = {k: os.environ.get(k) for k in ("OPENSWARM_STATE_FILE",)}
+        os.environ["OPENSWARM_STATE_FILE"] = _load.FIXTURE_STATE
+        if os.path.exists(xs.BREAKERS):
+            os.remove(xs.BREAKERS)
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        ChdirRootMixin.tearDown(self)
+
+    def dispatch(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                xs.cmd_run(ns(cwd=self.cwd, backends_file=PATCHER_CONFIG, backend="patcher",
+                              prompt="add a file patch-note.md with a note",
+                              verify="test -f patch-note.md && grep -q patcher-note patch-note.md "
+                                     "&& grep -q patcher-1 patch-note.md",
+                              title="patcher backend e2e"), POLICY)
+            except SystemExit as e:
+                return e.code
+        self.fail("cmd_run returned without exiting")
+
+    @unittest.skipIf(os.name == "nt", "worktree dispatch relies on POSIX symlinks and shell prepare steps; "
+                                       "Windows git/symlink semantics differ (same reason as test_workspace)")
+    def test_patcher_backend_dispatches_verify_and_ledgers(self):
+        self.assertEqual(self.dispatch(), 0)
+        entry, result = self.last_result()
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(result.get("backend"), "patcher")
+        self.assertEqual(entry.get("backend"), "patcher")
+        branch = result.get("branch")
+        self.assertTrue(branch)
+        shown = subprocess.run(["git", "show", f"{branch}:patch-note.md"], cwd=self.cwd,
+                               capture_output=True, text=True, check=True).stdout
+        self.assertIn("add a file patch-note.md with a note", shown)
+        self.assertIn("patcher-note", shown)
+
+    def last_result(self):
+        with open(xs.LEDGER) as f:
+            entry = json.loads(f.readlines()[-1])
+        with open(os.path.join(xs.RUNS, entry["id"], "result.json")) as f:
+            return entry, json.load(f)
+
+
 if __name__ == "__main__":
     unittest.main()

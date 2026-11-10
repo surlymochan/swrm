@@ -1,0 +1,1 @@
+{"backends":[{"command":["python3","patch-cli.py","run","--task","{prompt}","--dir","{worktree}","--engine","{model}"],"env":{"PATCHER_ENGINE":"{model}","PATCHER_PREFIX":"patcher-note"},"id":"patcher","model":"patcher-1","name":"Patch CLI (example custom backend — writes patch-note.md from prompt + env)","quota_file":"examples/patch-quota.json","quota_source":"file"}]}
