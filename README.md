@@ -658,7 +658,18 @@ executors: `status`, `summary`, `files_changed`, `tests`).
 remaining-quota variable), `command` (needs `quota_command`, an argv list
 whose stdout is a number or `{"remaining": n}`), or `file` (needs
 `quota_file`, same format). A backend whose quota reads exhausted is skipped
-by the router with the reason recorded.
+by the router with the reason recorded. `quota_file` is read from the
+current directory (use an absolute path if you run from elsewhere); command
+tokens naming a file next to the config resolve against the config
+directory instead.
+
+A second shipped example proves the same contract with a different backend
+in all three dimensions — no code changes: [`examples/patch-cli.py`](examples/patch-cli.py)
+with [`examples/custom-backends.patch.json`](examples/custom-backends.patch.json)
+uses a different command template (`run --task {prompt} --dir {worktree}
+--engine {model}`), different env (`PATCHER_PREFIX`, `PATCHER_ENGINE={model}`
+— an env value carrying a placeholder), and a `file` quota source
+([`examples/patch-quota.json`](examples/patch-quota.json)):
 
 Custom backends are opt-in, like `pi` / `agy` / `cursor`: only an explicit
 `--backend <id>` routes to one — they never join the automatic
