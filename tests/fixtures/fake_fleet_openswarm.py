@@ -70,8 +70,10 @@ elif sys.argv[1:2] == ["run"]:
     parser = argparse.ArgumentParser()
     parser.add_argument("--detach", action="store_true")
     parser.add_argument("--scope", choices=("repo", "host"), default="repo")
-    for flag in ("cwd", "task-file", "base", "backend", "model", "effort", "verify", "budget-minutes"):
+    for flag in ("cwd", "task-file", "base", "backend", "model", "effort", "verify", "budget-minutes",
+                 "card-type", "rework-of", "backends-file"):
         parser.add_argument("--" + flag)
+    parser.add_argument("--paths", nargs="*")
     args = parser.parse_args(sys.argv[2:])
     rid = "fake-" + uuid.uuid4().hex[:10]
     active = [path for path in (home / "runs").glob("*/stub.json") if not path.with_name("result.json").exists()]

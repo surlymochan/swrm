@@ -211,6 +211,66 @@ class WeightedRoutingTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     xs.routing_advice_margin({"routing": {"advice_margin": bad}})
 
+    def test_batch_weighted_route_off_makes_no_routing_calls(self):
+        """M7 slice 1 (#122): with weighted false the batch path must not
+        even ask route()/get_state(), so dispatch stays byte-identical."""
+        policy = weighted_policy(weighted=False)
+        st = scenario()
+        spec = {"backend": "codex", "backend_explicit": False, "model": None, "card_type": "fix"}
+        with mock.patch.object(xs, "route", side_effect=AssertionError("route must not be called")), \
+                mock.patch.object(xs, "get_state", side_effect=AssertionError("get_state must not be called")):
+            backend, model, info, decision = xs.batch_weighted_route(spec, policy)
+        self.assertEqual((backend, model, info, decision), ("codex", None, None, None))
+
+    def test_batch_weighted_route_falls_back_when_advised_backend_fails_to_plan(self):
+        policy = weighted_policy(weighted=True)
+        st = scenario()
+        self.seed(policy, st)
+        real_route = xs.route
+
+        def flaky_route(prof, state, pol, exclude=(), custom_backends=()):
+            if prof.get("backend") == "ocgo":
+                return {"ok": False, "reasons": ["ocgo planner unavailable"]}
+            return real_route(prof, state, pol, exclude, custom_backends)
+
+        spec = {"backend": "codex", "backend_explicit": False, "model": None, "card_type": "fix"}
+        with mock.patch.object(xs, "get_state", return_value=st), \
+                mock.patch.object(xs, "route", side_effect=flaky_route):
+            backend, model, info, new_decision = xs.batch_weighted_route(spec, policy)
+        self.assertEqual(backend, "codex")
+        self.assertFalse(info["applied"])
+        self.assertIn("failed to plan", info["reason"])
+        # The fallback returns the original (default) decision, unmodified.
+        self.assertEqual(new_decision["backend"], "codex")
+        self.assertNotIn("routed_by_advice", new_decision)
+
+    def test_batch_weighted_route_falls_back_when_state_is_unavailable(self):
+        policy = weighted_policy(weighted=True)
+        st = scenario()
+        self.seed(policy, st)
+        spec = {"backend": "codex", "backend_explicit": False, "model": None, "card_type": "fix"}
+        with mock.patch.object(xs, "get_state", side_effect=RuntimeError("probe failed")):
+            backend, model, info, new_decision = xs.batch_weighted_route(spec, policy)
+        self.assertEqual(backend, "codex")
+        self.assertFalse(info["applied"])
+        self.assertIn("unavailable", info["reason"])
+        self.assertIsNone(new_decision)
+
+    def test_batch_weighted_route_treats_unflagged_spec_backend_as_explicit(self):
+        """Specs written before backend_explicit existed carry a backend but
+        no flag; treat that backend as explicit so an old queued batch never
+        reroutes."""
+        policy = weighted_policy(weighted=True)
+        st = scenario()
+        self.seed(policy, st)
+        spec = {"backend": "codex", "model": None, "card_type": "fix"}
+        with mock.patch.object(xs, "get_state", return_value=st):
+            backend, model, info, new_decision = xs.batch_weighted_route(spec, policy)
+        self.assertEqual(backend, "codex")
+        self.assertFalse(info["applied"])
+        self.assertIn("explicit --backend", info["reason"])
+        self.assertIsNone(new_decision)
+
     def test_cmd_run_executes_on_advised_backend(self):
         policy = weighted_policy(weighted=True)
         state = scenario()
