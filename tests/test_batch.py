@@ -298,5 +298,147 @@ class BatchTests(FakeFleetFixture, unittest.TestCase):
         self.assertEqual(self.git(self.repo, "rev-parse", summary["cards"][0]["branch"]), summary["cards"][0]["commit"])
 
 
+class BatchDependencyTests(unittest.TestCase):
+    """M4 slice 1 (#106): depends_on parsing, validation, topological order."""
+
+    def test_parse_card_dependencies(self):
+        self.assertEqual(xs.parse_card_dependencies("depends_on: a.md, b.md\nDo the thing"),
+                         ["a.md", "b.md"])
+        self.assertEqual(xs.parse_card_dependencies("Do the thing\ndepends_on: [a.md]\n"), ["a.md"])
+        self.assertEqual(xs.parse_card_dependencies("Do the thing"), [])
+        self.assertEqual(xs.parse_card_dependencies("depends_on: a.md, a.md\n"), ["a.md"])
+        self.assertEqual(xs.parse_card_dependencies("depends_on:\nDo the thing"), [])
+
+    def test_strip_card_dependencies_removes_declaration_line(self):
+        self.assertEqual(xs.strip_card_dependencies("depends_on: a.md\nDo the thing\n"), "Do the thing\n")
+        self.assertEqual(xs.strip_card_dependencies("Do the thing\n"), "Do the thing\n")
+
+    def test_topo_sort_orders_dependencies_first(self):
+        order = xs.topo_sort_cards({"a.md": [], "b.md": ["a.md"], "c.md": ["a.md", "b.md"]})
+        self.assertEqual(order, ["a.md", "b.md", "c.md"])
+
+    def test_topo_sort_stable_without_dependencies(self):
+        self.assertEqual(xs.topo_sort_cards({"b.md": [], "a.md": [], "c.md": []}),
+                         ["a.md", "b.md", "c.md"])
+
+    def test_topo_sort_rejects_unknown_dependency(self):
+        with self.assertRaises(ValueError) as ctx:
+            xs.topo_sort_cards({"a.md": ["ghost.md"]})
+        message = str(ctx.exception)
+        self.assertIn("a.md", message)
+        self.assertIn("ghost.md", message)
+
+    def test_topo_sort_rejects_self_dependency(self):
+        with self.assertRaises(ValueError) as ctx:
+            xs.topo_sort_cards({"a.md": ["a.md"]})
+        self.assertIn("a.md", str(ctx.exception))
+
+    def test_topo_sort_rejects_cycle(self):
+        with self.assertRaises(ValueError) as ctx:
+            xs.topo_sort_cards({"a.md": ["b.md"], "b.md": ["a.md"]})
+        message = str(ctx.exception)
+        self.assertIn("a.md", message)
+        self.assertIn("b.md", message)
+        self.assertIn("cycle", message)
+
+
+class BatchPlanTests(FakeFleetFixture, unittest.TestCase):
+    """M4 slice 1 (#106): `batch plan` output and dispatch in topo order."""
+
+    def plan(self, **fields):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            xs.cmd_batch(self.args(batch_action="plan", **fields), xs.load_policy())
+        return json.loads(output.getvalue())
+
+    def test_plan_prints_topological_order(self):
+        (self.cards / "a.md").write_text("task a")
+        (self.cards / "b.md").write_text("depends_on: a.md\ntask b")
+        (self.cards / "c.md").write_text("depends_on: a.md, b.md\ntask c")
+        plan = self.plan()
+        self.assertEqual(plan["order"], ["a.md", "b.md", "c.md"])
+        self.assertEqual(plan["cards"], [
+            {"card": "a.md", "depends_on": [], "order": 0},
+            {"card": "b.md", "depends_on": ["a.md"], "order": 1},
+            {"card": "c.md", "depends_on": ["a.md", "b.md"], "order": 2},
+        ])
+
+    def test_plan_without_dependencies_keeps_filename_order(self):
+        (self.cards / "b.md").write_text("task b")
+        (self.cards / "a.md").write_text("task a")
+        self.assertEqual(self.plan()["order"], ["a.md", "b.md"])
+
+    def test_plan_rejects_unknown_dependency(self):
+        (self.cards / "a.md").write_text("depends_on: ghost.md\ntask a")
+        with self.assertRaises(ValueError) as ctx:
+            self.plan()
+        message = str(ctx.exception)
+        self.assertIn("a.md", message)
+        self.assertIn("ghost.md", message)
+
+    def test_plan_rejects_self_dependency(self):
+        (self.cards / "a.md").write_text("depends_on: a.md\ntask a")
+        with self.assertRaises(ValueError) as ctx:
+            self.plan()
+        self.assertIn("a.md", str(ctx.exception))
+
+    def test_plan_rejects_cycle(self):
+        (self.cards / "a.md").write_text("depends_on: b.md\ntask a")
+        (self.cards / "b.md").write_text("depends_on: a.md\ntask b")
+        with self.assertRaises(ValueError) as ctx:
+            self.plan()
+        message = str(ctx.exception)
+        self.assertIn("a.md", message)
+        self.assertIn("b.md", message)
+        self.assertIn("cycle", message)
+
+    def test_batch_creation_records_plan_and_orders_rows(self):
+        (self.cards / "a.md").write_text("task a")
+        (self.cards / "b.md").write_text("depends_on: a.md\ntask b")
+        rc, summary, _ = self.run_batch()
+        self.assertEqual(rc, 0)
+        self.assertEqual([row["card"] for row in summary["cards"]], ["a.md", "b.md"])
+        self.assertEqual(summary["plan"], [
+            {"card": "a.md", "depends_on": [], "order": 0},
+            {"card": "b.md", "depends_on": ["a.md"], "order": 1},
+        ])
+        self.assertEqual(summary["cards"][1]["depends_on"], ["a.md"])
+        self.assertEqual(summary["cards"][1]["order"], 1)
+
+    def test_batch_creation_rejects_unknown_dependency(self):
+        (self.cards / "a.md").write_text("depends_on: ghost.md\ntask a")
+        with self.assertRaises(ValueError):
+            self.run_batch()
+        self.assertFalse(list((self.data / "batches").glob("*/summary.json")))
+
+    def test_batch_dispatch_waits_for_dependency(self):
+        (self.cards / "a.md").write_text("task a")
+        (self.cards / "c.md").write_text("depends_on: a.md\ntask c")
+        rc, summary, _ = self.run_batch()
+        self.assertEqual(rc, 0)
+        events = []
+        for host in ("b1", "b2"):
+            events.extend(json.loads(line)
+                          for line in (self.root / host / "data" / "calls.jsonl").read_text().splitlines())
+        starts = {event["card"].strip().splitlines()[-1]: event
+                  for event in events if event["event"] == "start"}
+        finishes = {event["id"]: event["ts"] for event in events if event["event"] == "finish"}
+        self.assertLess(finishes[starts["task a"]["id"]], starts["task c"]["ts"])
+
+    def test_batch_launch_strips_depends_on_from_dispatched_card(self):
+        (self.cards / "a.md").write_text("depends_on: b.md\ntask a")
+        (self.cards / "b.md").write_text("task b")
+        rc, summary, _ = self.run_batch()
+        self.assertEqual(rc, 0)
+        calls = []
+        for host in ("b1", "b2"):
+            calls.extend(json.loads(line)
+                         for line in (self.root / host / "data" / "calls.jsonl").read_text().splitlines())
+        start = next(call for call in calls
+                     if call["event"] == "start" and "task a" in call["card"])
+        self.assertNotIn("depends_on", start["card"])
+        self.assertIn("task a", start["card"])
+
+
 if __name__ == "__main__":
     unittest.main()
