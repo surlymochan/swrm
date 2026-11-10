@@ -6,10 +6,10 @@ usage: openswarm batch [-h] [--repo REPO] [--cards CARDS] [--hosts HOSTS]
                        [--scope {repo,host}] [--detach]
                        [--card-type CARD_TYPE] [--rework-of REWORK_OF]
                        [--paths PATHS [PATHS ...]]
-                       [{status}] [id]
+                       [{status,plan}] [id]
 
 positional arguments:
-  {status}
+  {status,plan}
   id
 
 options:

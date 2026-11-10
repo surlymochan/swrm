@@ -10080,6 +10080,125 @@ def safe_id(value):
     return value
 
 
+_DEPENDS_ON_RE = re.compile(r"^depends_on:[ \t]*([^\n]*?)[ \t]*$", re.MULTILINE)
+
+
+def parse_card_dependencies(text):
+    """Declared batch dependencies from a card's `depends_on:` line.
+
+    One line, comma-separated card filenames, e.g. `depends_on: a.md, b.md`.
+    Brackets (`depends_on: [a.md]`) are accepted; duplicates are removed with
+    order preserved. No such line means no dependencies.
+    """
+    match = _DEPENDS_ON_RE.search(text)
+    if not match:
+        return []
+    raw = match.group(1).strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    deps = []
+    for part in raw.split(","):
+        dep = part.strip().strip("\"'")
+        if dep and dep not in deps:
+            deps.append(dep)
+    return deps
+
+
+def strip_card_dependencies(text):
+    """Remove the planner-only `depends_on:` line before dispatch.
+
+    The declaration is planner metadata (M4 slice 1, #106); the executor only
+    ever sees the task text, and the run title stays the first task line.
+    Accepts str or bytes and preserves everything else byte-for-byte.
+    """
+    if isinstance(text, bytes):
+        return re.sub(rb"^depends_on:[^\n]*\n?", b"", text, flags=re.MULTILINE)
+    return re.sub(r"^depends_on:[^\n]*\n?", "", text, flags=re.MULTILINE)
+
+
+def topo_sort_cards(deps_by_card):
+    """Order batch cards so every dependency precedes its dependents.
+
+    Stable: among cards whose dependencies are all placed, filename order
+    wins, so a batch without dependencies keeps its previous order. A
+    self-dependency, an unknown dependency, or a cycle raises ValueError with
+    an actionable message naming the card and the fix; nothing is silently
+    dropped or skipped.
+    """
+    names = sorted(deps_by_card)
+    for name in names:
+        for dep in deps_by_card[name]:
+            if dep == name:
+                raise ValueError(
+                    f"card {name!r} depends on itself; remove {name!r} from its own depends_on line")
+            if dep not in deps_by_card:
+                raise ValueError(
+                    f"card {name!r} depends on unknown card {dep!r} (no such file in the cards directory); "
+                    f"add the missing card file or remove {dep!r} from {name!r}'s depends_on line")
+    # Name the cycle explicitly (Kahn's algorithm alone cannot); a depth-first
+    # walk over the validated graph always finds one when a cycle exists.
+    visiting, visited, stack = set(), set(), []
+
+    def visit(name):
+        if name in visited:
+            return
+        if name in visiting:
+            cycle = stack[stack.index(name):] + [name]
+            raise ValueError(
+                "dependency cycle detected: " + " -> ".join(cycle) +
+                "; break the cycle by removing one depends_on entry")
+        visiting.add(name)
+        stack.append(name)
+        for dep in deps_by_card[name]:
+            visit(dep)
+        stack.pop()
+        visiting.discard(name)
+        visited.add(name)
+
+    for name in names:
+        visit(name)
+    remaining = {name: set(deps_by_card[name]) for name in names}
+    order = []
+    while remaining:
+        ready = [name for name in names if name in remaining and not remaining[name]]
+        first = ready[0]
+        order.append(first)
+        del remaining[first]
+        for deps in remaining.values():
+            deps.discard(first)
+    return order
+
+
+def batch_plan(cards_dir):
+    """Validate a cards directory and return its dispatch plan in topo order.
+
+    Returns {"cards": [{"card", "depends_on", "order"}], "order": [names]}.
+    Raises ValueError for an empty directory or any invalid dependency.
+    """
+    paths = sorted(path for path in glob.glob(os.path.join(os.path.abspath(cards_dir), "*"))
+                   if os.path.isfile(path))
+    if not paths:
+        raise ValueError("cards directory contains no files")
+    deps = {}
+    for path in paths:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            deps[os.path.basename(path)] = parse_card_dependencies(stream.read())
+    order = topo_sort_cards(deps)
+    cards = [{"card": name, "depends_on": deps[name], "order": i} for i, name in enumerate(order)]
+    return {"cards": cards, "order": order}
+
+
+def batch_dependencies_finished(summary, row):
+    """True when every card this row depends on has reached a terminal state.
+
+    Slice 1 gates only on finished (any outcome); skipping a dependent card
+    when its dependency failed is slice 2 (#105). Rows from batches created
+    before depends_on existed carry no field and are treated as independent.
+    """
+    finished = {other["card"] for other in summary["cards"] if other["state"] == "finished"}
+    return all(dep in finished for dep in row.get("depends_on") or [])
+
+
 def batch_save(summary):
     directory = os.path.join(DATA, "batches", summary["id"])
     jsave(os.path.join(directory, "summary.json"), summary)
@@ -10127,7 +10246,9 @@ def batch_collect(spec, row, result):
 def batch_launch(spec, row):
     host = spec["hosts"][row["host"]]
     with open(row["path"], "rb") as stream:
-        card = stream.read()
+        # depends_on is planner metadata (M4 slice 1, #106); strip it so the
+        # executor only ever sees the task text.
+        card = strip_card_dependencies(stream.read())
     source = ("import os, sys, tempfile; fd, path = tempfile.mkstemp(prefix='openswarm-card-', suffix='.md'); "
               "stream = os.fdopen(fd, 'wb'); stream.write(sys.stdin.buffer.read()); stream.close(); print(path)")
     path = host_require(host, host_python(host, source, input=card), "card copy").decode().strip()
@@ -10248,6 +10369,10 @@ def execute_batch(spec, summary):
                         break
                     if row["host"] != name or row["state"] != "queued" or row.get("run_id"):
                         continue
+                    if not batch_dependencies_finished(summary, row):
+                        # M4 slice 1 (#106): dispatch follows topo order; a card
+                        # waits until every dependency has finished (any outcome).
+                        continue
                     lock_path = os.path.join(DATA, "fleet-provider-concurrency.lock")
                     with open(lock_path, "a") as lock:
                         _flock(lock, LOCK_EX)
@@ -10287,6 +10412,11 @@ def cmd_batch(args, policy):
             summary["state"] = "dead"
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return
+    if args.batch_action == "plan":
+        if not args.cards:
+            raise ValueError("batch plan requires --cards")
+        print(json.dumps(batch_plan(args.cards), indent=2, ensure_ascii=False))
+        return
     if args.batch_id:
         directory = os.path.join(DATA, "batches", safe_id(args.batch_id))
         spec, summary = jload(os.path.join(directory, "spec.json")), jload(os.path.join(directory, "summary.json"))
@@ -10310,9 +10440,8 @@ def cmd_batch(args, policy):
     repo = os.path.realpath(os.path.expanduser(host_repo(local, args.repo, local=True)))
     base = host_require(local, host_git(local, repo, ["rev-parse", "--verify", "--end-of-options",
                                                     (args.base or "HEAD") + "^{commit}"]), "base resolution").decode().strip()
-    paths = sorted(path for path in glob.glob(os.path.join(os.path.abspath(args.cards), "*")) if os.path.isfile(path))
-    if not paths:
-        raise ValueError("cards directory contains no files")
+    plan = batch_plan(args.cards)
+    paths = [os.path.join(os.path.abspath(args.cards), entry["card"]) for entry in plan["cards"]]
     minutes = args.budget_minutes if args.budget_minutes is not None else policy["run"]["timeout_seconds"] / 60
     backend = args.backend
     decision = None
@@ -10336,8 +10465,9 @@ def cmd_batch(args, policy):
             "budget_minutes": args.budget_minutes or round(policy["run"]["timeout_seconds"] / 60),
             "poll_seconds": args.poll_seconds}
     summary = {"id": bid, "repo": args.repo, "base": base, "scope": getattr(args, "scope", "repo"),
-               "state": "queued", "started": NOW(), "cards": [
+               "state": "queued", "started": NOW(), "plan": plan["cards"], "cards": [
         {"card": os.path.basename(path), "path": path, "host": names[i % len(names)], "state": "queued", "status": "queued",
+         "depends_on": plan["cards"][i]["depends_on"], "order": i,
          "verify_rc": None, "branch": None, "commit": None, "seconds": None, "summary": ""} for i, path in enumerate(paths)]}
     directory = os.path.join(DATA, "batches", bid)
     jsave(os.path.join(directory, "spec.json"), spec)
@@ -12612,7 +12742,7 @@ def main():
     fp.add_argument("--timeout", type=float, default=600)
 
     sp = sub.add_parser("batch", help="queue task cards across fleet hosts and collect branches")
-    sp.add_argument("batch_action", nargs="?", choices=["status"])
+    sp.add_argument("batch_action", nargs="?", choices=["status", "plan"])
     sp.add_argument("id", nargs="?")
     sp.add_argument("--repo")
     sp.add_argument("--cards")

@@ -226,6 +226,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm lane systemd-unit` | Print an uninstalled systemd unit for a lane. | `openswarm lane systemd-unit K1` |
 | `openswarm batch` | Queue task cards across fleet hosts and collect their branches. | `openswarm batch --repo project --cards ./cards --hosts worker,sandbox --per-host 1 --backend pi --budget-minutes 20 --detach` |
 | `openswarm batch status` | Show the state of one batch. | `openswarm batch status <batch-id>` |
+| `openswarm batch plan` | Validate card dependencies and print the dispatch order without launching. | `openswarm batch plan --cards ./cards` |
 | `openswarm bus init` | Create the bus labels, issue template, and protocol README. | `openswarm bus init acme/openswarm-bus` |
 | `openswarm bus status` | Show open bus issues with their executor and age. | `openswarm bus status --json` |
 | `openswarm bus-worker` | Run the reference bus executor; `--once` claims at most one queued issue. | `openswarm bus-worker --bus acme/openswarm-bus --name runner-1 --backend codex --once` |
@@ -536,7 +537,14 @@ openswarm batch status <batch-id>
 
 The batch wakes each selected instabox once, checks swrm and the checkout, and makes `--base REV` available
 on every host (default: the planner checkout's `HEAD`). Sorted cards are assigned round-robin; `--per-host`
-defaults to 1, with remaining cards queued until slots free. Backend, model and effort flags are optional and pass
+defaults to 1, with remaining cards queued until slots free. A card can declare dependencies with a
+`depends_on:` line (`depends_on: a.md, b.md`); the planner validates the declaration (an unknown card, a
+self-dependency, or a cycle is a hard error naming the card and the fix), orders dispatch topologically, and
+waits for each dependency to finish before launching its dependents. `openswarm batch plan --cards ./cards`
+prints that order as JSON without launching anything, and the plan is recorded in the batch's `summary.json`.
+The `depends_on:` line is planner metadata and is stripped before the card reaches the executor. (Stacking a
+dependency's branch into the next worktree, and skipping dependents when a dependency fails verification, are
+not part of this slice; see issue #105.) Backend, model and effort flags are optional and pass
 through to each `run --detach`. One line is printed per state change; detached output goes to
 `$OPENSWARM_HOME/batches/<id>/batch.out`. Polling works without Monitor.
 
