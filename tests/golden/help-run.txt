@@ -4,13 +4,13 @@ usage: openswarm run [-h] [--type TYPE] [--difficulty DIFFICULTY]
                      [--model MODEL] [--effort EFFORT] [--card-type CARD_TYPE]
                      [--rework-of REWORK_OF] [--paths PATHS [PATHS ...]]
                      [--prompt PROMPT] [--task-file TASK_FILE] [--title TITLE]
-                     [--cwd CWD] [--scope {repo,host}] [--base BASE]
-                     [--no-worktree] [--verify-baseline] [--verify VERIFY]
-                     [--auto-rework [N]] [--verify-evalid]
-                     [--evalid-bin EVALID_BIN] [--keep-worktree]
-                     [--no-fallback] [--budget-minutes BUDGET_MINUTES]
-                     [--detach] [--dry-run] [--read-only]
-                     [--executor EXECUTOR]
+                     [--backends-file BACKENDS_FILE] [--cwd CWD]
+                     [--scope {repo,host}] [--base BASE] [--no-worktree]
+                     [--verify-baseline] [--verify VERIFY] [--auto-rework [N]]
+                     [--verify-evalid] [--evalid-bin EVALID_BIN]
+                     [--keep-worktree] [--no-fallback]
+                     [--budget-minutes BUDGET_MINUTES] [--detach] [--dry-run]
+                     [--read-only] [--executor EXECUTOR]
 
 options:
   -h, --help            show this help message and exit
@@ -35,6 +35,9 @@ options:
   --prompt PROMPT
   --task-file TASK_FILE
   --title TITLE
+  --backends-file BACKENDS_FILE
+                        custom backends config (JSON, M3 slice 1, #101);
+                        defaults to $OPENSWARM_HOME/backends.json
   --cwd CWD
   --scope {repo,host}   task scope (repo by default; host for authorized host
                         operations)

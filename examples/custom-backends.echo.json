@@ -1,0 +1,23 @@
+{
+    "backends": [
+        {
+            "command": [
+                "python3",
+                "echo-cli.py",
+                "--prompt",
+                "{prompt}",
+                "--workdir",
+                "{worktree}",
+                "--model",
+                "{model}"
+            ],
+            "env": {
+                "ECHO_MODEL": "echo-1"
+            },
+            "id": "echo",
+            "model": "echo-1",
+            "name": "Echo CLI (example custom backend \u2014 writes the prompt to echo-output.txt)",
+            "quota_source": "none"
+        }
+    ]
+}
