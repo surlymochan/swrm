@@ -11524,6 +11524,117 @@ Tokens use reported usage; absent usage counts as zero. Verification time is exc
 </main></body></html>"""
 
 
+def run_ledger_verdict(rid):
+    """Ledger verdict for one run: the verify_evalid verdict, else the verify rc.
+
+    Ledger entries win; result.json is the fallback. Returns "n/a" when neither
+    source records a verdict — never invent one."""
+    entry = None
+    for candidate in ledger_entries():
+        if str(candidate.get("id") or "") == rid:
+            entry = candidate
+    for source in (entry, jload(os.path.join(RUNS, rid, "result.json"), {}) or {}):
+        if not isinstance(source, dict):
+            continue
+        verdict = (source.get("verify_evalid") or {}).get("verdict")
+        if isinstance(verdict, str) and verdict:
+            return verdict
+        verify = source.get("verify") or {}
+        rc = verify.get("rc") if isinstance(verify, dict) else None
+        if isinstance(rc, int) and not isinstance(rc, bool):
+            return "rc %d" % rc
+    return "n/a"
+
+
+def checkin_report(policy, since_minutes):
+    """Live check-in data: quota headroom + active runs + runs finished since
+    --since-minutes + attention list. cmd_report prints from this dict; the
+    HTML snapshot renders from it too."""
+    st = get_state(policy)
+    c, cx, oc, ds = st["claude"], st["codex"], st["ocgo"], st["deepseek"]
+    cw = worst_window((cx["limits"].get("codex") or {}).get("windows"))
+    hot = [m for m in oc["models"] if not m["excluded"]]
+    oc_used = max((max(m["usage"].values()) for m in hot), default=0)
+    cl = worst_window({"5h": c["five_hour"], "7d": c["seven_day"]})
+    quota = [
+        {"label": "claude", "plan": c["plan"],
+         "text": ("%.0f%%" % (cl["used"] * 100)) if cl and not c["stale"] else "n/a"},
+        {"label": "codex", "plan": cx["plan"],
+         "text": ("%.0f%%" % (cw["used"] * 100)) if cw else "n/a",
+         "suffix": (" pace %.2fx" % cw["pace"]) if cw and cw.get("pace") else ""},
+        {"label": "ocgo", "plan": oc["plan"], "text": "max-model %.0f%%" % (oc_used * 100)},
+        {"label": "deepseek", "plan": None,
+         "text": "%s %s" % (ds.get("balance"), ds.get("currency") or "")},
+    ]
+    ids = sorted(os.listdir(RUNS), reverse=True)[:200] if os.path.isdir(RUNS) else []
+    rows = [run_digest(i) for i in ids]
+    active = [r for r in rows if r["state"] in ("queued", "routing", "running", "finalizing", "dead")]
+    cutoff = NOW() - since_minutes * 60
+    recent = [r for r in rows if r["state"] == "finished"
+              and (jload(f"{RUNS}/{r['id']}/status.json", {}) or {}).get("finished", 0) >= cutoff]
+    for row in active + recent:
+        row["verdict"] = run_ledger_verdict(row["id"])
+    tally = {}
+    for r in recent:
+        tally[r["status"]] = tally.get(r["status"], 0) + 1
+    needs = [r for r in active if r["state"] == "dead" or
+             (r["state"] == "running" and r["budget_min"] and r["elapsed_min"] > r["budget_min"])]
+    needs += [r for r in recent if r["status"] not in ("done",)]
+    return {"generated_at": time.strftime("%m-%d %H:%M"), "since_minutes": since_minutes,
+            "quota": quota, "active": active, "recent_finished": recent,
+            "tally": tally, "attention": needs}
+
+
+def checkin_report_html(data):
+    """Single-file live check-in snapshot, zero external resources. Same visual
+    system as daily_report_html (light/dark via prefers-color-scheme)."""
+    esc = lambda value: html.escape(str(value if value is not None else "—"))
+
+    def table(headers, rows):
+        head = "".join(f"<th scope='col'>{esc(h)}</th>" for h in headers)
+        body = "".join("<tr>" + "".join(f"<td>{esc(cell)}</td>" for cell in row) + "</tr>" for row in rows)
+        if not body:
+            body = f"<tr><td colspan='{len(headers)}'>No runs</td></tr>"
+        return f"<div class='scroll'><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
+
+    def runs(title, rows):
+        return f"<section><h2>{title}</h2>" + table(
+            ["Run", "Backend", "Lane", "Scope", "State", "Status", "Elapsed min", "Ledger verdict", "Title"],
+            [[r["id"], f"{r.get('backend') or '—'}/{r.get('model') or '—'}", r.get("lane") or "—",
+              r.get("scope", "repo"), r.get("state"), r.get("status"),
+              r.get("elapsed_min"), r.get("verdict", "n/a"), r.get("title")] for r in rows]) + "</section>"
+
+    quota = data.get("quota") or []
+    cards_html = "".join(
+        f"<div class='card'><span>{esc(q['label'] + (' (' + q['plan'] + ')' if q.get('plan') else ''))}</span>"
+        f"<strong>{esc(q.get('text', 'n/a') + q.get('suffix', ''))}</strong></div>" for q in quota)
+    attention = data.get("attention") or []
+    attention_html = ("<section><h2>Attention</h2>" + table(["Run", "State", "Status", "Ledger verdict"],
+        [[r["id"], r.get("state"), r.get("status"), r.get("verdict", "n/a")] for r in attention]) + "</section>"
+        if attention else "<section><h2>Attention</h2><p>None</p></section>")
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>openswarm live check-in — {esc(data.get('generated_at', ''))}</title>
+<style>
+:root{{color-scheme:light dark;--bg:#f4f6f8;--panel:#fff;--text:#16212b;--muted:#526170;--line:#d8e0e7;--accent:#176c57}}
+@media(prefers-color-scheme:dark){{:root{{--bg:#10171d;--panel:#19232c;--text:#edf3f8;--muted:#a5b6c6;--line:#34434f;--accent:#78d7b8}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,sans-serif}}
+main{{max-width:1250px;margin:40px auto;padding:0 24px}}h1{{font-size:30px;margin:0}}h2{{font-size:20px;margin:0 0 16px}}
+p,.card span{{color:var(--muted)}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px}}
+.card,section{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px}}section{{margin-top:24px}}
+.card span,.card strong{{display:block}}.card strong{{font-size:27px;color:var(--accent);margin-top:8px}}
+.scroll{{overflow:auto}}table{{width:100%;border-collapse:collapse;text-align:left}}th,td{{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}}
+th{{white-space:nowrap;color:var(--muted);font-size:13px}}td:last-child{{min-width:80px;overflow-wrap:anywhere}}
+footer{{color:var(--muted);margin-top:24px;font-size:13px}}
+</style></head><body><main><h1>openswarm · Live check-in</h1>
+<p>{esc(data.get('generated_at', ''))} · last {esc(data.get('since_minutes', ''))} minutes · Local ledger</p><div class="cards">{cards_html}</div>
+{runs('Active runs', data.get('active') or '')}{runs('Recently finished runs', data.get('recent_finished') or '')}
+{attention_html}
+<footer>Quota is live headroom at snapshot time; finished runs are those completed in the window above.
+Ledger verdict is the verify_evalid verdict (ledger first, result.json fallback), else the verify exit code, else n/a.</footer>
+</main></body></html>"""
+
+
 def cmd_daily_report(args, policy):
     report = daily_report(policy, getattr(args, "date", None))
     if getattr(args, "html", None):
@@ -11544,26 +11655,30 @@ def cmd_daily_report(args, policy):
 
 def cmd_report(args, policy):
     """Compact check-in: quota headroom + active runs + runs finished since --since-minutes. For scheduled reports."""
-    if any(getattr(args, key, None) for key in ("daily", "date", "html", "json")):
+    if any(getattr(args, key, None) for key in ("daily", "date", "json")):
         cmd_daily_report(args, policy)
         return
-    st = get_state(policy)
-    c, cx, oc, ds = st["claude"], st["codex"], st["ocgo"], st["deepseek"]
-    cw = worst_window((cx["limits"].get("codex") or {}).get("windows"))
-    hot = [m for m in oc["models"] if not m["excluded"]]
-    oc_used = max((max(m["usage"].values()) for m in hot), default=0)
-    cl = worst_window({"5h": c["five_hour"], "7d": c["seven_day"]})
-    print(f"[openswarm report {time.strftime('%m-%d %H:%M')}]")
-    print(f"quota  claude({c['plan']}) {('%.0f%%' % (cl['used'] * 100)) if cl and not c['stale'] else 'n/a'}"
-          f" | codex({cx['plan']}) {('%.0f%%' % (cw['used'] * 100)) if cw else 'n/a'}"
-          f"{(' pace %.2fx' % cw['pace']) if cw and cw.get('pace') else ''}"
-          f" | ocgo({oc['plan']}) max-model {oc_used:.0%} | deepseek {ds.get('balance')} {ds.get('currency') or ''}")
-    ids = sorted(os.listdir(RUNS), reverse=True)[:200] if os.path.isdir(RUNS) else []
-    rows = [run_digest(i) for i in ids]
-    active = [r for r in rows if r["state"] in ("queued", "routing", "running", "finalizing", "dead")]
-    cutoff = NOW() - args.since_minutes * 60
-    recent = [r for r in rows if r["state"] == "finished"
-              and (jload(f"{RUNS}/{r['id']}/status.json", {}) or {}).get("finished", 0) >= cutoff]
+    if getattr(args, "html", None):
+        data = checkin_report(policy, args.since_minutes)
+        path = os.path.abspath(args.html)
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write(checkin_report_html(data))
+        except OSError as exc:
+            sys.exit(f"openswarm: cannot write HTML report to {path}: {exc.strerror or exc} "
+                     "(check the directory exists and is writable)")
+        print(f"HTML: {path}")
+        return
+    data = checkin_report(policy, args.since_minutes)
+    quota = " | ".join(
+        (f"{q['label']}({q['plan']}) {q['text']}" if q.get("plan") else f"{q['label']} {q['text']}")
+        + q.get("suffix", "") for q in data["quota"])
+    print(f"[openswarm report {data['generated_at']}]")
+    print(f"quota  {quota}")
+    active = data["active"]
     print(f"active {len(active)}")
     for r in active:
         warn = []
@@ -11576,16 +11691,13 @@ def cmd_report(args, policy):
         print(f"  {r['id']} {r['backend']}/{r['model']}"
               f"{' lane=' + r['lane'] if r.get('lane') else ''} scope={r.get('scope', 'repo')} {r['elapsed_min']}m/{r['budget_min']}m cmds={r['cmds']} "
               f"{'⚠ ' + ', '.join(warn) if warn else ''}\n    {r['title']} — {r['last_msg'][:140]}")
-    tally = {}
-    for r in recent:
-        tally[r["status"]] = tally.get(r["status"], 0) + 1
-    print(f"finished in last {args.since_minutes}m: {len(recent)} {tally if tally else ''}")
+    recent = data["recent_finished"]
+    print(f"finished in last {data['since_minutes']}m: {len(recent)} {data['tally'] if data['tally'] else ''}")
     for r in recent:
         print(f"  {r['status']:<15} {r['backend']}/{r['model']}"
               f"{' lane=' + r['lane'] if r.get('lane') else ''} scope={r.get('scope', 'repo')} {r['elapsed_min']}m  {r['title']}"
               f"{'  commit ' + r['commit'][:10] if r.get('commit') else ''}")
-    needs = [r for r in active if r["state"] == "dead" or (r["state"] == "running" and r["budget_min"] and r["elapsed_min"] > r["budget_min"])]
-    needs += [r for r in recent if r["status"] not in ("done",)]
+    needs = data["attention"]
     print(f"attention {len(needs)}" + ("" if not needs else ": " + ", ".join(f"{r['id']}({r['status'] or r['state']})" for r in needs)))
 
 
@@ -12847,7 +12959,8 @@ def main():
     sp.add_argument("--since-minutes", type=float, default=60)
     sp.add_argument("--daily", action="store_true", help="report one local ledger day without live probes")
     sp.add_argument("--date", help="daily report date (YYYY-MM-DD; policy timezone)")
-    sp.add_argument("--html", help="write a self-contained daily HTML report")
+    sp.add_argument("--html", help="write a self-contained HTML report: live check-in snapshot "
+                                    "(with --daily/--date, the daily report)")
     sp.add_argument("--json", action="store_true", help="daily report as JSON")
 
     sp = sub.add_parser("retro", help="run the weekly fleet retrospective")
