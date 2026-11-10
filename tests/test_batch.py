@@ -57,6 +57,7 @@ class FakeFleetFixture:
         (self.data / "fleet.json").write_text(json.dumps({"hosts": list(self.hosts.values())}))
         self.calls = []
         self.patches = [mock.patch.object(xs, "DATA", str(self.data)),
+                        mock.patch.object(xs, "LEDGER", str(self.data / "ledger.jsonl")),
                         mock.patch.object(xs, "host_run", side_effect=self.transport),
                         mock.patch.object(xs, "sh", side_effect=self.shell)]
         for patch in self.patches:
@@ -112,6 +113,32 @@ class BatchTests(FakeFleetFixture, unittest.TestCase):
         remote_args = host_json.call_args.args[1]
         self.assertEqual(remote_args[remote_args.index("--paths") + 1:], ["src/widget.py"])
         self.assertEqual(remote_args[remote_args.index("--scope") + 1], "host")
+
+    def test_batch_launch_passes_backends_file_to_remote_run(self):
+        card = self.cards / "one.md"
+        card.write_text("Update src/widget.py")
+        spec = {"hosts": {"b1": self.hosts["b1"]}, "repos": {"b1": str(self.repo)}, "scope": "repo",
+                "base": self.base, "paths": [], "card_type": None,
+                "backends_file": "/tmp/m4-backends.json"}
+        row = {"host": "b1", "path": str(card), "run_id": "run1"}
+        with mock.patch.object(xs, "host_python", side_effect=[b"remote-card.md", b""]), \
+                mock.patch.object(xs, "host_require", side_effect=lambda host, output, context: output), \
+                mock.patch.object(xs, "host_json", return_value={"id": "run1"}) as host_json:
+            self.assertEqual(xs.batch_launch(spec, row), "run1")
+        remote_args = host_json.call_args.args[1]
+        self.assertEqual(remote_args[remote_args.index("--backends-file") + 1], "/tmp/m4-backends.json")
+
+    def test_batch_launch_without_backends_file_passes_no_flag(self):
+        card = self.cards / "one.md"
+        card.write_text("Update src/widget.py")
+        spec = {"hosts": {"b1": self.hosts["b1"]}, "repos": {"b1": str(self.repo)}, "scope": "repo",
+                "base": self.base, "paths": [], "card_type": None}
+        row = {"host": "b1", "path": str(card), "run_id": "run1"}
+        with mock.patch.object(xs, "host_python", side_effect=[b"remote-card.md", b""]), \
+                mock.patch.object(xs, "host_require", side_effect=lambda host, output, context: output), \
+                mock.patch.object(xs, "host_json", return_value={"id": "run1"}) as host_json:
+            self.assertEqual(xs.batch_launch(spec, row), "run1")
+        self.assertNotIn("--backends-file", host_json.call_args.args[1])
 
     def test_batch_host_scope_reaches_remote_run(self):
         (self.cards / "one.md").write_text("host maintenance")
@@ -438,6 +465,131 @@ class BatchPlanTests(FakeFleetFixture, unittest.TestCase):
                      if call["event"] == "start" and "task a" in call["card"])
         self.assertNotIn("depends_on", start["card"])
         self.assertIn("task a", start["card"])
+
+
+class BatchSlice2Tests(FakeFleetFixture, unittest.TestCase):
+    """M4 slice 2 (#108): branch stacking + failure blocking."""
+
+    def summary_with(self, rows):
+        return {"id": "batch-test", "cards": rows}
+
+    def row(self, card, state="finished", status="done", commit=None, order=0, depends_on=None):
+        return {"card": card, "state": state, "status": status, "commit": commit,
+                "order": order, "depends_on": depends_on or []}
+
+    def test_stack_base_without_dependencies_is_batch_base(self):
+        base, stacked_on = xs.batch_stack_base(self.summary_with([]), self.row("a.md"))
+        self.assertIsNone(base)
+        self.assertEqual(stacked_on, {})
+
+    def test_stack_base_uses_latest_finished_dependency_commit(self):
+        summary = self.summary_with([
+            self.row("a.md", commit="aaa", order=0),
+            self.row("b.md", commit="bbb", order=1, depends_on=["a.md"]),
+        ])
+        base, stacked_on = xs.batch_stack_base(summary, self.row("c.md", depends_on=["a.md", "b.md"]))
+        self.assertEqual(base, "bbb")
+        self.assertEqual(stacked_on, {"a.md": "aaa", "b.md": "bbb"})
+
+    def test_stack_base_no_change_dependency_falls_back_to_batch_base(self):
+        summary = self.summary_with([self.row("a.md", commit=None, order=0)])
+        base, stacked_on = xs.batch_stack_base(
+            summary, self.row("b.md", depends_on=["a.md"]), batch_base=self.base)
+        self.assertEqual(base, self.base)
+        self.assertEqual(stacked_on, {"a.md": self.base})
+
+    def test_dependency_failure_none_when_dependencies_pass(self):
+        summary = self.summary_with([self.row("a.md", commit="aaa")])
+        self.assertIsNone(xs.batch_dependency_failure(summary, self.row("b.md", depends_on=["a.md"])))
+
+    def test_dependency_failure_none_while_dependency_unfinished(self):
+        summary = self.summary_with([self.row("a.md", state="started", status="running")])
+        self.assertIsNone(xs.batch_dependency_failure(summary, self.row("b.md", depends_on=["a.md"])))
+
+    def test_dependency_failure_names_failed_dependency_and_verify_rc(self):
+        summary = self.summary_with([
+            self.row("a.md", status="failed", commit="aaa", order=0)])
+        summary["cards"][0]["verify_rc"] = 1
+        summary["cards"][0]["summary"] = "verify failed"
+        dep, reason = xs.batch_dependency_failure(summary, self.row("b.md", depends_on=["a.md"]))
+        self.assertEqual(dep, "a.md")
+        self.assertIn("failed", reason)
+        self.assertIn("1", reason)
+
+    def test_dependency_failure_is_transitive_through_blocked(self):
+        summary = self.summary_with([
+            self.row("a.md", status="failed", order=0),
+            self.row("b.md", status="blocked", order=1, depends_on=["a.md"]),
+        ])
+        dep, _reason = xs.batch_dependency_failure(summary, self.row("c.md", depends_on=["b.md"]))
+        self.assertEqual(dep, "b.md")
+
+    def real_git(self, args, cwd, timeout=60):
+        # The fixture mocks xs.sh (which xs.git delegates to) to always
+        # succeed, so ancestry checks must run the real git binary here.
+        proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, timeout=timeout)
+        return proc.returncode, proc.stdout.decode(), proc.stderr.decode()
+
+    def test_verify_stacked_accepts_ancestor_and_rejects_unrelated(self):
+        spec = {"repo_path": str(self.repo)}
+        with mock.patch.object(xs, "git", side_effect=self.real_git):
+            xs.batch_verify_stacked(spec, {"stacked_on": {"a.md": self.initial}}, self.base)
+            with self.assertRaises(RuntimeError):
+                xs.batch_verify_stacked(spec, {"stacked_on": {"a.md": self.base}}, self.initial)
+
+    def test_batch_stacks_dependency_branch_into_successor(self):
+        (self.cards / "a.md").write_text("task a")
+        (self.cards / "b.md").write_text("depends_on: a.md\ntask b")
+        rc, summary, _ = self.run_batch()
+        self.assertEqual(rc, 0)
+        a_row, b_row = summary["cards"]
+        self.assertEqual(b_row["base"], a_row["commit"])
+        self.assertEqual(b_row["stacked_on"], {"a.md": a_row["commit"]})
+        starts = []
+        for host in ("b1", "b2"):
+            starts.extend(json.loads(line) for line in
+                          (self.root / host / "data" / "calls.jsonl").read_text().splitlines()
+                          if json.loads(line)["event"] == "start")
+        b_start = next(call for call in starts if "task b" in call["card"])
+        self.assertEqual(b_start["args"]["base"], a_row["commit"])
+        self.assertEqual(self.git(self.repo, "merge-base", "--is-ancestor", a_row["commit"], b_row["commit"]), "")
+        self.assertEqual(self.git(self.repo, "show", f"{b_row['branch']}:{a_row['run_id']}.txt"), "task a")
+
+    def test_batch_blocks_dependent_when_dependency_fails(self):
+        (self.cards / "a.md").write_text("FAIL task a")
+        (self.cards / "b.md").write_text("depends_on: a.md\ntask b")
+        (self.cards / "c.md").write_text("depends_on: b.md\ntask c")
+        rc, summary, _ = self.run_batch()
+        self.assertEqual(rc, 1)
+        a_row, b_row, c_row = summary["cards"]
+        self.assertEqual(a_row["status"], "failed")
+        self.assertEqual(a_row["verify_rc"], 1)
+        self.assertEqual(b_row["status"], "blocked")
+        self.assertEqual(b_row["blocked_by"], "a.md")
+        self.assertIn("a.md", b_row["summary"])
+        self.assertEqual(c_row["status"], "blocked")
+        self.assertEqual(c_row["blocked_by"], "b.md")
+        self.assertNotIn("run_id", b_row)
+        self.assertNotIn("run_id", c_row)
+        starts = []
+        for host in ("b1", "b2"):
+            calls_path = self.root / host / "data" / "calls.jsonl"
+            if not calls_path.exists():
+                continue
+            starts.extend(json.loads(line) for line in calls_path.read_text().splitlines())
+        started_cards = [call["card"] for call in starts if call["event"] == "start"]
+        self.assertEqual(len(started_cards), 1)
+        self.assertNotIn("task b", " ".join(started_cards))
+        self.assertNotIn("task c", " ".join(started_cards))
+        ledger = [json.loads(line) for line in
+                  (self.data / "ledger.jsonl").read_text().splitlines()]
+        blocked = [entry for entry in ledger if entry.get("status") == "blocked"]
+        self.assertEqual({entry["card"] for entry in blocked}, {"b.md", "c.md"})
+        self.assertEqual({entry["blocked_by"] for entry in blocked}, {"a.md", "b.md"})
+        self.assertTrue(all(entry.get("batch_id") == summary["id"] for entry in blocked))
+        markdown = (self.data / "batches" / summary["id"] / "summary.md").read_text()
+        self.assertIn("blocked", markdown)
+
 
 
 if __name__ == "__main__":

@@ -10191,12 +10191,115 @@ def batch_plan(cards_dir):
 def batch_dependencies_finished(summary, row):
     """True when every card this row depends on has reached a terminal state.
 
-    Slice 1 gates only on finished (any outcome); skipping a dependent card
-    when its dependency failed is slice 2 (#105). Rows from batches created
+    Passing vs failing is decided separately by batch_dependency_failure
+    (slice 2, #108): a finished dependency that did not pass blocks its
+    dependents instead of releasing them. Rows from batches created
     before depends_on existed carry no field and are treated as independent.
     """
     finished = {other["card"] for other in summary["cards"] if other["state"] == "finished"}
     return all(dep in finished for dep in row.get("depends_on") or [])
+
+
+def batch_dependency_failure(summary, row):
+    """(dep card, reason) when a finished dependency did not pass, else None.
+
+    A dependency passes only with status "done": a run failure lands as
+    status "failed", a verify failure downgrades "done" to "partial" (host
+    verify is the authority), and a "blocked" dependency blocks
+    transitively. Unfinished dependencies return None (the caller keeps
+    waiting); rows from batches created before depends_on existed carry no
+    field and are treated as independent.
+    """
+    by_card = {other["card"]: other for other in summary["cards"]}
+    for dep in row.get("depends_on") or []:
+        other = by_card.get(dep)
+        if other is None or other.get("state") != "finished":
+            continue
+        if other.get("status") == "done":
+            continue
+        reason = f"dependency {dep!r} {other.get('status')}"
+        verify_rc = other.get("verify_rc")
+        if verify_rc is not None:
+            reason += f" (verify_rc={verify_rc})"
+        detail = (other.get("summary") or "").strip()
+        if detail:
+            reason += f": {short(detail, 120)}"
+        return dep, reason
+    return None
+
+
+def batch_stack_base(summary, row, batch_base=None):
+    """(base commit, stacked_on) for dispatching a row whose deps all passed.
+
+    The successor starts from the commit of its latest (highest-order)
+    finished dependency, so in a chain each step builds on the previous
+    branch. stacked_on maps every dependency card to the commit stacked.
+    A passed dependency with no commit made no changes, so it stacks as the
+    batch base. With no dependencies, (None, {}) means "use the batch base".
+    """
+    by_card = {other["card"]: other for other in summary["cards"]}
+    stacked_on, base, latest_order = {}, None, -1
+    for dep in row.get("depends_on") or []:
+        other = by_card.get(dep)
+        if other is None or other.get("state") != "finished" or other.get("status") != "done":
+            continue
+        commit = other.get("commit") or batch_base
+        if not commit:
+            raise ValueError(
+                f"cannot stack dependency {dep!r} for {row['card']!r}: it passed but has no commit "
+                f"and no batch base is available")
+        stacked_on[dep] = commit
+        if (other.get("order") or 0) >= latest_order:
+            base, latest_order = commit, (other.get("order") or 0)
+    return base, stacked_on
+
+
+def batch_verify_stacked(spec, row, commit):
+    """Raise unless every stacked dependency commit is an ancestor of commit.
+
+    Guards the collection path: a successor branch that does not contain its
+    predecessor's commit is not a stacked branch, so it must fail collection
+    rather than be recorded as stacked.
+    """
+    for dep, dep_commit in (row.get("stacked_on") or {}).items():
+        rc, _, _ = git(["merge-base", "--is-ancestor", dep_commit, commit], spec["repo_path"])
+        if rc:
+            raise RuntimeError(
+                f"successor branch does not contain stacked dependency {dep} "
+                f"({str(dep_commit)[:12]} not an ancestor of {str(commit)[:12]})")
+
+
+def batch_block_row(summary, row, dep, reason):
+    """Mark a queued row blocked by a failed dependency (M4 slice 2, #108).
+
+    Records the block in the batch summary and in the ledger, and returns
+    the (dep, reason) pair. Callers must not dispatch the row afterwards.
+    """
+    row["blocked_by"] = dep
+    row["blocked_reason"] = reason
+    batch_change(summary, row, "finished", status="blocked",
+                 summary=f"blocked by {dep}: {reason}")
+    batch_record_blocked(summary, row, dep, reason)
+    return dep, reason
+
+
+def batch_record_blocked(summary, row, dep, reason):
+    """Ledger entry for a card that was never dispatched (M4 slice 2, #108).
+
+    Blocked cards have no run id; the entry id names the batch and card so
+    the ledger still shows the dispatch decision with its blocking cause.
+    A ledger write failure must not fail the batch, so it is reported and
+    the batch summary (which always records the block) stays authoritative.
+    """
+    try:
+        append_ledger({"id": f"batch-{summary['id']}-{row['card']}", "ts": NOW(),
+                       "title": f"batch {row['card']} blocked by {dep}",
+                       "status": "blocked", "batch_id": summary["id"], "card": row["card"],
+                       "blocked_by": dep, "blocked_reason": reason,
+                       "scope": summary.get("scope")})
+    except OSError as error:
+        print(f"openswarm: warning: could not record blocked card {row['card']} in ledger: {error}",
+              file=sys.stderr)
 
 
 def batch_save(summary):
@@ -10238,26 +10341,39 @@ def batch_collect(spec, row, result):
                 raise RuntimeError(f"{host['name']}: fetched commit differs from run result")
             host_require(host, host_git(host, spec["repos"][row["host"]], ["branch", "-D", branch]),
                          "remote branch cleanup")
+    if commit:
+        batch_verify_stacked(spec, row, commit)
     return {"status": result.get("status") or "failed", "verify_rc": (result.get("verify") or {}).get("rc"),
             "branch": branch, "commit": commit, "seconds": result.get("seconds"),
             "summary": short((result.get("result") or {}).get("summary") or result.get("summary"), 200)}
 
 
-def batch_launch(spec, row):
+def batch_launch(spec, row, base=None):
     host = spec["hosts"][row["host"]]
     with open(row["path"], "rb") as stream:
         # depends_on is planner metadata (M4 slice 1, #106); strip it so the
         # executor only ever sees the task text.
         card = strip_card_dependencies(stream.read())
+    base = base or spec["base"]
+    if base != spec["base"]:
+        # M4 slice 2 (#108): the successor starts from its predecessor's
+        # branch HEAD, so that commit must exist on the executor host first.
+        fetched = transfer_ref(spec["local"], spec["repo_path"], base, host,
+                               spec["repos"][row["host"]],
+                               "refs/openswarm-bases/" + spec["id"] + "-stacked")
+        if fetched != base:
+            raise RuntimeError(f"{host['name']}: stacked base transfer mismatch")
     source = ("import os, sys, tempfile; fd, path = tempfile.mkstemp(prefix='openswarm-card-', suffix='.md'); "
               "stream = os.fdopen(fd, 'wb'); stream.write(sys.stdin.buffer.read()); stream.close(); print(path)")
     path = host_require(host, host_python(host, source, input=card), "card copy").decode().strip()
     try:
-        args = ["run", "--detach", "--cwd", spec["repos"][row["host"]], "--task-file", path, "--base", spec["base"],
+        args = ["run", "--detach", "--cwd", spec["repos"][row["host"]], "--task-file", path, "--base", base,
                 "--scope", spec.get("scope", "repo")]
         for key in ("backend", "model", "effort", "verify", "budget_minutes", "card_type", "rework_of"):
             if spec.get(key) is not None:
                 args += ["--" + key.replace("_", "-"), str(spec[key])]
+        if spec.get("backends_file"):
+            args += ["--backends-file", spec["backends_file"]]
         if spec.get("paths"):
             args += ["--paths", *spec["paths"]]
         reply = host_json(host, args)
@@ -10333,6 +10449,16 @@ def execute_batch(spec, summary):
                 if fetched != spec["base"]:
                     raise RuntimeError(f"{name}: base transfer mismatch")
         while any(row["state"] != "finished" for row in summary["cards"]):
+            # M4 slice 2 (#108): a card whose dependency finished without
+            # passing is never dispatched. Cards are in topo order, so a
+            # blocked card blocks its own dependents in the same pass.
+            for row in summary["cards"]:
+                if row["state"] != "queued" or row.get("run_id"):
+                    continue
+                failure = batch_dependency_failure(summary, row)
+                if failure is None:
+                    continue
+                batch_block_row(summary, row, *failure)
             for name, host in spec["hosts"].items():
                 active = [row for row in summary["cards"] if row["host"] == name and row.get("run_id")
                           and row["state"] != "finished"]
@@ -10371,7 +10497,21 @@ def execute_batch(spec, summary):
                         continue
                     if not batch_dependencies_finished(summary, row):
                         # M4 slice 1 (#106): dispatch follows topo order; a card
-                        # waits until every dependency has finished (any outcome).
+                        # waits until every dependency has finished.
+                        continue
+                    # M4 slice 2 (#108): the gate above is checked again here
+                    # because a dependency can finish (failing) mid-tick, after
+                    # the scan at the top of this loop iteration ran.
+                    failure = batch_dependency_failure(summary, row)
+                    if failure is not None:
+                        batch_block_row(summary, row, *failure)
+                        continue
+                    try:
+                        base, stacked_on = batch_stack_base(summary, row, spec["base"])
+                    except ValueError as e:
+                        # Stacking data is missing before any run started, so
+                        # no live run can be hiding behind this card.
+                        batch_change(summary, row, "finished", status="failed", summary=str(e))
                         continue
                     lock_path = os.path.join(DATA, "fleet-provider-concurrency.lock")
                     with open(lock_path, "a") as lock:
@@ -10379,8 +10519,11 @@ def execute_batch(spec, summary):
                         if not batch_provider_slot_available(spec, row):
                             continue
                         try:
-                            row["run_id"] = batch_launch(spec, row)
+                            row["run_id"] = batch_launch(spec, row, base=base)
                             row["started"] = NOW()
+                            row["base"] = base or spec["base"]
+                            if stacked_on:
+                                row["stacked_on"] = stacked_on
                             batch_change(summary, row, "started", status="running")
                             count += 1
                         except (OSError, ValueError, RuntimeError, KeyError) as e:
@@ -10458,6 +10601,7 @@ def cmd_batch(args, policy):
     spec = {"id": bid, "repo": args.repo, "repo_path": repo, "base": base, "local": local, "hosts": chosen,
             "repos": {name: host_repo(host, args.repo, local=host["kind"] == "local") for name, host in chosen.items()},
             "per_host": args.per_host, "backend": backend, "provider": execution_provider(backend, decision, policy),
+            "backends_file": getattr(args, "backends_file", None),
             "concurrency": concurrency_caps, "model": args.model, "effort": args.effort,
             "card_type": getattr(args, "card_type", None), "rework_of": getattr(args, "rework_of", None),
             "paths": getattr(args, "paths", None) or [],
@@ -12488,7 +12632,7 @@ def main():
     # commands instead of silently falling back to the built-ins, and the
     # custom ids join the --backend choices.
     custom_backends = []
-    if len(sys.argv) > 1 and sys.argv[1] in ("route", "run"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("route", "run", "batch"):
         try:
             custom_backends = load_custom_backends(policy=load_policy(),
                                                    explicit=backends_file_from_argv(sys.argv))
@@ -12749,7 +12893,11 @@ def main():
     sp.add_argument("--hosts")
     sp.add_argument("--per-host", type=int, default=1)
     add_dispatch_arguments(sp, "backend", "model", "effort", "verify", "budget",
-                           backend_choices=list(PLANNERS), budget_type=int)
+                           backend_choices=list(PLANNERS) + [b["id"] for b in custom_backends],
+                           budget_type=int)
+    sp.add_argument("--backends-file", help="custom backends config (JSON, M3 slice 1, #101); "
+                                            "defaults to $OPENSWARM_HOME/backends.json; "
+                                            "passed through to each run")
     sp.add_argument("--base")
     sp.add_argument("--scope", choices=("repo", "host"), default="repo", help="task scope (repo by default; host for authorized host operations)")
     sp.add_argument("--detach", action="store_true")
