@@ -120,6 +120,7 @@ Routing decisions use live quota data, not guesses.
   - At the soft limit, easy work spills to other enabled backends.
   - A hard limit skips the backend.
   - Quota that is about to expire unused gets spent at higher effort.
+- **Declarative custom backends.** Any CLI agent joins routing from one JSON config file — no code changes. See [Custom backends](#custom-backends).
 - **Isolated execution.** Each run gets its own `git worktree` and `openswarm/<id>` branch.
   - Dependency dirs (`node_modules`, `.venv`) are symlinked in and never committed.
   - For a workspace that must install dependencies inside each worktree, set `workspace.prepare`; it runs before
@@ -621,6 +622,53 @@ See [docs/BUS.md](docs/BUS.md) for the issue/result schema and worker setup. The
 
 The full rules are in [`SKILL.md`](SKILL.md#7-routing-rules-what-route-does). Every threshold is in
 [`policy.json`](policy.json).
+
+## Custom backends
+
+Any CLI agent can join routing from one JSON config file — no code changes.
+The file is `$OPENSWARM_HOME/backends.json` by default; pass `--backends-file`
+to `route` / `run`, set `OPENSWARM_CUSTOM_BACKENDS`, or point
+`custom_backends_file` at it in policy. Each entry carries an `id`, a `command`
+template, optional `env`, a `quota_source`, and an optional `model`:
+
+```json
+{
+  "backends": [
+    {
+      "id": "echo",
+      "name": "Echo CLI (example)",
+      "command": ["python3", "echo-cli.py", "--prompt", "{prompt}",
+                  "--workdir", "{worktree}", "--model", "{model}"],
+      "env": {"ECHO_MODEL": "echo-1"},
+      "quota_source": "none",
+      "model": "echo-1"
+    }
+  ]
+}
+```
+
+Placeholders: `{prompt}` (required — the task text), `{worktree}`, `{model}`.
+Command tokens naming a file next to the config resolve against the config
+directory, so a shipped example works wherever it is checked out. The
+executor runs the command in the worktree with the merged env, and parses a
+JSON result object from stdout when present (same contract as the other
+executors: `status`, `summary`, `files_changed`, `tests`).
+
+`quota_source` is one of `none`, `env` (needs `quota_env_var`, a numeric
+remaining-quota variable), `command` (needs `quota_command`, an argv list
+whose stdout is a number or `{"remaining": n}`), or `file` (needs
+`quota_file`, same format). A backend whose quota reads exhausted is skipped
+by the router with the reason recorded.
+
+Custom backends are opt-in, like `pi` / `agy` / `cursor`: only an explicit
+`--backend <id>` routes to one — they never join the automatic
+`routing.default_order`. Validation is strict: a missing field, a command
+template without `{prompt}`, an unknown `quota_source`, or an `id` that
+collides with a built-in backend all fail with an actionable error, and an
+invalid config refuses to start instead of silently falling back to the
+built-ins. A working example ships in
+[`examples/custom-backends.echo.json`](examples/custom-backends.echo.json)
+with [`examples/echo-cli.py`](examples/echo-cli.py).
 
 ## Architecture
 

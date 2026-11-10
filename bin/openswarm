@@ -3307,6 +3307,313 @@ PLANNERS = {"codex": plan_codex, "ocgo": plan_ocgo, "deepseek": plan_deepseek, "
             "agy": plan_agy, "pi": plan_pi, "hermes": plan_hermes, "copilot": plan_copilot}
 
 
+# ---------------------------------------------------------------- custom backends (M3 slice 1, #101)
+# Declarative custom backends: any CLI agent joins routing from one JSON
+# config file — no code changes. A custom backend is opt-in (like pi/agy):
+# only an explicit --backend <id> routes to it; custom backends never join
+# the automatic default_order. An invalid config refuses to start; it never
+# silently falls back to the built-ins.
+
+
+class CustomBackendConfigError(ValueError):
+    """A custom-backends config file is missing, malformed, or invalid."""
+
+
+CUSTOM_BACKEND_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+CUSTOM_BACKEND_FIELDS = {"id", "name", "command", "env", "quota_source",
+                         "quota_env_var", "quota_command", "quota_file", "model"}
+CUSTOM_QUOTA_SOURCES = ("none", "env", "command", "file")
+CUSTOM_BACKEND_QUOTA_FIELDS = {"env": "quota_env_var", "command": "quota_command",
+                               "file": "quota_file"}
+
+
+def backends_file_from_argv(argv):
+    """Explicit --backends-file value from an argv list, or None."""
+    for i, arg in enumerate(argv):
+        if arg == "--backends-file" and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--backends-file="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def custom_backends_path(policy, explicit=None):
+    """Resolve the custom-backends config path: --backends-file, then the
+    OPENSWARM_CUSTOM_BACKENDS env var, then policy custom_backends_file,
+    then $OPENSWARM_HOME/backends.json. Returns (path, explicit?)."""
+    if explicit:
+        return os.path.expanduser(explicit), True
+    env_path = envvar("CUSTOM_BACKENDS")
+    if env_path:
+        return os.path.expanduser(env_path), True
+    configured = (policy or {}).get("custom_backends_file")
+    if configured:
+        path = os.path.expanduser(str(configured))
+        if not os.path.isabs(path):
+            path = os.path.join(SKILL_DIR, path)
+        return path, True
+    return os.path.join(DATA, "backends.json"), False
+
+
+def validate_custom_backends(data, source):
+    """Validate a parsed custom-backends document; return normalized backends.
+
+    Every failure raises CustomBackendConfigError with the file, the backend
+    id, and what to fix — a bad config must refuse to start, never silently
+    degrade to the built-ins.
+    """
+    def err(backend_id, problem, fix):
+        where = f"{source}: backend {backend_id!r}" if backend_id else source
+        raise CustomBackendConfigError(f"{where}: {problem}; {fix}")
+
+    if not isinstance(data, dict):
+        raise CustomBackendConfigError(
+            f"{source}: top level must be a JSON object with a 'backends' list, "
+            f"got {type(data).__name__}; fix the file or remove it")
+    if "backends" not in data:
+        raise CustomBackendConfigError(
+            f"{source}: missing top-level 'backends' list; add \"backends\": [...]")
+    raw = data["backends"]
+    if not isinstance(raw, list):
+        raise CustomBackendConfigError(
+            f"{source}: 'backends' must be a list, got {type(raw).__name__}; "
+            f"wrap the backend entries in [...]")
+    builtins = set(PLANNERS) | set(BACKEND_ALIASES)
+    seen, out = set(), []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise CustomBackendConfigError(
+                f"{source}: each backend entry must be an object, got "
+                f"{type(entry).__name__}; fix the entry or remove it")
+        unknown = sorted(set(entry) - CUSTOM_BACKEND_FIELDS)
+        if unknown:
+            raise CustomBackendConfigError(
+                f"{source}: backend {entry.get('id')!r}: unknown field(s) "
+                f"{', '.join(unknown)}; allowed fields are "
+                f"{', '.join(sorted(CUSTOM_BACKEND_FIELDS))}")
+        backend_id = entry.get("id")
+        if not isinstance(backend_id, str) or not backend_id:
+            err(None, "each backend needs a non-empty string 'id'",
+                "add \"id\": \"<name>\" (lowercase letters, digits, '-' or '_')")
+        if not CUSTOM_BACKEND_ID_RE.match(backend_id):
+            err(backend_id, f"'id' {backend_id!r} is not a valid backend id",
+                "use lowercase letters, digits, '-' or '_' starting with a letter or digit")
+        if backend_id in builtins:
+            err(backend_id, f"'id' {backend_id!r} collides with a built-in backend",
+                "pick a different 'id' — built-in ids cannot be overridden")
+        if backend_id in seen:
+            err(backend_id, "duplicate 'id'",
+                "give each backend a unique 'id'")
+        seen.add(backend_id)
+        command = entry.get("command")
+        if not isinstance(command, list) or not command:
+            err(backend_id, "'command' must be a non-empty list of argv tokens",
+                "set \"command\": [\"<binary>\", ..., \"{prompt}\", ...]")
+        if any(not isinstance(tok, str) or not tok for tok in command):
+            err(backend_id, "'command' tokens must be non-empty strings",
+                "remove the empty/non-string token from 'command'")
+        if "{prompt}" not in " ".join(command):
+            err(backend_id, "'command' template must include the {prompt} placeholder",
+                "add \"{prompt}\" to one of the command arguments — that is how "
+                "the task text reaches the agent")
+        env = entry.get("env", {})
+        if not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str)
+                                            for k, v in env.items()):
+            err(backend_id, "'env' must be an object of string to string",
+                "quote the env values, e.g. \"env\": {\"FOO\": \"bar\"}")
+        quota_source = entry.get("quota_source")
+        if quota_source not in CUSTOM_QUOTA_SOURCES:
+            err(backend_id, f"'quota_source' must be one of {', '.join(CUSTOM_QUOTA_SOURCES)}, "
+                f"got {quota_source!r}", "set \"quota_source\": \"none\" when the backend "
+                "reports no usable quota, or \"env\" / \"command\" / \"file\" with its field")
+        for source_name, field in CUSTOM_BACKEND_QUOTA_FIELDS.items():
+            if source_name == quota_source:
+                value = entry.get(field)
+                if source_name == "command":
+                    ok = isinstance(value, list) and bool(value) and all(
+                        isinstance(tok, str) and tok for tok in value)
+                else:
+                    ok = isinstance(value, str) and bool(value)
+                if not ok:
+                    err(backend_id, f"'quota_source' {quota_source!r} requires '{field}'",
+                        f"add \"{field}\" (env var name / argv list / file path)")
+            elif field in entry:
+                err(backend_id, f"'{field}' only applies when 'quota_source' is {source_name!r}",
+                    f"remove \"{field}\" or set \"quota_source\": \"{source_name}\"")
+        model = entry.get("model")
+        if model is not None and (not isinstance(model, str) or not model):
+            err(backend_id, "'model' must be a non-empty string when present",
+                "remove 'model' or set it to the backend's model name")
+        name = entry.get("name")
+        if name is not None and (not isinstance(name, str) or not name):
+            err(backend_id, "'name' must be a non-empty string when present",
+                "remove 'name' or set it to a human-readable backend name")
+        normalized = {"id": backend_id, "name": name or backend_id,
+                      "command": list(command), "env": dict(env),
+                      "quota_source": quota_source, "model": model}
+        for source_name, field in CUSTOM_BACKEND_QUOTA_FIELDS.items():
+            if source_name == quota_source:
+                normalized[field] = entry[field]
+        out.append(normalized)
+    return out
+
+
+def load_custom_backends(policy=None, explicit=None):
+    """Load and validate the custom-backends config, or [] when no file is
+    configured. An explicitly configured file that is missing or invalid is
+    an error; the default $OPENSWARM_HOME/backends.json simply means no
+    custom backends when absent."""
+    path, is_explicit = custom_backends_path(policy, explicit)
+    if not os.path.isfile(path):
+        if is_explicit:
+            raise CustomBackendConfigError(
+                f"custom backends file not found: {path} "
+                f"(passed via --backends-file, OPENSWARM_CUSTOM_BACKENDS, or "
+                f"policy custom_backends_file); fix the path or remove the setting")
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise CustomBackendConfigError(
+            f"custom backends file {path} is not readable JSON ({exc}); "
+            f"fix the file or remove it") from exc
+    backends = validate_custom_backends(data, path)
+    # Command tokens naming a file next to the config resolve against the
+    # config directory, so a shipped example works wherever it is checked out.
+    config_dir = os.path.dirname(os.path.abspath(path))
+    for backend in backends:
+        resolved = []
+        for tok in backend["command"]:
+            if ("{" not in tok and not tok.startswith("-") and not os.path.isabs(tok)
+                    and os.path.isfile(os.path.join(config_dir, tok))):
+                tok = os.path.join(config_dir, tok)
+            resolved.append(tok)
+        backend["command"] = resolved
+    return backends
+
+
+def _quota_remaining_number(value, where):
+    """Parse a quota reading (JSON {"remaining": n} or a plain number)."""
+    if isinstance(value, dict):
+        value = value.get("remaining")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{where}: expected a number or {{\"remaining\": n}}, got {value!r}")
+    return value
+
+
+def custom_backend_quota(cfg):
+    """Check a custom backend's quota source. Returns (available, why)."""
+    source = cfg["quota_source"]
+    if source == "none":
+        return True, None
+    if source == "env":
+        var = cfg["quota_env_var"]
+        raw = os.environ.get(var)
+        if raw is None:
+            return False, f"quota env var {var} is not set"
+        try:
+            remaining = _quota_remaining_number(float(raw), var)
+        except ValueError:
+            return False, f"quota env var {var} is not a number: {raw!r}"
+        if remaining <= 0:
+            return False, f"quota exhausted ({var} remaining is {remaining})"
+        return True, None
+    if source == "command":
+        try:
+            proc = subprocess.run(cfg["quota_command"], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"quota command failed to run: {exc}"
+        if proc.returncode != 0:
+            return False, f"quota command exited {proc.returncode}: {(proc.stderr or '').strip()[:200]}"
+        try:
+            remaining = _quota_remaining_number(json.loads(proc.stdout), "quota command output")
+        except ValueError:
+            try:
+                remaining = _quota_remaining_number(float(proc.stdout.strip()), "quota command output")
+            except ValueError:
+                return False, f"quota command output is not a number or {{\"remaining\": n}}: {proc.stdout.strip()[:200]!r}"
+        if remaining <= 0:
+            return False, f"quota exhausted (quota command remaining is {remaining})"
+        return True, None
+    if source == "file":
+        try:
+            with open(os.path.expanduser(cfg["quota_file"]), encoding="utf-8") as fh:
+                raw = fh.read()
+        except OSError as exc:
+            return False, f"quota file unreadable: {exc}"
+        try:
+            remaining = _quota_remaining_number(json.loads(raw), cfg["quota_file"])
+        except ValueError:
+            try:
+                remaining = _quota_remaining_number(float(raw.strip()), cfg["quota_file"])
+            except ValueError:
+                return False, f"quota file is not a number or {{\"remaining\": n}}: {raw.strip()[:200]!r}"
+        if remaining <= 0:
+            return False, f"quota exhausted ({cfg['quota_file']} remaining is {remaining})"
+        return True, None
+    return False, f"unknown quota_source {source!r}"
+
+
+def plan_custom_backend(cfg, prof, st, policy, forced, notes):
+    """Planner for one declarative custom backend: binary resolvable and
+    quota available, or unavailable with the reason. Never degrades to a
+    different backend — the caller reports the skip."""
+    binary = cfg["command"][0]
+    if os.sep in binary or (os.altsep and os.altsep in binary):
+        resolved = binary if os.path.isfile(binary) and os.access(binary, os.X_OK) else None
+    else:
+        resolved = shutil.which(binary)
+    if not resolved:
+        return None, (f"custom backend '{cfg['id']}': command binary {binary!r} not found "
+                      f"on PATH; install it or fix the 'command' in the backends config")
+    available, why = custom_backend_quota(cfg)
+    if not available:
+        return None, f"custom backend '{cfg['id']}': quota unavailable — {why}"
+    if cfg["quota_source"] == "none":
+        notes.append(f"custom backend '{cfg['id']}': quota not metered by openswarm "
+                     f"(quota_source none)")
+    model = prof.get("model") or cfg.get("model")
+    tier = policy["difficulty_map"][str(prof["difficulty"])]["tier"]
+    return {"backend": cfg["id"], "model": model, "effort": None, "tier": tier,
+            "custom_backend": cfg}, None
+
+
+def _custom_planner(cfg):
+    def plan(p, st, policy, forced, notes):
+        return plan_custom_backend(cfg, p, st, policy, forced, notes)
+    return plan
+
+
+def exec_custom_cli(d, st, prompt, wd, rdir, timeout, evp):
+    """Run a declarative custom backend: substitute {prompt} / {worktree} /
+    {model} into the configured argv, merge the configured env, run it in
+    the worktree, and parse a JSON result object from stdout when present."""
+    cfg = d.get("custom_backend") or {}
+    model = d.get("model") or cfg.get("model") or ""
+
+    def sub(token):
+        return token.replace("{prompt}", prompt).replace("{worktree}", wd).replace("{model}", model)
+
+    cmd = [sub(tok) for tok in cfg.get("command", [])]
+    env = os.environ.copy()
+    for key, value in (cfg.get("env") or {}).items():
+        env[key] = sub(value)
+    rc = run_proc(cmd, wd, env, timeout, evp)
+    try:
+        with open(evp, errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        text = ""
+    try:
+        with open(evp + ".err", errors="replace") as fh:
+            err_tail = fh.read()[-3000:]
+    except OSError:
+        err_tail = ""
+    final = extract_json(text) if text.strip() else None
+    return rc, final, {"usage": {}, "custom_backend": cfg.get("id")}, err_tail
+
+
 def canonical_backend(name):
     """`gemini` is an accepted alias for the Antigravity (`agy`) backend."""
     return BACKEND_ALIASES.get(name, name)
@@ -3333,9 +3640,12 @@ def concurrency(st, policy):
     return {"codex": 1, "ocgo": 1}
 
 
-def route(prof, st, policy, exclude=()):
+def route(prof, st, policy, exclude=(), custom_backends=()):
     r = policy["routing"]
     default_order = list(r["default_order"])
+    planners = dict(PLANNERS)
+    for cfg in custom_backends or ():
+        planners[cfg["id"]] = _custom_planner(cfg)
 
     def prioritize(preferred):
         return [backend for backend in preferred if backend in default_order] + [
@@ -3367,7 +3677,12 @@ def route(prof, st, policy, exclude=()):
         order = [b for b in order if b not in exclude]
         skipped = {}
         for b in order:
-            d, why = PLANNERS[b](p, st, policy, bool(p.get("backend")), notes)
+            planner = planners.get(b)
+            if planner is None:
+                skipped[b] = (f"unknown backend '{b}': not a built-in backend and no custom "
+                              f"backend with that id is configured (see backends.json)")
+                continue
+            d, why = planner(p, st, policy, bool(p.get("backend")), notes)
             if d:
                 if p.get("model"):
                     d["model"] = p["model"]
@@ -3747,8 +4062,14 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
                    execution_started=status.get("execution_started") or admitted_at, workspace=wd)
         started = NOW()
         timeout = max(0, budget_deadline - NOW())
-        rc, final, meta, err_text = EXECUTORS[backend](call_decision, state, current_prompt, wd,
-                                                       rdir, timeout, event_file)
+        executor = EXECUTORS.get(backend)
+        if executor is None and decision.get("custom_backend"):
+            executor = exec_custom_cli
+        if executor is None:
+            raise ValueError(f"unknown backend '{backend}': not a built-in backend and no custom "
+                             f"backend with that id is configured (see backends.json)")
+        rc, final, meta, err_text = executor(call_decision, state, current_prompt, wd,
+                                             rdir, timeout, event_file)
         seconds = round(NOW() - started, 3)
         error_class = executor_error_class(rc, final, err_text, backend)
         # run_proc has reaped a normal 403 or reported early-result exit.
@@ -5294,7 +5615,7 @@ def new_run_id():
     return dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
 
-def cmd_run(args, policy):
+def cmd_run(args, policy, custom_backends=None):
     scope = getattr(args, "scope", "repo")
     card_type = getattr(args, "card_type", None)
     rework_of = getattr(args, "rework_of", None)
@@ -5348,6 +5669,11 @@ def cmd_run(args, policy):
     prof = profile_from_args(args)
     prof["read_only"] = (getattr(args, "read_only", False) or
                          prof.get("type") in READ_ONLY_CARD_TYPES or card_type in READ_ONLY_CARD_TYPES)
+    # Declarative custom backends (M3 slice 1, #101): an invalid config is a
+    # startup failure — the run refuses before routing, never silently
+    # degrades to the built-ins.
+    if custom_backends is None:
+        custom_backends = load_custom_backends(policy, explicit=getattr(args, "backends_file", None))
     budget_min = args.budget_minutes if args.budget_minutes is not None else policy["run"]["timeout_seconds"] / 60
     if args.backend == "github-issue":
         try:
@@ -5375,7 +5701,7 @@ def cmd_run(args, policy):
             raise SystemExit(2)
         return
     st = get_state(policy)
-    decision = route(prof, st, policy)
+    decision = route(prof, st, policy, custom_backends=custom_backends)
     if not decision["ok"]:
         out = {"id": rid, "status": "unroutable", "decision": decision, "scope": scope}
         set_status(rdir, state="unroutable", scope=scope)
@@ -5421,6 +5747,8 @@ def cmd_run(args, policy):
             child.append("--verify-evalid")
         if getattr(args, "evalid_bin", None):
             child += ["--evalid-bin", args.evalid_bin]
+        if getattr(args, "backends_file", None):
+            child += ["--backends-file", args.backends_file]
         if getattr(args, "base", None):
             child += ["--base", args.base]
         if getattr(args, "verify_baseline", False):
@@ -5515,7 +5843,7 @@ def cmd_run(args, policy):
             result = final
             break
         st = probe(policy)
-        nxt = route(prof, st, policy, exclude=tried if err_class == "rate_limit" else ([] if err_class == "model_unavailable" else [b]))
+        nxt = route(prof, st, policy, custom_backends=custom_backends, exclude=tried if err_class == "rate_limit" else ([] if err_class == "model_unavailable" else [b]))
         if not nxt["ok"]:
             result = final
             break
@@ -5645,7 +5973,7 @@ def cmd_run(args, policy):
                 # tier / different backend, then a final re-verify.
                 esc_prof, stronger_tier = escalation_profile(prof, decision.get("tier"))
                 st_esc = probe(policy)
-                esc = route(esc_prof, st_esc, policy, exclude=[decision["backend"]])
+                esc = route(esc_prof, st_esc, policy, custom_backends=custom_backends, exclude=[decision["backend"]])
                 if not esc.get("ok"):
                     auto_rework["escalation"] = {"skipped": "no stronger backend available",
                                                  "tier": stronger_tier, "reasons": esc.get("reasons")}
@@ -12025,6 +12353,20 @@ def cmd_regress_compare(args):
 def main():
     ap = argparse.ArgumentParser(prog="openswarm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    # Declarative custom backends (M3 slice 1, #101): route/run accept them,
+    # so the config is loaded up front — an invalid file refuses those
+    # commands instead of silently falling back to the built-ins, and the
+    # custom ids join the --backend choices.
+    custom_backends = []
+    if len(sys.argv) > 1 and sys.argv[1] in ("route", "run"):
+        try:
+            custom_backends = load_custom_backends(policy=load_policy(),
+                                                   explicit=backends_file_from_argv(sys.argv))
+        except CustomBackendConfigError as error:
+            print(f"openswarm: {error}", file=sys.stderr)
+            sys.exit(2)
+    profile_backends = ["codex", "ocgo", "deepseek", "cursor", "agy", "gemini", "pi", "hermes",
+                        "copilot"] + [b["id"] for b in custom_backends]
     consult_module().add_parser(sub)
 
     sp = sub.add_parser("probe")
@@ -12119,16 +12461,19 @@ def main():
                 raise ValueError(f"unknown dispatch argument field: {field}")
 
     sp = sub.add_parser("route")
-    add_dispatch_arguments(sp, "profile", "card-type",
+    add_dispatch_arguments(sp, "profile", "card-type", profile_backends=profile_backends,
                            card_type_help="optional task card type used for record-only routing advice")
     sp.add_argument("--refresh", action="store_true")
+    sp.add_argument("--backends-file", help="custom backends config (JSON, M3 slice 1, #101); "
+                                            "defaults to $OPENSWARM_HOME/backends.json")
 
     sp = sub.add_parser("run")
     add_dispatch_arguments(sp, "profile", "card-type", "rework-of", "paths", "prompt", "task-file", "title",
-                           profile_backends=["codex", "ocgo", "deepseek", "cursor", "agy", "gemini", "pi", "hermes", "copilot",
-                                             "github-issue"],
+                           profile_backends=profile_backends + ["github-issue"],
                            card_type_help="optional task card type from knowledge/card-types.yaml",
                            rework_of_help="run id this task is reworking")
+    sp.add_argument("--backends-file", help="custom backends config (JSON, M3 slice 1, #101); "
+                                            "defaults to $OPENSWARM_HOME/backends.json")
     sp.add_argument("--cwd", default=os.getcwd())
     sp.add_argument("--scope", choices=("repo", "host"), default="repo", help="task scope (repo by default; host for authorized host operations)")
     sp.add_argument("--base", help="base commit for an isolated worktree; defaults to HEAD")
@@ -12409,13 +12754,13 @@ def main():
         validate_card_type(policy, a.card_type)
         st = get_state(policy, a.refresh)
         profile = profile_from_args(a)
-        decision = route(profile, st, policy)
+        decision = route(profile, st, policy, custom_backends=custom_backends)
         advice = routing_advice(profile, a.card_type, st, policy, decision)
         print(json.dumps({**decision, **({"routing_advice": advice} if advice is not None else {})},
                          indent=2, ensure_ascii=False))
     elif a.cmd == "run":
         try:
-            cmd_run(a, policy)
+            cmd_run(a, policy, custom_backends=custom_backends)
         except ValueError as error:
             print(f"openswarm: {error}", file=sys.stderr)
             sys.exit(2)
