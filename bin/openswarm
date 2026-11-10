@@ -5806,6 +5806,16 @@ def cmd_run(args, policy, custom_backends=None):
     routing_fields = {"routing_advice": advice} if advice is not None else {}
     if weighted_info is not None:
         routing_fields["weighted_routing"] = weighted_info
+    if decision.get("routed_by_advice"):
+        # M6 slice 3 (#119): acceptance 114-1 requires the reroute decision
+        # itself to land in ledger/result.json, not only in the route/dry-run
+        # decision object. Pass the six fields apply_weighted_routing() sets.
+        routing_fields["routed_by_advice"] = True
+        routing_fields["routed_from"] = decision.get("routed_from")
+        routing_fields["advice_pass_rate"] = decision.get("advice_pass_rate")
+        routing_fields["advice_samples"] = decision.get("advice_samples")
+        routing_fields["actual_pass_rate"] = decision.get("actual_pass_rate")
+        routing_fields["actual_samples"] = decision.get("actual_samples")
     if args.dry_run:
         set_status(rdir, state="dry-run", scope=scope)
         print(json.dumps({"id": rid, "dry_run": True, "decision": decision, "scope": scope,

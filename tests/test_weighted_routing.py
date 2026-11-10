@@ -253,12 +253,27 @@ class WeightedRoutingTests(unittest.TestCase):
         self.assertEqual(run["backend"], "ocgo")
         self.assertTrue(run["weighted_routing"]["applied"])
         self.assertEqual(run["routing_advice"]["backend"], "ocgo")
+        # M6 slice 3 (#119): the reroute decision itself must land in the
+        # result.json output, mirroring the route/dry-run decision object.
+        self.assertTrue(run["routed_by_advice"])
+        self.assertEqual(run["routed_from"], {"backend": "codex", "model": expected_model})
+        self.assertEqual(run["advice_pass_rate"], 7 / 8)
+        self.assertEqual(run["advice_samples"], 8)
+        self.assertEqual(run["actual_pass_rate"], 2 / 8)
+        self.assertEqual(run["actual_samples"], 8)
         recorded = json.loads(self.ledger.read_text().splitlines()[-1])
         self.assertEqual(recorded["backend"], "ocgo")
         self.assertEqual(recorded["routing_advice"]["backend"], "ocgo")
         self.assertTrue(recorded["weighted_routing"]["applied"])
         self.assertEqual(recorded["weighted_routing"]["from"]["model"], expected_model)
         self.assertTrue(recorded["exec_pass"])  # partial with a commit is an execution pass
+        # ... and in the ledger row too.
+        self.assertTrue(recorded["routed_by_advice"])
+        self.assertEqual(recorded["routed_from"], {"backend": "codex", "model": expected_model})
+        self.assertEqual(recorded["advice_pass_rate"], 7 / 8)
+        self.assertEqual(recorded["advice_samples"], 8)
+        self.assertEqual(recorded["actual_pass_rate"], 2 / 8)
+        self.assertEqual(recorded["actual_samples"], 8)
 
 
 if __name__ == "__main__":
