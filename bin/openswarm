@@ -2257,24 +2257,31 @@ def routing_advice_margin(policy):
     return value
 
 
-def routing_advice(profile, card_type, st, policy, actual_decision):
+def routing_advice(profile, card_type, st, policy, actual_decision, custom_backends=()):
     """Return record-only advice from enough-sample groups eligible for this live state.
 
     The returned dict also carries the advised row's observed pass rate and
     sample count, plus the actual pick's row for the same card type when it
     has enough samples — the comparison `apply_weighted_routing` needs to
-    decide whether the advice is worth following (M6, #114)."""
+    decide whether the advice is worth following (M6, #114).
+
+    `custom_backends` is the same merged planner table `route()` builds:
+    without it a custom backend is never an advice candidate, because
+    `PLANNERS` holds only the built-ins (M6 slice 2 blocker, #117)."""
     if profile.get("backend") or not actual_decision.get("ok"):
         return None
     weights = compute_routing_weights(ledger_entries(), routing_min_samples(policy))
     candidates = []
     actual_row = None
+    planners = dict(PLANNERS)
+    for cfg in custom_backends or ():
+        planners[cfg["id"]] = _custom_planner(cfg)
     possible = list(dict.fromkeys([actual_decision.get("backend")] +
                                   (actual_decision.get("fallbacks") or [])))
     for backend in possible:
         if not backend:
             continue
-        planner = PLANNERS.get(backend)
+        planner = planners.get(backend)
         eligible, _ = planner({**profile, "backend": backend}, st, policy, True, []) if planner else (None, None)
         if not eligible:
             continue
@@ -2328,7 +2335,8 @@ def apply_weighted_routing(profile, card_type, st, policy, decision, custom_back
         return decision, {**info, "reason": "explicit --backend wins over weighted routing"}
     if not decision.get("ok"):
         return decision, {**info, "reason": "no routable decision to re-weight"}
-    advice = routing_advice(profile, card_type, st, policy, decision)
+    advice = routing_advice(profile, card_type, st, policy, decision,
+                            custom_backends=custom_backends)
     if advice is None or not advice.get("backend"):
         return decision, {**info, "reason": "no eligible advice (samples below min_samples or no history)"}
     advised = (advice["backend"], advice.get("model"))
@@ -3387,9 +3395,12 @@ PLANNERS = {"codex": plan_codex, "ocgo": plan_ocgo, "deepseek": plan_deepseek, "
 # ---------------------------------------------------------------- custom backends (M3 slice 1, #101)
 # Declarative custom backends: any CLI agent joins routing from one JSON
 # config file — no code changes. A custom backend is opt-in (like pi/agy):
-# only an explicit --backend <id> routes to it; custom backends never join
-# the automatic default_order. An invalid config refuses to start; it never
-# silently falls back to the built-ins.
+# the shipped default_order never lists one, so only an explicit
+# --backend <id> routes to it out of the box; a policy may list a custom
+# backend id in routing.default_order explicitly, and route() then honours
+# it like any built-in (M6 weighted routing relies on the default pick
+# being whatever default_order says, custom or not). An invalid config
+# refuses to start; it never silently falls back to the built-ins.
 
 
 class CustomBackendConfigError(ValueError):
@@ -5788,7 +5799,8 @@ def cmd_run(args, policy, custom_backends=None):
         jsave(f"{rdir}/result.json", out)
         print(json.dumps(out, indent=2, ensure_ascii=False))
         sys.exit(2)
-    advice = routing_advice(prof, card_type, st, policy, decision)
+    advice = routing_advice(prof, card_type, st, policy, decision,
+                            custom_backends=custom_backends)
     decision, weighted_info = apply_weighted_routing(prof, card_type, st, policy, decision,
                                                      custom_backends=custom_backends)
     routing_fields = {"routing_advice": advice} if advice is not None else {}
@@ -13227,7 +13239,8 @@ def main():
         st = get_state(policy, a.refresh)
         profile = profile_from_args(a)
         decision = route(profile, st, policy, custom_backends=custom_backends)
-        advice = routing_advice(profile, a.card_type, st, policy, decision)
+        advice = routing_advice(profile, a.card_type, st, policy, decision,
+                                custom_backends=custom_backends)
         decision, weighted_info = apply_weighted_routing(profile, a.card_type, st, policy, decision,
                                                          custom_backends=custom_backends)
         print(json.dumps({**decision, **({"routing_advice": advice} if advice is not None else {}),
