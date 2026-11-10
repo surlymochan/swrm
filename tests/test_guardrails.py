@@ -343,3 +343,160 @@ class GuardrailsTests(unittest.TestCase):
         self.assertEqual(report["totals"]["runs"], 0)
         self.assertEqual(report["slowest_runs"], [])
         self.assertIn("No runs", xs.daily_report_html(report))
+
+    def checkin_fixture_rows(self):
+        state = json.loads(Path(_load.FIXTURE_STATE).read_text())
+        rows = []
+        for rid, scope, phase in (("active", "host", "running"), ("recent", "host", "finished"),
+                                  ("legacy", "repo", "finished")):
+            rdir = self.root / "runs" / rid
+            rdir.mkdir(parents=True)
+            (rdir / "status.json").write_text(json.dumps({"finished": self.now}))
+            rows.append({"id": rid, "scope": scope, "state": phase, "backend": "codex", "model": "test",
+                         "status": "done", "elapsed_min": 1, "budget_min": 5, "idle_min": 0,
+                         "cmds": 0, "title": rid, "last_msg": ""})
+        return state, rows
+
+    def test_checkin_report_extracts_live_data(self):
+        state, rows = self.checkin_fixture_rows()
+        with mock.patch.object(xs, "get_state", return_value=state), \
+                mock.patch.object(xs, "run_digest", side_effect=lambda rid: next(r for r in rows if r["id"] == rid)):
+            data = xs.checkin_report(self.policy, 60)
+        self.assertEqual([(q["label"], q["text"]) for q in data["quota"]],
+                         [("claude", "n/a"), ("codex", "31%"), ("ocgo", "max-model 0%"), ("deepseek", "55.0 CNY")])
+        self.assertEqual([r["id"] for r in data["active"]], ["active"])
+        self.assertEqual([r["id"] for r in data["recent_finished"]], ["recent", "legacy"])
+        self.assertEqual(data["tally"], {"done": 2})
+        self.assertEqual(data["attention"], [])
+        self.assertEqual(data["active"][0]["verdict"], "n/a")
+        self.assertEqual(data["since_minutes"], 60)
+
+    def test_compact_report_text_output_unchanged(self):
+        """Golden: the text check-in prints exactly what the pre-M5 code printed."""
+        state, rows = self.checkin_fixture_rows()
+        output = io.StringIO()
+        with mock.patch.object(xs, "get_state", return_value=state), \
+                mock.patch.object(xs, "run_digest", side_effect=lambda rid: next(r for r in rows if r["id"] == rid)), \
+                contextlib.redirect_stdout(output):
+            xs.cmd_report(argparse.Namespace(since_minutes=60), self.policy)
+        lines = output.getvalue().splitlines()
+        self.assertTrue(lines[0].startswith("[openswarm report "))
+        self.assertEqual(lines[1:], [
+            "quota  claude(pro) n/a | codex(plus) 31% | ocgo(go) max-model 0% | deepseek 55.0 CNY",
+            "active 1",
+            "  active codex/test scope=host 1m/5m cmds=0 ",
+            "    active — ",
+            "finished in last 60m: 2 {'done': 2}",
+            "  done            codex/test scope=host 1m  recent",
+            "  done            codex/test scope=repo 1m  legacy",
+            "attention 0",
+        ])
+
+    def test_run_ledger_verdict_prefers_ledger_then_result(self):
+        self.ledger([
+            {"id": "a", "ts": self.now, "status": "done", "backend": "pi",
+             "verify_evalid": {"verdict": "mismatch"}, "verify": {"rc": 0}},
+            {"id": "b", "ts": self.now, "status": "done", "backend": "pi", "verify": {"rc": 1}},
+        ])
+        rdir = self.root / "runs" / "a"
+        rdir.mkdir(parents=True)
+        (rdir / "result.json").write_text(json.dumps({"verify_evalid": {"verdict": "pass"}}))
+        rdir = self.root / "runs" / "b"
+        rdir.mkdir(parents=True)
+        (rdir / "result.json").write_text(json.dumps({"verify": {"rc": 0}}))
+        self.assertEqual(xs.run_ledger_verdict("a"), "mismatch")
+        self.assertEqual(xs.run_ledger_verdict("b"), "rc 1")
+        self.assertEqual(xs.run_ledger_verdict("missing"), "n/a")
+
+    def test_checkin_report_html_sections(self):
+        data = {"generated_at": "11-10 19:00", "since_minutes": 60,
+                "quota": [{"label": "claude", "plan": "pro", "text": "n/a"},
+                          {"label": "codex", "plan": "plus", "text": "31%", "suffix": " pace 1.00x"},
+                          {"label": "ocgo", "plan": "go", "text": "max-model 0%"},
+                          {"label": "deepseek", "plan": None, "text": "55.0 CNY"}],
+                "active": [{"id": "a1", "backend": "pi", "model": "m", "lane": "C1", "scope": "repo",
+                            "state": "running", "status": None, "elapsed_min": 3,
+                            "title": "do <script>thing", "verdict": "pass"}],
+                "recent_finished": [{"id": "r1", "backend": "codex", "model": "m", "lane": None, "scope": "host",
+                                     "state": "finished", "status": "done", "elapsed_min": 5,
+                                     "title": "did it", "verdict": "rc 0"}],
+                "tally": {"done": 1},
+                "attention": [{"id": "r1", "state": "finished", "status": "failed", "verdict": "rc 1"}]}
+        html = xs.checkin_report_html(data)
+        self.assertIn("Live check-in", html)
+        self.assertIn("claude (pro)", html)
+        self.assertIn("pace 1.00x", html)
+        self.assertIn("Active runs", html)
+        self.assertIn("Recently finished runs", html)
+        self.assertIn("Attention", html)
+        self.assertIn("Ledger verdict", html)
+        self.assertIn("<td>a1</td>", html)
+        self.assertIn("<td>pass</td>", html)
+        self.assertIn("<td>r1</td>", html)
+        self.assertIn("<td>rc 0</td>", html)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertNotIn("<script>", html)
+        self.assertIn("prefers-color-scheme:dark", html)
+        self.assertNotIn('src="http', html)
+        self.assertNotIn('href="http', html)
+        empty = dict(data, active=[], recent_finished=[], attention=[])
+        self.assertIn("No runs", xs.checkin_report_html(empty))
+
+    def _report_cli_env(self):
+        return {**os.environ, "OPENSWARM_HOME": str(self.root),
+                "OPENSWARM_STATE_FILE": _load.FIXTURE_STATE}
+
+    def _report_cli_runs(self):
+        now = __import__("time").time()
+        active = self.root / "runs" / "live-one"
+        active.mkdir(parents=True)
+        (active / "status.json").write_text(json.dumps(
+            {"state": "queued", "backend": "pi", "model": "m", "title": "live one"}))
+        recent = self.root / "runs" / "done-one"
+        recent.mkdir(parents=True)
+        (recent / "status.json").write_text(json.dumps(
+            {"state": "finished", "status": "done", "finished": now, "started": now - 60,
+             "backend": "codex", "model": "m", "title": "done one"}))
+
+    def test_bare_html_writes_live_snapshot_not_daily(self):
+        (self.root / "policy.local.json").write_text(json.dumps({"budget": self.policy["budget"]}))
+        self._report_cli_runs()
+        target = self.root / "checkin.html"
+        result = subprocess.run([sys.executable, str(Path(_load.ROOT) / "bin" / "openswarm"), "report",
+                                 "--html", str(target)],
+                                env=self._report_cli_env(), capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"HTML: {target}", result.stdout)
+        html = target.read_text()
+        self.assertIn("Live check-in", html)
+        self.assertIn("live-one", html)
+        self.assertIn("done-one", html)
+        self.assertNotIn("Daily report", html)
+        self.assertNotIn("Runs by backend", html)
+
+    def test_daily_html_still_daily_with_flag(self):
+        self.report_fixture()
+        (self.root / "policy.local.json").write_text(json.dumps({"budget": self.policy["budget"]}))
+        target = self.root / "daily.html"
+        result = subprocess.run([sys.executable, str(Path(_load.ROOT) / "bin" / "openswarm"), "report",
+                                 "--daily", "--date", "2026-10-27", "--html", str(target)],
+                                env=self._report_cli_env(), capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        html = target.read_text()
+        self.assertIn("Daily report", html)
+        self.assertIn("Runs by backend", html)
+        self.assertNotIn("Live check-in", html)
+
+    def test_html_bad_path_errors_without_text_fallback(self):
+        (self.root / "policy.local.json").write_text(json.dumps({"budget": self.policy["budget"]}))
+        blocker = self.root / "blocker"
+        blocker.write_text("not a directory")
+        target = blocker / "report.html"
+        result = subprocess.run([sys.executable, str(Path(_load.ROOT) / "bin" / "openswarm"), "report",
+                                 "--html", str(target)],
+                                env=self._report_cli_env(), capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot write HTML report", result.stderr)
+        self.assertIn(str(target), result.stderr)
+        self.assertNotIn("HTML:", result.stdout)
+        self.assertFalse(target.exists())
