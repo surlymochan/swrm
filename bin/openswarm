@@ -2250,12 +2250,25 @@ def ledger_entries_from(path):
         return
 
 
+def routing_advice_margin(policy):
+    value = (policy.get("routing") or {}).get("advice_margin", 0.10)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < 1:
+        raise ValueError("routing.advice_margin must be a number in [0, 1)")
+    return value
+
+
 def routing_advice(profile, card_type, st, policy, actual_decision):
-    """Return record-only advice from enough-sample groups eligible for this live state."""
+    """Return record-only advice from enough-sample groups eligible for this live state.
+
+    The returned dict also carries the advised row's observed pass rate and
+    sample count, plus the actual pick's row for the same card type when it
+    has enough samples — the comparison `apply_weighted_routing` needs to
+    decide whether the advice is worth following (M6, #114)."""
     if profile.get("backend") or not actual_decision.get("ok"):
         return None
     weights = compute_routing_weights(ledger_entries(), routing_min_samples(policy))
     candidates = []
+    actual_row = None
     possible = list(dict.fromkeys([actual_decision.get("backend")] +
                                   (actual_decision.get("fallbacks") or [])))
     for backend in possible:
@@ -2268,6 +2281,9 @@ def routing_advice(profile, card_type, st, policy, actual_decision):
         for row in weights["entries"]:
             if row["backend"] != backend or row["card_type"] != card_type or not row["enough"]:
                 continue
+            if (row["backend"] == actual_decision.get("backend")
+                    and row["model"] == actual_decision.get("model")):
+                actual_row = row
             if profile.get("model") and row["model"] != profile["model"]:
                 continue
             quality = (row["pass_rate"] if row["pass_rate"] is not None else 0,
@@ -2278,6 +2294,9 @@ def routing_advice(profile, card_type, st, policy, actual_decision):
             candidates.append((quality, cost, row))
     if not candidates:
         return {"backend": None, "model": None,
+                "pass_rate": None, "runs": 0,
+                "actual_pass_rate": actual_row["pass_rate"] if actual_row else None,
+                "actual_runs": actual_row["runs"] if actual_row else 0,
                 "reason": f"no eligible {card_type or 'untyped'} routing samples meet min_samples="
                           f"{weights['min_samples']}"}
     candidates.sort(key=lambda item: (-item[0][0], -item[0][1], -item[0][2], -item[0][3],
@@ -2285,8 +2304,66 @@ def routing_advice(profile, card_type, st, policy, actual_decision):
                                      str(item[2]["model"] or "")))
     row = candidates[0][2]
     return {"backend": row["backend"], "model": row["model"],
+            "pass_rate": row["pass_rate"], "runs": row["runs"],
+            "actual_pass_rate": actual_row["pass_rate"] if actual_row else None,
+            "actual_runs": actual_row["runs"] if actual_row else 0,
             "reason": (f"best observed pass, first-try, rework, and P1+ rates among {row['runs']} "
                        "eligible samples; ties use median tokens then seconds; actual routing unchanged")}
+
+
+def apply_weighted_routing(profile, card_type, st, policy, decision, custom_backends=()):
+    """routing.weighted enforcement (M6, #114): follow ledger advice when it
+    beats the default pick by at least routing.advice_margin.
+
+    Returns (decision, info); info["applied"] is False when nothing changed,
+    so the record-only path keeps the original decision untouched. Never
+    strands a run: any failure to re-plan falls back to the original
+    decision. Explicit --backend always wins; the shipped default
+    (routing.weighted false) never reaches the switch."""
+    info = {"applied": False}
+    routing = policy.get("routing") or {}
+    if not routing.get("weighted", False):
+        return decision, {**info, "reason": "routing.weighted is false (record-only advice)"}
+    if profile.get("backend"):
+        return decision, {**info, "reason": "explicit --backend wins over weighted routing"}
+    if not decision.get("ok"):
+        return decision, {**info, "reason": "no routable decision to re-weight"}
+    advice = routing_advice(profile, card_type, st, policy, decision)
+    if advice is None or not advice.get("backend"):
+        return decision, {**info, "reason": "no eligible advice (samples below min_samples or no history)"}
+    advised = (advice["backend"], advice.get("model"))
+    actual = (decision.get("backend"), decision.get("model"))
+    if advised == actual:
+        return decision, {**info, "reason": "advice agrees with the default pick"}
+    margin = routing_advice_margin(policy)
+    adv_rate, act_rate = advice.get("pass_rate"), advice.get("actual_pass_rate")
+    if adv_rate is None or act_rate is None:
+        return decision, {**info, "reason": "pass-rate comparison unavailable (default pick has no history for this card type)"}
+    if adv_rate - act_rate < margin:
+        return decision, {**info, "reason": f"advice advantage {adv_rate - act_rate:.2f} is below margin {margin:.2f}"}
+    forced = {**profile, "backend": advice["backend"]}
+    if advice.get("model"):
+        forced["model"] = advice["model"]
+    new_decision = route(forced, st, policy, custom_backends=custom_backends)
+    if not new_decision.get("ok"):
+        return decision, {**info, "reason": "advised backend failed to plan; kept the default pick"}
+    new_decision["fallbacks"] = [b for b in ([actual[0]] + list(decision.get("fallbacks") or []))
+                                 if b and b != advised[0]]
+    new_decision["routed_by_advice"] = True
+    new_decision["routed_from"] = {"backend": actual[0], "model": actual[1]}
+    new_decision["advice_pass_rate"] = adv_rate
+    new_decision["advice_samples"] = advice.get("runs")
+    new_decision["actual_pass_rate"] = act_rate
+    new_decision["actual_samples"] = advice.get("actual_runs")
+    new_decision.setdefault("reasons", []).append(
+        f"weighted routing: {advised[0]} / {advised[1]} observed pass rate {adv_rate:.2f} "
+        f"beats {actual[0]} / {actual[1]} at {act_rate:.2f} by {adv_rate - act_rate:.2f} "
+        f"(margin {margin:.2f}, {advice.get('runs')} samples)")
+    return new_decision, {"applied": True,
+                          "from": {"backend": actual[0], "model": actual[1]},
+                          "to": {"backend": advised[0], "model": advised[1]},
+                          "advantage": adv_rate - act_rate, "margin": margin,
+                          "reason": advice.get("reason")}
 
 
 def cmd_routing_weights(args, policy):
@@ -5712,7 +5789,11 @@ def cmd_run(args, policy, custom_backends=None):
         print(json.dumps(out, indent=2, ensure_ascii=False))
         sys.exit(2)
     advice = routing_advice(prof, card_type, st, policy, decision)
+    decision, weighted_info = apply_weighted_routing(prof, card_type, st, policy, decision,
+                                                     custom_backends=custom_backends)
     routing_fields = {"routing_advice": advice} if advice is not None else {}
+    if weighted_info is not None:
+        routing_fields["weighted_routing"] = weighted_info
     if args.dry_run:
         set_status(rdir, state="dry-run", scope=scope)
         print(json.dumps({"id": rid, "dry_run": True, "decision": decision, "scope": scope,
@@ -13147,7 +13228,10 @@ def main():
         profile = profile_from_args(a)
         decision = route(profile, st, policy, custom_backends=custom_backends)
         advice = routing_advice(profile, a.card_type, st, policy, decision)
-        print(json.dumps({**decision, **({"routing_advice": advice} if advice is not None else {})},
+        decision, weighted_info = apply_weighted_routing(profile, a.card_type, st, policy, decision,
+                                                         custom_backends=custom_backends)
+        print(json.dumps({**decision, **({"routing_advice": advice} if advice is not None else {}),
+                          "weighted_routing": weighted_info},
                          indent=2, ensure_ascii=False))
     elif a.cmd == "run":
         try:

@@ -440,8 +440,11 @@ compute `exec_pass` for eligible older records.
 
 `openswarm route --card-type fix` and `openswarm run --card-type fix` attach `routing_advice` when enough historical
 samples exist for currently eligible backends. Advice ranks pass, first-try, rework and P1+ rates, then uses median
-tokens and seconds as cost tie-breakers. It is recorded alongside the real route and does not change the selected
-backend or model; `routing.weighted` remains false and reserved for future routing behavior. Compare recorded advice
+tokens and seconds as cost tie-breakers. With `routing.weighted: false` (the shipped default) it is recorded
+alongside the real route and does not change the selected backend or model. Set `routing.weighted: true` and the
+run follows the advice when its observed pass rate beats the default pick by at least `routing.advice_margin`
+(default 0.10); the switch is recorded in the ledger as `weighted_routing` and on the decision as
+`routed_by_advice`, and an explicit `--backend` always wins. Compare recorded advice
 with actual outcomes using `openswarm routing compare --days 30`. An advice outcome is shown as `not run` when the
 actual route used a different backend or model, because that counterfactual was not executed.
 
