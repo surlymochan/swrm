@@ -542,9 +542,12 @@ defaults to 1, with remaining cards queued until slots free. A card can declare 
 self-dependency, or a cycle is a hard error naming the card and the fix), orders dispatch topologically, and
 waits for each dependency to finish before launching its dependents. `openswarm batch plan --cards ./cards`
 prints that order as JSON without launching anything, and the plan is recorded in the batch's `summary.json`.
-The `depends_on:` line is planner metadata and is stripped before the card reaches the executor. (Stacking a
-dependency's branch into the next worktree, and skipping dependents when a dependency fails verification, are
-not part of this slice; see issue #105.) Backend, model and effort flags are optional and pass
+The `depends_on:` line is planner metadata and is stripped before the card reaches the executor. When a card
+has dependencies, its run starts from the latest finished dependency's branch HEAD, so its diff builds on the
+predecessor's change; the stacked commits are recorded in the batch's `summary.json` as `stacked_on`, and
+collection verifies each stacked commit is an ancestor of the result commit. If a dependency finishes without
+passing (run failure or verify failure), its dependents are never dispatched: they are recorded as `blocked` in
+`summary.json`/`summary.md` and in the ledger, with `blocked_by` naming the dependency and the reason. Backend, model and effort flags are optional and pass
 through to each `run --detach`. One line is printed per state change; detached output goes to
 `$OPENSWARM_HOME/batches/<id>/batch.out`. Polling works without Monitor.
 
