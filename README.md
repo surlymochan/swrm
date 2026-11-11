@@ -492,6 +492,18 @@ negative and never exceeds the cap. When a diversion uses an adaptive margin, th
 `run --dry-run` and the real run share the single `apply_weighted_routing` decision path, and an explicit
 `--backend` always wins.
 
+`routing.calibration_gate` (M15, #160) stops following a miscalibrated advice group instead of merely raising
+its margin. It is off by default (`false`): with it off, every decision is byte-identical to today's behaviour.
+With it on, an advised group is gated when the same M8 calibration table flags it miscalibrated — `|advised -
+actual|` over `routing.calibration_gate_diff` (default 0.20) with at least `routing.calibration_gate_min_samples`
+(default 8) scored runs. A gated group never diverts the run: the decision keeps the default pick, and the
+ledger's `weighted_routing` record carries `gated_by_calibration: true` with `calibration_diff`,
+`calibration_samples`, and the advised/actual rates, so a gated run is auditable after the fact. The gate is
+re-evaluated from ledger history on every decision, so a group whose calibration recovers (new scored runs pull
+the difference back under the bar) is followed again with no manual reset, and a group with too few samples or
+no history is never gated. The gate only ever blocks a diversion; it never changes the advice computation, the
+default pick, or the margin, and an explicit `--backend` always wins.
+
 Run the weekly fleet retrospective in one command:
 
 ```bash
