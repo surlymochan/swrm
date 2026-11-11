@@ -2955,6 +2955,315 @@ def cmd_weighted_eval(args, policy):
     print(weighted_eval_text(result, path), end="")
 
 
+# ---------------------------------------------------------------- gate-flip evaluation (M16 slice 1, #164)
+
+def compute_gate_eval(entries, margin=0.10,
+                      gate_diff=CALIBRATION_GATE_DEFAULT_DIFF,
+                      gate_min_samples=CALIBRATION_GATE_DEFAULT_MIN_SAMPLES):
+    """Calibration-gate flip counterfactual replay, by (advised backend, card type).
+
+    Unlike `compute_weighted_eval`, which scores every group against the
+    whole ledger at once, this replay is time-ordered: ledger entries are
+    walked in file order (append order = dispatch order) and each scored
+    run's gate verdict is read off the M8 calibration table computed over
+    the strict prefix — the entries recorded before that run. That is the
+    exact view the live gate had at dispatch time
+    (`calibration_gate_for` reads the ledger as it stood then), so a group
+    that was miscalibrated early and recovered later gates only the runs
+    dispatched while it was miscalibrated, and a group that only looks
+    miscalibrated in the final whole-ledger table gates nothing it did not
+    gate live. Replaying against the final table instead would erase real
+    historical interceptions (M15 slice 2 evidence home-a: the one recorded
+    `gated_by_calibration` run is only reproduced by the prefix replay).
+
+    For each scored run (known outcome via `routing_outcome`):
+    - would_divert: the same rule `compute_weighted_eval` replays
+      (advised backend/model differs from the run's own, quoted advice
+      pass rate beats the recorded actual-pick pass rate by at least
+      `margin`; equal diverts). The gate only ever blocks a diversion,
+      so the prefix table is computed only for would-divert runs.
+    - intercepted: would_divert and the advised group is miscalibrated
+      in the prefix table (|advised - actual| > `gate_diff` with at least
+      `gate_min_samples` scored runs — the shipped M15 bar at the
+      defaults, taken from policy by `cmd_gate_eval`; the replay itself
+      is run as if the gate were on, whatever the shipped default is).
+
+    Two expected pass rates are reported per group and overall, because
+    the quoted-basis one takes advice at face value and the calibrated
+    one does not — and the difference is the whole question:
+    - quoted basis (M9-consistent): a diverted run's expected outcome is
+      the quoted advice rate; an intercepted run's is the default pick's
+      recorded actual-pick rate (the run stays put); any other run keeps
+      its observed outcome. `expected_delta` (gate on - gate off) is
+      therefore usually negative when advice over-promises: it charges
+      the gate for the quoted rate the blocked diversion never earned.
+    - calibrated basis (the decision metric): a diverted run's expected
+      outcome is the advised group's observed actual pass rate in the
+      prefix table (what following the advice would really have scored);
+      an intercepted run's is the default pick's recorded actual-pick
+      rate; any other run keeps its observed outcome. `calibrated_delta`
+      is positive exactly when the gate keeps runs off backends whose
+      observed rate is below the default pick's — the true expected
+      pass-rate change from flipping the default on.
+    No per-run counterfactual outcome is invented: every expected value
+    is a recorded rate (quoted, prefix-group actual, or actual-pick) or
+    the run's own observed outcome, and a missing rate falls back to
+    the observed outcome. Intercepted run ids are listed so the replay
+    can be cross-checked against the ledger's recorded
+    `gated_by_calibration` records. Groups with advice records but no
+    scored run still appear, with n=0 and no invented rates.
+    Batch/fleet routing-decision records are not run outcomes and are
+    excluded, as in `compute_advice_accuracy`. Read-only: this never
+    touches routing decisions, the shipped default, or the ledger.
+    """
+    margin = routing_advice_margin({"routing": {"advice_margin": margin}})
+    if isinstance(gate_diff, bool) or not isinstance(gate_diff, (int, float)) \
+            or not 0 < gate_diff < 1:
+        raise ValueError("calibration_gate_diff must be a number in (0, 1)")
+    if isinstance(gate_min_samples, bool) or not isinstance(gate_min_samples, int) \
+            or gate_min_samples < 1:
+        raise ValueError("calibration_gate_min_samples must be a positive integer")
+    entries = list(entries)
+    groups = {}
+    total_advice = 0
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid"):
+            continue
+        advice = entry.get("routing_advice")
+        if not isinstance(advice, dict) or not advice.get("backend"):
+            continue
+        total_advice += 1
+        key = (str(advice["backend"]), str(entry.get("card_type") or "-"))
+        group = groups.setdefault(key, {"advice_records": 0, "outcomes": [],
+                                        "quoted_rates": [], "would_divert": 0,
+                                        "intercepted": 0, "intercepted_ids": [],
+                                        "intercepted_outcomes": [],
+                                        "intercepted_quoted": [],
+                                        "expected_off": [], "expected_on": [],
+                                        "calibrated_off": [], "calibrated_on": []})
+        group["advice_records"] += 1
+        outcome = routing_outcome(entry)
+        if outcome is None:
+            continue
+        group["outcomes"].append(outcome)
+        observed = 1.0 if outcome else 0.0
+        rate = advice.get("pass_rate")
+        quoted = (rate if isinstance(rate, (int, float)) and not isinstance(rate, bool)
+                  and math.isfinite(rate) else None)
+        if quoted is not None:
+            group["quoted_rates"].append(quoted)
+        diverted = False
+        advised = (advice.get("backend"), advice.get("model"))
+        actual = (entry.get("backend"), entry.get("model"))
+        act_rate = advice.get("actual_pass_rate")
+        act_ok = (isinstance(act_rate, (int, float)) and not isinstance(act_rate, bool)
+                  and math.isfinite(act_rate))
+        if advised != actual and quoted is not None and act_ok:
+            if round(quoted - act_rate, 6) >= margin:
+                diverted = True
+        if not diverted:
+            group["expected_off"].append(observed)
+            group["expected_on"].append(observed)
+            group["calibrated_off"].append(observed)
+            group["calibrated_on"].append(observed)
+            continue
+        group["would_divert"] += 1
+        # The gate's view at dispatch time: the calibration table over
+        # the history recorded before this run.
+        prefix = compute_advice_accuracy(entries[:index])
+        prefix_row = next((row for row in prefix["groups"]
+                           if (row["backend"], row["card_type"]) == key), None)
+        prefix_actual = (prefix_row["actual_pass_rate"] if prefix_row else None)
+        gated = bool(prefix_row is not None and prefix_row["diff"] is not None
+                     and prefix_row["diff"] > gate_diff
+                     and prefix_row["n"] >= gate_min_samples)
+        group["expected_off"].append(quoted)
+        group["calibrated_off"].append(prefix_actual if prefix_actual is not None else observed)
+        if gated:
+            group["intercepted"] += 1
+            group["intercepted_ids"].append(entry.get("id"))
+            group["intercepted_outcomes"].append(outcome)
+            group["intercepted_quoted"].append(quoted)
+            group["expected_on"].append(act_rate)
+            group["calibrated_on"].append(act_rate)
+        else:
+            group["expected_on"].append(quoted)
+            group["calibrated_on"].append(prefix_actual if prefix_actual is not None else observed)
+    rows = []
+    for (backend, card_type), group in sorted(groups.items()):
+        n = len(group["outcomes"])
+        intercepted = group["intercepted"]
+        int_outcomes = group["intercepted_outcomes"]
+        int_actual = (round(sum(int_outcomes) / len(int_outcomes), 6)
+                      if int_outcomes else None)
+        int_quoted = (round(sum(group["intercepted_quoted"]) / len(group["intercepted_quoted"]), 6)
+                      if group["intercepted_quoted"] else None)
+        overpromise = (round(int_quoted - int_actual, 6)
+                       if int_actual is not None and int_quoted is not None else None)
+        advised_rate = (round(sum(group["quoted_rates"]) / len(group["quoted_rates"]), 6)
+                        if group["quoted_rates"] else None)
+        actual_rate = round(sum(group["outcomes"]) / n, 6) if n else None
+        exp_off = round(sum(group["expected_off"]) / n, 6) if n else None
+        exp_on = round(sum(group["expected_on"]) / n, 6) if n else None
+        cal_off = round(sum(group["calibrated_off"]) / n, 6) if n else None
+        cal_on = round(sum(group["calibrated_on"]) / n, 6) if n else None
+        rows.append({
+            "backend": backend,
+            "card_type": card_type,
+            "advice_records": group["advice_records"],
+            "n": n,
+            "would_divert": group["would_divert"],
+            "diverted_share": round(group["would_divert"] / n, 6) if n else None,
+            "intercepted": intercepted,
+            "intercepted_share": (round(intercepted / group["would_divert"], 6)
+                                  if group["would_divert"] else None),
+            "intercepted_of_scored": round(intercepted / n, 6) if n else None,
+            "intercepted_ids": group["intercepted_ids"],
+            "intercepted_actual_pass_rate": int_actual,
+            "intercepted_expected_if_followed": int_quoted,
+            "intercepted_overpromise": overpromise,
+            "advised_pass_rate": advised_rate,
+            "actual_pass_rate": actual_rate,
+            "expected_pass_rate_gate_off": exp_off,
+            "expected_pass_rate_gate_on": exp_on,
+            "expected_delta": (round(exp_on - exp_off, 6)
+                               if exp_off is not None and exp_on is not None else None),
+            "calibrated_expected_pass_rate_gate_off": cal_off,
+            "calibrated_expected_pass_rate_gate_on": cal_on,
+            "calibrated_delta": (round(cal_on - cal_off, 6)
+                                 if cal_off is not None and cal_on is not None else None),
+            "small_n": bool(0 < n < ADVICE_ACCURACY_FLAG_MIN_SAMPLES),
+        })
+    total_scored = sum(row["n"] for row in rows)
+    total_diverted = sum(row["would_divert"] for row in rows)
+    total_intercepted = sum(row["intercepted"] for row in rows)
+    all_int_outcomes = [outcome for group in groups.values()
+                        for outcome in group["intercepted_outcomes"]]
+    all_int_quoted = [rate for group in groups.values()
+                      for rate in group["intercepted_quoted"]]
+    tot_int_actual = (round(sum(all_int_outcomes) / len(all_int_outcomes), 6)
+                      if all_int_outcomes else None)
+    tot_int_quoted = (round(sum(all_int_quoted) / len(all_int_quoted), 6)
+                      if all_int_quoted else None)
+    tot_exp_off = (round(sum(sum(group["expected_off"]) for group in groups.values())
+                         / total_scored, 6) if total_scored else None)
+    tot_exp_on = (round(sum(sum(group["expected_on"]) for group in groups.values())
+                        / total_scored, 6) if total_scored else None)
+    tot_cal_off = (round(sum(sum(group["calibrated_off"]) for group in groups.values())
+                         / total_scored, 6) if total_scored else None)
+    tot_cal_on = (round(sum(sum(group["calibrated_on"]) for group in groups.values())
+                        / total_scored, 6) if total_scored else None)
+    return {"groups": rows,
+            "margin": margin,
+            "gate_diff": gate_diff,
+            "gate_min_samples": gate_min_samples,
+            "total_advice_records": total_advice,
+            "total_scored": total_scored,
+            "total_would_divert": total_diverted,
+            "total_intercepted": total_intercepted,
+            "intercepted_share": (round(total_intercepted / total_diverted, 6)
+                                  if total_diverted else None),
+            "intercepted_of_scored": (round(total_intercepted / total_scored, 6)
+                                      if total_scored else None),
+            "intercepted_ids": [run_id for group in groups.values()
+                                for run_id in group["intercepted_ids"]],
+            "intercepted_actual_pass_rate": tot_int_actual,
+            "intercepted_expected_if_followed": tot_int_quoted,
+            "intercepted_overpromise": (round(tot_int_quoted - tot_int_actual, 6)
+                                        if tot_int_actual is not None
+                                        and tot_int_quoted is not None else None),
+            "expected_pass_rate_gate_off": tot_exp_off,
+            "expected_pass_rate_gate_on": tot_exp_on,
+            "expected_delta": (round(tot_exp_on - tot_exp_off, 6)
+                               if tot_exp_off is not None and tot_exp_on is not None else None),
+            "calibrated_expected_pass_rate_gate_off": tot_cal_off,
+            "calibrated_expected_pass_rate_gate_on": tot_cal_on,
+            "calibrated_delta": (round(tot_cal_on - tot_cal_off, 6)
+                                 if tot_cal_off is not None and tot_cal_on is not None else None)}
+
+
+def gate_eval_text(result, source):
+    """Text rendering of a `compute_gate_eval` result."""
+    lines = [f"gate eval (ledger: {source}; margin: {result['margin']:.2f}; "
+             f"gate: diff > {result['gate_diff']:.2f} and n >= {result['gate_min_samples']})",
+             "replay in ledger order: a scored run would divert when the advised backend/model differs from the "
+             "run's backend/model and the quoted advice pass rate beats the recorded actual-pick "
+             "pass rate by at least the margin; it is intercepted when the advised group is miscalibrated "
+             "against the history before that run (the live gate's view at dispatch time); "
+             "expected (quoted basis) = quoted advice rate for diverted runs, the default pick's recorded rate "
+             "for intercepted runs, observed outcome otherwise; calibrated = the advised group's observed rate "
+             "for diverted runs, the default pick's recorded rate for intercepted runs, observed outcome "
+             "otherwise — the calibrated delta is the decision metric, the quoted-basis delta takes advice at "
+             "face value; small-n = n < 8, deltas indicative only"]
+    rows = result["groups"]
+    if not rows:
+        lines.append("no advice history in ledger")
+        return "\n".join(lines) + "\n"
+    lines.append(f"{'backend':<10} {'card_type':<12} {'n':>4} {'diverted':>8} {'intercepted':>11} "
+                 f"{'share':>6} {'int-actual':>10} {'int-quoted':>10} {'cal-delta':>9}  flag")
+    lines.append("-" * 94)
+    for row in rows:
+        share = f"{row['intercepted_share']:.2f}" if row["intercepted_share"] is not None else "n/a"
+        int_actual = (f"{row['intercepted_actual_pass_rate']:.2f}"
+                      if row["intercepted_actual_pass_rate"] is not None else "n/a")
+        int_quoted = (f"{row['intercepted_expected_if_followed']:.2f}"
+                      if row["intercepted_expected_if_followed"] is not None else "n/a")
+        cal_delta = (f"{row['calibrated_delta']:+.2f}"
+                     if row["calibrated_delta"] is not None else "n/a")
+        if row["n"] == 0:
+            flag = "no scored runs"
+        elif row["small_n"]:
+            flag = "small-n"
+        else:
+            flag = ""
+        lines.append(f"{row['backend']:<10} {row['card_type']:<12} {row['n']:>4} "
+                     f"{row['would_divert']:>8} {row['intercepted']:>11} {share:>6} "
+                     f"{int_actual:>10} {int_quoted:>10} {cal_delta:>9}  {flag}")
+    share = (f"{result['intercepted_share']:.2f}"
+             if result["intercepted_share"] is not None else "n/a")
+    of_scored = (f"{result['intercepted_of_scored']:.2f}"
+                 if result["intercepted_of_scored"] is not None else "n/a")
+    lines.append(f"scored runs: {result['total_scored']} across {len(rows)} groups; "
+                 f"would divert: {result['total_would_divert']}; "
+                 f"intercepted: {result['total_intercepted']} ({share} of diversions, "
+                 f"{of_scored} of scored); advice records: {result['total_advice_records']}")
+    fmt = lambda value: f"{value:.2f}" if value is not None else "n/a"
+    delta = result["expected_delta"]
+    lines.append(f"expected pass rate (quoted basis): gate off {fmt(result['expected_pass_rate_gate_off'])} "
+                 f"vs gate on {fmt(result['expected_pass_rate_gate_on'])} "
+                 f"(delta {f'{delta:+.2f}' if delta is not None else 'n/a'})")
+    cal_delta = result["calibrated_delta"]
+    lines.append(f"expected pass rate (calibrated): gate off {fmt(result['calibrated_expected_pass_rate_gate_off'])} "
+                 f"vs gate on {fmt(result['calibrated_expected_pass_rate_gate_on'])} "
+                 f"(delta {f'{cal_delta:+.2f}' if cal_delta is not None else 'n/a'})")
+    if result["total_intercepted"]:
+        lines.append(f"intercepted runs: actual {fmt(result['intercepted_actual_pass_rate'])} vs "
+                     f"expected-if-followed {fmt(result['intercepted_expected_if_followed'])} "
+                     f"(over-promise {result['intercepted_overpromise']:+.2f} "
+                     f"over {result['total_intercepted']} runs)")
+    else:
+        lines.append("intercepted runs: none (no diversion would be blocked)")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_gate_eval(args, policy):
+    # The replay is run as if the gate were on: the shipped `enabled`
+    # switch is ignored, but the diff / sample bar come from policy so a
+    # custom bar replays under that bar.
+    settings = calibration_gate_settings(policy)
+    path = fleet_ledger_path() if getattr(args, "fleet", False) else LEDGER
+    result = compute_gate_eval(ledger_entries_from(path),
+                               margin=routing_advice_margin(policy),
+                               gate_diff=settings["diff"],
+                               gate_min_samples=settings["min_samples"])
+    if getattr(args, "json", False):
+        print(json.dumps({"ledger": path, **result}, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    print(gate_eval_text(result, path), end="")
+
+
 # ---------------------------------------------------------------- weekly retro
 
 def retro_safe(value, limit=240):
@@ -13558,6 +13867,9 @@ def cmd_report(args, policy):
     if getattr(args, "weighted_eval", None):
         cmd_weighted_eval(args, policy)
         return
+    if getattr(args, "gate_eval", None):
+        cmd_gate_eval(args, policy)
+        return
     if any(getattr(args, key, None) for key in ("daily", "date", "json")):
         cmd_daily_report(args, policy)
         return
@@ -14875,8 +15187,11 @@ def main():
     sp.add_argument("--weighted-eval", action="store_true",
                     help="weighted-routing counterfactual replay by (backend, card type) from ledger history "
                          "(M9, #132); with --json, print it as JSON")
+    sp.add_argument("--gate-eval", action="store_true",
+                    help="calibration-gate flip counterfactual replay by (backend, card type) from ledger history "
+                         "(M16, #164); with --json, print it as JSON")
     sp.add_argument("--fleet", action="store_true",
-                    help="with --advice-accuracy or --weighted-eval, read the merged fleet ledger")
+                    help="with --advice-accuracy, --weighted-eval or --gate-eval, read the merged fleet ledger")
 
     sp = sub.add_parser("retro", help="run the weekly fleet retrospective")
     sp.add_argument("--days", type=int, default=7, help="include runs from the last N days")

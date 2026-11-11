@@ -1,0 +1,15 @@
+gate eval (ledger: LEDGER; margin: 0.10; gate: diff > 0.20 and n >= 8)
+replay in ledger order: a scored run would divert when the advised backend/model differs from the run's backend/model and the quoted advice pass rate beats the recorded actual-pick pass rate by at least the margin; it is intercepted when the advised group is miscalibrated against the history before that run (the live gate's view at dispatch time); expected (quoted basis) = quoted advice rate for diverted runs, the default pick's recorded rate for intercepted runs, observed outcome otherwise; calibrated = the advised group's observed rate for diverted runs, the default pick's recorded rate for intercepted runs, observed outcome otherwise — the calibrated delta is the decision metric, the quoted-basis delta takes advice at face value; small-n = n < 8, deltas indicative only
+backend    card_type       n diverted intercepted  share int-actual int-quoted cal-delta  flag
+----------------------------------------------------------------------------------------------
+bad        fix            12        4           4   1.00       0.50       0.90     +0.08  
+cursor     review          4        0           0    n/a        n/a        n/a     +0.00  small-n
+edge       fix            12        2           0   0.00        n/a        n/a     +0.00  
+ok         fix            12        4           0   0.00        n/a        n/a     +0.00  
+pi         fix             0        0           0    n/a        n/a        n/a       n/a  no scored runs
+rec        fix            36        4           2   0.50       0.50       0.90     +0.01  
+thin       fix             6        2           0   0.00        n/a        n/a     +0.00  small-n
+scored runs: 82 across 7 groups; would divert: 16; intercepted: 6 (0.38 of diversions, 0.07 of scored); advice records: 85
+expected pass rate (quoted basis): gate off 0.71 vs gate on 0.69 (delta -0.03)
+expected pass rate (calibrated): gate off 0.63 vs gate on 0.65 (delta +0.02)
+intercepted runs: actual 0.50 vs expected-if-followed 0.90 (over-promise +0.40 over 6 runs)
