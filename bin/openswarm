@@ -2529,6 +2529,159 @@ def cmd_advice_accuracy(args, policy):
     print(advice_accuracy_text(result, path), end="")
 
 
+def compute_weighted_eval(entries, margin=0.10, plan_ok=None):
+    """Counterfactual weighted-routing replay, by (advised backend, card type).
+
+    For each ledger run with recorded routing advice, replay the diversion
+    rule `apply_weighted_routing` enforces (M6, #114): the run would divert
+    when the advised (backend, model) differs from the run's own
+    (backend, model) and the quoted advice pass rate beats the recorded
+    actual-pick pass rate by at least `margin` (equal diverts, as in the
+    live `< margin` check). When `plan_ok` is given and returns False for
+    the advised backend/model, the run is counted as `plan_failed` and
+    keeps the default pick — the live path's re-plan failure, modelled
+    here as a seam because the historical run's profile is not in the
+    ledger; the report command passes None (assume plannable).
+
+    For each group:
+    - n: scored runs (known outcome via `routing_outcome`); diverted: runs
+      that would divert; diverted_share: diverted / n.
+    - advised_pass_rate: mean quoted advice pass rate over scored runs.
+    - actual_pass_rate: observed pass rate over scored runs.
+    - expected_pass_rate: mean over scored runs of the counterfactual
+      outcome — the quoted advice rate for diverted runs, the observed
+      outcome otherwise. No per-run counterfactual outcome is invented:
+      a diverted run's expected outcome is exactly the rate advice quoted
+      at dispatch time (diversion requires a quoted rate, so this is
+      always defined when n > 0).
+    - expected_delta: expected - actual.
+    - small_n: 0 < n < 8 (same sample bar as the M8 calibration flag);
+      groups with advice records but no scored run still appear, with
+      n=0 and no invented rates. Batch/fleet routing-decision records
+      are not run outcomes and are excluded, as in
+      `compute_advice_accuracy`. Read-only: this never touches routing
+      decisions.
+    """
+    margin = routing_advice_margin({"routing": {"advice_margin": margin}})
+    groups = {}
+    total_advice = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision"):
+            continue
+        advice = entry.get("routing_advice")
+        if not isinstance(advice, dict) or not advice.get("backend"):
+            continue
+        total_advice += 1
+        key = (str(advice["backend"]), str(entry.get("card_type") or "-"))
+        group = groups.setdefault(key, {"advice_records": 0, "outcomes": [],
+                                        "quoted_rates": [], "diverted": 0,
+                                        "plan_failed": 0, "expected": []})
+        group["advice_records"] += 1
+        outcome = routing_outcome(entry)
+        if outcome is None:
+            continue
+        group["outcomes"].append(outcome)
+        rate = advice.get("pass_rate")
+        quoted = (rate if isinstance(rate, (int, float)) and not isinstance(rate, bool)
+                  and math.isfinite(rate) else None)
+        if quoted is not None:
+            group["quoted_rates"].append(quoted)
+        diverted = False
+        advised = (advice.get("backend"), advice.get("model"))
+        actual = (entry.get("backend"), entry.get("model"))
+        act_rate = advice.get("actual_pass_rate")
+        act_ok = (isinstance(act_rate, (int, float)) and not isinstance(act_rate, bool)
+                  and math.isfinite(act_rate))
+        if advised != actual and quoted is not None and act_ok:
+            if round(quoted - act_rate, 6) >= margin:
+                if plan_ok is not None and not plan_ok(advice.get("backend"), advice.get("model")):
+                    group["plan_failed"] += 1
+                else:
+                    diverted = True
+        if diverted:
+            group["diverted"] += 1
+            group["expected"].append(quoted)
+        else:
+            group["expected"].append(1.0 if outcome else 0.0)
+    rows = []
+    for (backend, card_type), group in sorted(groups.items()):
+        n = len(group["outcomes"])
+        advised_rate = (sum(group["quoted_rates"]) / len(group["quoted_rates"])
+                        if group["quoted_rates"] else None)
+        actual_rate = sum(group["outcomes"]) / n if n else None
+        expected_rate = sum(group["expected"]) / n if n else None
+        advised_rate = round(advised_rate, 6) if advised_rate is not None else None
+        actual_rate = round(actual_rate, 6) if actual_rate is not None else None
+        expected_rate = round(expected_rate, 6) if expected_rate is not None else None
+        delta = (round(expected_rate - actual_rate, 6)
+                 if expected_rate is not None and actual_rate is not None else None)
+        rows.append({
+            "backend": backend,
+            "card_type": card_type,
+            "advice_records": group["advice_records"],
+            "n": n,
+            "diverted": group["diverted"],
+            "diverted_share": round(group["diverted"] / n, 6) if n else None,
+            "advised_pass_rate": advised_rate,
+            "actual_pass_rate": actual_rate,
+            "expected_pass_rate": expected_rate,
+            "expected_delta": delta,
+            "plan_failed": group["plan_failed"],
+            "small_n": bool(0 < n < ADVICE_ACCURACY_FLAG_MIN_SAMPLES),
+        })
+    return {"groups": rows,
+            "margin": margin,
+            "total_advice_records": total_advice,
+            "total_scored": sum(row["n"] for row in rows),
+            "total_diverted": sum(row["diverted"] for row in rows)}
+
+
+def weighted_eval_text(result, source):
+    """Text rendering of a `compute_weighted_eval` result."""
+    lines = [f"weighted eval (ledger: {source}; margin: {result['margin']:.2f})",
+             "replay: a scored run would divert when the advised backend/model differs from the "
+             "run's backend/model and the quoted advice pass rate beats the recorded actual-pick "
+             "pass rate by at least the margin; expected = quoted advice rate for diverted runs, "
+             "observed outcome otherwise; small-n = n < 8, expected delta indicative only"]
+    rows = result["groups"]
+    if not rows:
+        lines.append("no advice history in ledger")
+        return "\n".join(lines) + "\n"
+    lines.append(f"{'backend':<10} {'card_type':<12} {'n':>4} {'diverted':>8} {'share':>6} "
+                 f"{'advised':>8} {'actual':>8} {'expected':>8} {'delta':>6}  flag")
+    lines.append("-" * 84)
+    for row in rows:
+        share = f"{row['diverted_share']:.2f}" if row["diverted_share"] is not None else "n/a"
+        advised = f"{row['advised_pass_rate']:.2f}" if row["advised_pass_rate"] is not None else "n/a"
+        actual = f"{row['actual_pass_rate']:.2f}" if row["actual_pass_rate"] is not None else "n/a"
+        expected = f"{row['expected_pass_rate']:.2f}" if row["expected_pass_rate"] is not None else "n/a"
+        delta = f"{row['expected_delta']:+.2f}" if row["expected_delta"] is not None else "n/a"
+        if row["n"] == 0:
+            flag = "no scored runs"
+        elif row["small_n"]:
+            flag = "small-n"
+        else:
+            flag = ""
+        lines.append(f"{row['backend']:<10} {row['card_type']:<12} {row['n']:>4} "
+                     f"{row['diverted']:>8} {share:>6} {advised:>8} {actual:>8} "
+                     f"{expected:>8} {delta:>6}  {flag}")
+    lines.append(f"scored runs: {result['total_scored']} across {len(rows)} groups; "
+                 f"diverted: {result['total_diverted']}; advice records: {result['total_advice_records']}")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_weighted_eval(args, policy):
+    path = fleet_ledger_path() if getattr(args, "fleet", False) else LEDGER
+    result = compute_weighted_eval(ledger_entries_from(path),
+                                   margin=routing_advice_margin(policy))
+    if getattr(args, "json", False):
+        print(json.dumps({"ledger": path, **result}, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    print(weighted_eval_text(result, path), end="")
+
+
 # ---------------------------------------------------------------- weekly retro
 
 def retro_safe(value, limit=240):
@@ -12177,6 +12330,9 @@ def cmd_report(args, policy):
     if getattr(args, "advice_accuracy", None):
         cmd_advice_accuracy(args, policy)
         return
+    if getattr(args, "weighted_eval", None):
+        cmd_weighted_eval(args, policy)
+        return
     if any(getattr(args, key, None) for key in ("daily", "date", "json")):
         cmd_daily_report(args, policy)
         return
@@ -13487,8 +13643,11 @@ def main():
     sp.add_argument("--advice-accuracy", action="store_true",
                     help="advice calibration table by (backend, card type) from ledger history "
                          "(M8, #127); with --json, print it as JSON")
+    sp.add_argument("--weighted-eval", action="store_true",
+                    help="weighted-routing counterfactual replay by (backend, card type) from ledger history "
+                         "(M9, #132); with --json, print it as JSON")
     sp.add_argument("--fleet", action="store_true",
-                    help="with --advice-accuracy, read the merged fleet ledger")
+                    help="with --advice-accuracy or --weighted-eval, read the merged fleet ledger")
 
     sp = sub.add_parser("retro", help="run the weekly fleet retrospective")
     sp.add_argument("--days", type=int, default=7, help="include runs from the last N days")
