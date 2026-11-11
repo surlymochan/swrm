@@ -100,6 +100,20 @@ def by_key(result):
     return {(row["backend"], row["card_type"]): row for row in result["groups"]}
 
 
+REAL_LEDGER_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "advice-accuracy-real-ledger.jsonl"
+
+
+def load_real_ledger():
+    """Verbatim copy of the M8 slice 2 (#129) real-run ledger (48 lines).
+
+    Produced by 48 real `openswarm run` calls in scratch
+    bench-env/m8-slice2 (16 seed + 8 weighted runs per card type, fix and
+    test); see docs/m8-advice-accuracy-evidence.md for the hand recount.
+    """
+    return [json.loads(line) for line in
+            REAL_LEDGER_FIXTURE.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 class AdviceAccuracyTests(unittest.TestCase):
     def test_known_numbers(self):
         result = xs.compute_advice_accuracy(known_ledger())
@@ -127,6 +141,29 @@ class AdviceAccuracyTests(unittest.TestCase):
         self.assertFalse(deepseek["miscalibrated"])
         self.assertEqual(result["total_scored"], 10 + 8 + 8 + 5 + 7)
         self.assertEqual(result["total_advice_records"], 10 + 8 + 8 + 5 + 7 + 3 + 2)
+
+    def test_real_ledger_two_groups_n_eight(self):
+        """M8 slice 2 (#129): the real-ledger calibration table, hand-recomputed.
+
+        Both groups quote pass rate 1.0 on every scored run and observe 8/8
+        passes, so advised == actual == 1.0, diff 0.0, no MISCALIBRATED
+        group. The numbers below are the hand recount in
+        docs/m8-advice-accuracy-evidence.md, not the report's own output.
+        """
+        result = xs.compute_advice_accuracy(load_real_ledger())
+        groups = by_key(result)
+        self.assertEqual(sorted(groups), [("echo-good", "fix"), ("echo-good", "test")])
+        for key in (("echo-good", "fix"), ("echo-good", "test")):
+            row = groups[key]
+            self.assertAlmostEqual(row["advised_pass_rate"], 1.0)
+            self.assertAlmostEqual(row["actual_pass_rate"], 1.0)
+            self.assertEqual(row["n"], 8)
+            self.assertAlmostEqual(row["diff"], 0.0)
+            self.assertFalse(row["miscalibrated"])
+            self.assertEqual(row["not_followed"], 0)
+        self.assertEqual(result["total_scored"], 16)
+        self.assertEqual(result["total_advice_records"], 16)
+        self.assertFalse(any(row["miscalibrated"] for row in result["groups"]))
 
     def test_flag_boundaries(self):
         groups = by_key(xs.compute_advice_accuracy(known_ledger()))
