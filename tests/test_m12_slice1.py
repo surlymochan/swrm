@@ -66,6 +66,7 @@ class RunHealthTests(unittest.TestCase):
                 fh.write(json.dumps({"run_id": rid, "status": "progress"}) + "\n")
         return str(rdir)
 
+    @needs_identity
     def test_live_runner_recent_activity_is_alive(self):
         pid = os.getpid()
         self.make_run("run-alive", {"state": "running", "runner_pid": pid,
@@ -265,6 +266,7 @@ class FleetHealthFakeTransportTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(Path(_load.ROOT) / "bin" / "openswarm"), *argv],
                               env=self.env(), capture_output=True, text=True, timeout=120)
 
+    @needs_identity
     def test_health_over_fake_transport_reports_live_runner(self):
         pid = os.getpid()
         rdir = self.root / "runs" / "fake-alive"
