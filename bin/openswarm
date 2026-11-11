@@ -2267,6 +2267,161 @@ def routing_advice_margin(policy):
     return value
 
 
+# ---------------------------------------------------------------- adaptive margin (M14 slice 1, #156)
+
+ADAPTIVE_MARGIN_DEFAULT_FLOOR = 0.05
+ADAPTIVE_MARGIN_DEFAULT_CAP = 0.30
+ADAPTIVE_MARGIN_Z = 1.96  # 95% Wilson score interval
+
+
+def wilson_lower_bound(rate, n, z=ADAPTIVE_MARGIN_Z):
+    """Wilson score lower bound of an observed pass rate (M14, #156).
+
+    Returns None when there are no trials. Pure arithmetic, so the same
+    ledger history always yields the same bound (see the reproducibility
+    test in tests/test_adaptive_margin.py)."""
+    if n <= 0:
+        return None
+    z2 = z * z
+    denom = 1 + z2 / n
+    centre = (rate + z2 / (2 * n)) / denom
+    half = z * math.sqrt(rate * (1 - rate) / n + z2 / (4 * n * n)) / denom
+    return max(0.0, min(1.0, centre - half))
+
+
+def adaptive_margin_settings(policy):
+    """Validated adaptive-margin settings from policy (M14, #156).
+
+    `routing.adaptive_margin` is the master switch (default false: shipped
+    behaviour is byte-identical to the static margin). `floor`/`cap` bound
+    every adaptive margin; `min_samples` defaults to `routing.min_samples`
+    when unset, so the sample bar stays the one advice already uses."""
+    routing = policy.get("routing") or {}
+    enabled = routing.get("adaptive_margin", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("routing.adaptive_margin must be a boolean")
+    floor = routing.get("adaptive_margin_floor", ADAPTIVE_MARGIN_DEFAULT_FLOOR)
+    cap = routing.get("adaptive_margin_cap", ADAPTIVE_MARGIN_DEFAULT_CAP)
+    for name, value in (("adaptive_margin_floor", floor), ("adaptive_margin_cap", cap)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < 1:
+            raise ValueError(f"routing.{name} must be a number in [0, 1)")
+    if floor > cap:
+        raise ValueError("routing.adaptive_margin_floor must not exceed routing.adaptive_margin_cap")
+    min_samples = routing.get("adaptive_margin_min_samples", routing_min_samples(policy))
+    if isinstance(min_samples, bool) or not isinstance(min_samples, int) or min_samples < 1:
+        raise ValueError("routing.adaptive_margin_min_samples must be a positive integer")
+    return {"enabled": enabled, "static_margin": routing_advice_margin(policy),
+            "floor": floor, "cap": cap, "min_samples": min_samples}
+
+
+def compute_adaptive_margins(entries, policy):
+    """Per-(backend, card-type) adaptive margins from ledger history (M14, #156).
+
+    Method (reproducible from the ledger alone; see README "Adaptive routing
+    margin"): a scored run is a ledger run whose recorded `routing_advice`
+    named the backend, that actually ran on it, with a known outcome — the
+    same scoring `compute_advice_accuracy` uses (M8, #127). For each group:
+
+    - advised_pass_rate: mean pass rate the advice quoted on scored runs.
+    - actual_pass_rate: observed pass rate over the scored runs.
+    - diff: |advised - actual|, the observed calibration error.
+    - wilson_lower: 95% Wilson lower bound of the actual pass rate.
+    - uncertainty: actual - wilson_lower; shrinks as n grows.
+    - margin = clamp(diff + uncertainty, floor, cap): the margin must at
+      least cover the observed calibration error plus the statistical
+      uncertainty of the actual rate. A perfectly calibrated, heavily
+      sampled group lands on the floor; a miscalibrated or thinly sampled
+      group needs a bigger advantage before it may divert (up to the cap).
+
+    Groups with n < min_samples are not adapted: their margin falls back
+    to the static `routing.advice_margin` and `adapted` is False. Groups
+    with no history do not appear at all — callers fall back to the static
+    margin. Read-only: this never touches routing decisions.
+    """
+    settings = adaptive_margin_settings(policy)
+    groups = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid"):
+            continue
+        advice = entry.get("routing_advice")
+        if not isinstance(advice, dict) or not advice.get("backend"):
+            continue
+        key = (str(advice["backend"]), str(entry.get("card_type") or "-"))
+        group = groups.setdefault(key, {"advised_rates": [], "outcomes": []})
+        if entry.get("backend") != advice.get("backend"):
+            continue
+        outcome = routing_outcome(entry)
+        if outcome is None:
+            continue
+        rate = advice.get("pass_rate")
+        if isinstance(rate, (int, float)) and not isinstance(rate, bool) and math.isfinite(rate):
+            group["advised_rates"].append(rate)
+        group["outcomes"].append(outcome)
+    rows = []
+    for (backend, card_type), group in sorted(groups.items()):
+        n = len(group["outcomes"])
+        advised = (round(sum(group["advised_rates"]) / len(group["advised_rates"]), 6)
+                   if group["advised_rates"] else None)
+        actual = round(sum(group["outcomes"]) / n, 6) if n else None
+        diff = (round(abs(advised - actual), 6)
+                if advised is not None and actual is not None else None)
+        lower = (round(wilson_lower_bound(actual, n), 6)
+                 if actual is not None and n else None)
+        uncertainty = (round(actual - lower, 6)
+                       if actual is not None and lower is not None else None)
+        adapted = bool(n >= settings["min_samples"] and diff is not None
+                       and uncertainty is not None)
+        margin = (round(min(max(diff + uncertainty, settings["floor"]), settings["cap"]), 6)
+                  if adapted else settings["static_margin"])
+        rows.append({
+            "backend": backend,
+            "card_type": card_type,
+            "n": n,
+            "advised_pass_rate": advised,
+            "actual_pass_rate": actual,
+            "diff": diff,
+            "wilson_lower": lower,
+            "uncertainty": uncertainty,
+            "margin": margin,
+            "adapted": adapted,
+        })
+    return {"enabled": settings["enabled"],
+            "static_margin": settings["static_margin"],
+            "floor": settings["floor"], "cap": settings["cap"],
+            "min_samples": settings["min_samples"], "groups": rows}
+
+
+def adaptive_margin_for(policy, backend, card_type, entries=None):
+    """(margin, detail) for one (backend, card-type) group (M14, #156).
+
+    detail carries `margin_source` ("adaptive" | "static"), the adapted
+    group row when one exists, and the fallback reason otherwise. With the
+    switch off the static margin is returned without reading the ledger,
+    so the record-only path stays byte-identical. Never returns a negative
+    margin or one above the cap: adaptive margins are clamped by
+    construction and the static margin is validated to [0, 1).
+    """
+    settings = adaptive_margin_settings(policy)
+    if not settings["enabled"]:
+        return settings["static_margin"], {"margin_source": "static", "adapted": False,
+                                           "reason": "disabled"}
+    if entries is None:
+        entries = ledger_entries()
+    result = compute_adaptive_margins(entries, policy)
+    key = (str(backend), str(card_type or "-"))
+    for row in result["groups"]:
+        if (row["backend"], row["card_type"]) == key:
+            if row["adapted"]:
+                return row["margin"], {"margin_source": "adaptive", "adapted": True,
+                                       "group": row}
+            return settings["static_margin"], {"margin_source": "static", "adapted": False,
+                                               "reason": "below min_samples", "group": row}
+    return settings["static_margin"], {"margin_source": "static", "adapted": False,
+                                       "reason": "no history"}
+
+
 def routing_advice(profile, card_type, st, policy, actual_decision, custom_backends=()):
     """Return record-only advice from enough-sample groups eligible for this live state.
 
@@ -2330,7 +2485,15 @@ def routing_advice(profile, card_type, st, policy, actual_decision, custom_backe
 
 def apply_weighted_routing(profile, card_type, st, policy, decision, custom_backends=()):
     """routing.weighted enforcement (M6, #114): follow ledger advice when it
-    beats the default pick by at least routing.advice_margin.
+    beats the default pick by at least the margin for the advised group.
+
+    The margin is `routing.advice_margin` by default; with
+    `routing.adaptive_margin: true` (M14, #156) it is the per-(backend,
+    card-type) margin `adaptive_margin_for` computes from ledger history
+    (calibration error + Wilson uncertainty, clamped to floor/cap), falling
+    back to the static margin when the group has no history or too few
+    samples. `route`, `run --dry-run` and the real run all call this one
+    function, so the three paths cannot drift apart.
 
     Returns (decision, info); info["applied"] is False when nothing changed,
     so the record-only path keeps the original decision untouched. Never
@@ -2353,7 +2516,7 @@ def apply_weighted_routing(profile, card_type, st, policy, decision, custom_back
     actual = (decision.get("backend"), decision.get("model"))
     if advised == actual:
         return decision, {**info, "reason": "advice agrees with the default pick"}
-    margin = routing_advice_margin(policy)
+    margin, margin_detail = adaptive_margin_for(policy, advice["backend"], card_type)
     adv_rate, act_rate = advice.get("pass_rate"), advice.get("actual_pass_rate")
     if adv_rate is None or act_rate is None:
         return decision, {**info, "reason": "pass-rate comparison unavailable (default pick has no history for this card type)"}
@@ -2373,15 +2536,29 @@ def apply_weighted_routing(profile, card_type, st, policy, decision, custom_back
     new_decision["advice_samples"] = advice.get("runs")
     new_decision["actual_pass_rate"] = act_rate
     new_decision["actual_samples"] = advice.get("actual_runs")
+    # M14 slice 1 (#156): when the margin came from ledger history, record
+    # it on the decision and in the weighted_routing info, so the ledger
+    # and result.json show which margin decided the diversion. With the
+    # switch off (or a static fallback) nothing is added, so the record
+    # stays byte-identical to the static-margin behaviour.
+    margin_note = f"margin {margin:.2f}"
+    if margin_detail.get("adapted"):
+        new_decision["advice_margin"] = margin
+        new_decision["adaptive_margin"] = margin_detail["group"]
+        margin_note = f"adaptive margin {margin:.2f}"
     new_decision.setdefault("reasons", []).append(
         f"weighted routing: {advised[0]} / {advised[1]} observed pass rate {adv_rate:.2f} "
         f"beats {actual[0]} / {actual[1]} at {act_rate:.2f} by {adv_rate - act_rate:.2f} "
-        f"(margin {margin:.2f}, {advice.get('runs')} samples)")
-    return new_decision, {"applied": True,
-                          "from": {"backend": actual[0], "model": actual[1]},
-                          "to": {"backend": advised[0], "model": advised[1]},
-                          "advantage": adv_rate - act_rate, "margin": margin,
-                          "reason": advice.get("reason")}
+        f"({margin_note}, {advice.get('runs')} samples)")
+    info = {"applied": True,
+            "from": {"backend": actual[0], "model": actual[1]},
+            "to": {"backend": advised[0], "model": advised[1]},
+            "advantage": adv_rate - act_rate, "margin": margin,
+            "reason": advice.get("reason")}
+    if margin_detail.get("adapted"):
+        info["margin_source"] = "adaptive"
+        info["margin_group"] = margin_detail["group"]
+    return new_decision, info
 
 
 def cmd_routing_weights(args, policy):

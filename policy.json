@@ -78,7 +78,11 @@
     "large_context_tokens": 220000,
     "min_samples": 8,
     "weighted": true,
-    "advice_margin": 0.1
+    "advice_margin": 0.1,
+    "adaptive_margin": false,
+    "adaptive_margin_floor": 0.05,
+    "adaptive_margin_cap": 0.3,
+    "adaptive_margin_min_samples": 8
   },
   "codex": {
     "default_model": "gpt-6-luna",

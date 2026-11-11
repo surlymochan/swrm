@@ -476,6 +476,22 @@ advice records but no scored run show `n=0` with `n/a` rates. Add `--json` for m
 `--fleet` to read the merged fleet ledger. The command is read-only and never changes routing; the margin it
 replays is the policy's `routing.advice_margin` (default 0.10).
 
+`routing.adaptive_margin` (M14, #156) replaces that single static margin with one computed per (backend,
+card type) from ledger history. It is off by default (`false`): with it off, every decision is byte-identical to
+the static-margin behaviour. With it on, each advised group is scored the same way `report --advice-accuracy`
+scores it — scored runs are ledger runs whose recorded `routing_advice` named the backend, that actually ran on
+it, with a known outcome — and the margin is `clamp(|advised - actual| + uncertainty, floor, cap)`, where
+`advised` is the mean pass rate the advice quoted on scored runs, `actual` is the observed pass rate over those
+runs, and `uncertainty` is `actual` minus its 95% Wilson score lower bound (it shrinks as the sample count grows).
+Groups below `routing.adaptive_margin_min_samples` (default `routing.min_samples`, 8) are not adapted and fall back
+to the static `routing.advice_margin` (0.10), as do groups with no history. `routing.adaptive_margin_floor`
+(default 0.05) and `routing.adaptive_margin_cap` (default 0.30) bound every adaptive margin, so a margin is never
+negative and never exceeds the cap. When a diversion uses an adaptive margin, the decision and the ledger's
+`weighted_routing` record carry `advice_margin`, the full group row under `adaptive_margin` / `margin_group`, and
+`margin_source: adaptive`. The switch only changes the margin threshold, never the advice computation itself; `route`,
+`run --dry-run` and the real run share the single `apply_weighted_routing` decision path, and an explicit
+`--backend` always wins.
+
 Run the weekly fleet retrospective in one command:
 
 ```bash
