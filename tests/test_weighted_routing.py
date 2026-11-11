@@ -2,8 +2,8 @@
 
 When routing.weighted is true, ledger advice moves the live route: a run
 follows the advised backend when its observed pass rate beats the default
-pick by at least routing.advice_margin. With weighted false (the shipped
-default) advice stays record-only and the route is unchanged.
+pick by at least routing.advice_margin. With weighted false (explicit
+opt-out) advice stays record-only and the route is unchanged.
 Run: python3 -m unittest discover -s tests   (or: python3 tests/test_weighted_routing.py)
 """
 import contextlib

@@ -385,7 +385,8 @@ class FleetWeightedRoutingTests(unittest.TestCase):
                          {("codex", 8), ("ocgo", 8)})
 
     def test_weighted_off_forwards_verbatim_without_ledger_entry(self):
-        self.write_policy()
+        """Explicit opt-out (weighted false): forward verbatim, no decision."""
+        self.write_policy(weighted=False, default_order=["codex", "ocgo"], min_samples=8)
         _, decision = self.seed()
         before = self.ledger_entries()
         proc = self.exec_run()
