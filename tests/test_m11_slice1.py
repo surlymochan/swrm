@@ -23,8 +23,18 @@ import _load
 
 xs = _load.load()
 
+# Process start-time identity is unreadable on platforms without /proc or
+# `ps -o lstart=` (Windows): pid_alive there falls back to the legacy
+# existence check by design, so identity-dependent tests skip there.
+IDENTITY_SUPPORTED = xs.proc_start_time(os.getpid()) is not None
+needs_identity = unittest.skipUnless(
+    IDENTITY_SUPPORTED,
+    "process start-time identity is unreadable on this platform; "
+    "pid check falls back to the legacy existence test")
+
 
 class PidIdentityTests(unittest.TestCase):
+    @needs_identity
     def test_live_pid_with_matching_start_is_alive(self):
         pid = os.getpid()
         start = xs.proc_start_time(pid)
@@ -32,6 +42,7 @@ class PidIdentityTests(unittest.TestCase):
         self.assertTrue(xs.pid_alive(pid, start))
         self.assertTrue(xs.runner_alive({"runner_pid": pid, "runner_pid_start": start}))
 
+    @needs_identity
     def test_live_pid_with_wrong_start_is_not_the_runner(self):
         # The pid is alive, but it is a different (recycled) process: the
         # recorded runner is dead. This is the #98 false-positive.
@@ -54,6 +65,7 @@ class PidIdentityTests(unittest.TestCase):
         self.assertFalse(xs.runner_alive({"runner_pid": 999999}))
         self.assertFalse(xs.runner_alive({}))
 
+    @needs_identity
     def test_set_status_stamps_runner_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             rdir = os.path.join(tmp, "run-stamp")
@@ -103,6 +115,7 @@ class ReapDeadRunTests(unittest.TestCase):
         # Second reap is a no-op: the run is already terminal.
         self.assertFalse(xs.reap_dead_run(str(rdir)))
 
+    @needs_identity
     def test_reap_refuses_recycled_pid_as_alive(self):
         # The pid is alive (this process) but the recorded identity is
         # someone else's: the recorded runner is dead and must be reaped.
