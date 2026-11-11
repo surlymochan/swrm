@@ -133,7 +133,7 @@ class PiBackend(unittest.TestCase):
                      {"id": f"run-{state}", "state": state,
                       "executor_pid": 999999, "runner_pid": 12345})
             with mock.patch.object(xs, "RUNS", self.tmp), \
-                 mock.patch.object(xs, "pid_alive", side_effect=lambda pid: pid == 12345), \
+                 mock.patch.object(xs, "pid_alive", side_effect=lambda pid, start=None: pid == 12345), \
                  mock.patch.object(xs, "kill_tree") as kill:
                 with contextlib.redirect_stdout(io.StringIO()):
                     xs.cmd_stop(argparse.Namespace(run_id=f"run-{state}"), POLICY)

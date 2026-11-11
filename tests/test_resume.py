@@ -46,7 +46,7 @@ class ResumeTests(unittest.TestCase):
         lanes = [{"name": "L1", "state": "busy", "current_run": "live-running"},
                  {"name": "L2", "state": "idle", "current_run": None}]
         output = io.StringIO()
-        with mock.patch.object(xs, "pid_alive", side_effect=lambda pid: pid in (101, 102)), \
+        with mock.patch.object(xs, "pid_alive", side_effect=lambda pid, start=None: pid in (101, 102)), \
                 mock.patch.object(xs, "lane_status_rows", return_value=lanes), \
                 contextlib.redirect_stdout(output):
             xs.cmd_resume(argparse.Namespace(since_hours=6, json=True))
