@@ -77,7 +77,7 @@
     ],
     "large_context_tokens": 220000,
     "min_samples": 8,
-    "weighted": false,
+    "weighted": true,
     "advice_margin": 0.1
   },
   "codex": {

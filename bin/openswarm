@@ -2330,8 +2330,8 @@ def apply_weighted_routing(profile, card_type, st, policy, decision, custom_back
     Returns (decision, info); info["applied"] is False when nothing changed,
     so the record-only path keeps the original decision untouched. Never
     strands a run: any failure to re-plan falls back to the original
-    decision. Explicit --backend always wins; the shipped default
-    (routing.weighted false) never reaches the switch."""
+    decision. Explicit --backend always wins; an explicit
+    `routing.weighted: false` never reaches the switch."""
     info = {"applied": False}
     routing = policy.get("routing") or {}
     if not routing.get("weighted", False):

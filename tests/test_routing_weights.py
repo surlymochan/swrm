@@ -98,7 +98,11 @@ class RoutingWeightsTests(unittest.TestCase):
         self.assertEqual(row["scored_runs"], 3)
 
     def test_run_records_advice_without_changing_live_route(self):
+        # Record-only path: explicit opt-out (weighted false). The shipped
+        # default is weighted true since M9 #134, so this test must opt
+        # out explicitly instead of relying on the default.
         policy = copy.deepcopy(xs.load_policy())
+        policy["routing"]["weighted"] = False
         policy["routing"]["min_samples"] = 2
         policy["routing"]["default_order"] = ["codex", "ocgo"]
         profile = {"type": "impl", "difficulty": 3}

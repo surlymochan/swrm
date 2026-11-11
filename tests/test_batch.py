@@ -707,10 +707,10 @@ class BatchWeightedRoutingTests(FakeFleetFixture, unittest.TestCase):
                          {("codex", 8), ("ocgo", 8)})
 
     def test_weighted_off_dispatches_without_new_fields(self):
-        """Shipped default: no weighted fields anywhere, remote run gets the
+        """Explicit opt-out (weighted false): no weighted fields anywhere, remote run gets the
         creation-time default pick exactly as before this change."""
         (self.cards / "one.md").write_text("task one")
-        self.write_policy()
+        self.write_policy(weighted=False, default_order=["codex", "ocgo"], min_samples=8)
         state, decision = self.seed()
         rc, summary, _ = self.run_weighted_batch(state, backend=None, model=None, card_type="fix")
         self.assertEqual(rc, 0)

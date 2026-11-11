@@ -244,6 +244,48 @@ class WeightedEvalTests(unittest.TestCase):
         text = xs.weighted_eval_text(result, "<missing>")
         self.assertIn("no advice history", text)
 
+    def test_real_ledger_all_diverted(self):
+        """M9 slice 2 (#134): the real-ledger counterfactual, hand-recomputed.
+
+        Both groups quote pass rate 1.0 on every scored run while the runs
+        actually ran on echo-bad and failed 0/8, so all 16 divert (share
+        1.00), expected 1.00, delta +1.00. The numbers below are the hand
+        recount in docs/m9-counterfactual-evidence.md, not the report's
+        own output.
+        """
+        result = xs.compute_weighted_eval(load_real_ledger())
+        groups = by_key(result)
+        self.assertEqual(sorted(groups), [("echo-good", "fix"), ("echo-good", "test")])
+        for key in (("echo-good", "fix"), ("echo-good", "test")):
+            row = groups[key]
+            self.assertEqual(row["n"], 8)
+            self.assertEqual(row["diverted"], 8)
+            self.assertAlmostEqual(row["diverted_share"], 1.0)
+            self.assertAlmostEqual(row["advised_pass_rate"], 1.0)
+            self.assertAlmostEqual(row["actual_pass_rate"], 0.0)
+            self.assertAlmostEqual(row["expected_pass_rate"], 1.0)
+            self.assertAlmostEqual(row["expected_delta"], 1.0)
+            self.assertEqual(row["plan_failed"], 0)
+            self.assertFalse(row["small_n"])
+        self.assertEqual(result["total_scored"], 16)
+        self.assertEqual(result["total_diverted"], 16)
+        self.assertEqual(result["total_advice_records"], 16)
+
+
+REAL_LEDGER_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "weighted-eval-real-ledger.jsonl"
+
+
+def load_real_ledger():
+    """Verbatim copy of the M9 slice 2 (#134) real-run ledger (48 lines).
+
+    Produced by 48 real `openswarm run` calls in scratch
+    bench-env/m9-slice2 under the default config (no routing.weighted
+    key: 16 seed + 8 record-only runs per card type, fix and test);
+    see docs/m9-counterfactual-evidence.md for the hand recount.
+    """
+    return [json.loads(line) for line in
+            REAL_LEDGER_FIXTURE.read_text(encoding="utf-8").splitlines() if line.strip()]
+
 
 GOLDEN = Path(__file__).resolve().parent / "golden" / "report-weighted-eval.txt"
 
