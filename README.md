@@ -272,6 +272,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm routing compare` | Compare recorded routing advice with the actual run outcomes. | `openswarm routing compare --days 30 --fleet` |
 | `openswarm report --advice-accuracy` | Advice calibration table by (backend, card type): quoted vs observed pass rates. | `openswarm report --advice-accuracy [--json] [--fleet]` |
 | `openswarm report --weighted-eval` | Weighted-routing counterfactual replay by (backend, card type): diverted share and expected vs actual pass rate. | `openswarm report --weighted-eval [--json] [--fleet]` |
+| `openswarm report --gate-eval` | Calibration-gate flip counterfactual replay by (backend, card type): intercepted diversion share and expected pass-rate change. | `openswarm report --gate-eval [--json] [--fleet]` |
 | `openswarm retro` | Run the weekly retrospective: pull, ingest, backfill, weights, proposals, report. | `openswarm retro --days 7 --repos acme/project` |
 | `openswarm regress run` | Run the regression card suite on a backend, a lane, or a routing mode. | `openswarm regress run --backend codex --cards card-a,card-b --label nightly --parallel 2` |
 | `openswarm regress compare` | Compare two regression result files card by card. | `openswarm regress compare before.json after.json` |
@@ -503,6 +504,22 @@ re-evaluated from ledger history on every decision, so a group whose calibration
 the difference back under the bar) is followed again with no manual reset, and a group with too few samples or
 no history is never gated. The gate only ever blocks a diversion; it never changes the advice computation, the
 default pick, or the margin, and an explicit `--backend` always wins.
+
+`openswarm report --gate-eval` (M16, #164) replays those same advice records to decide whether the gate's
+shipped default should flip: for each scored run it replays the diversion rule, then asks whether the gate
+would have intercepted that diversion — the advised group miscalibrated against the history recorded *before*
+that run (the live gate's view at dispatch time, so a group that was miscalibrated early and recovered later
+gates only the runs dispatched while it was miscalibrated). One row per (advised backend, card type) shows
+the intercepted share of diversions, the intercepted runs' observed pass rate against the rate following the
+advice promised, and the expected pass-rate change (Δ). Two Δs are reported because the quoted-basis one
+takes advice at face value (it charges the gate for the quoted rate a blocked diversion never earned) while
+the calibrated basis credits a diverted run with the advised group's observed rate instead — the calibrated
+Δ is the decision metric for the flip. Intercepted run ids are listed in `--json` so the replay can be
+cross-checked against the ledger's recorded `gated_by_calibration` records. Add `--json` for machine-readable
+output or `--fleet` to read the merged fleet ledger. The command is read-only and never changes routing, the
+shipped default, or the ledger; the gate bar it replays comes from policy (`routing.calibration_gate_diff`,
+default 0.20; `routing.calibration_gate_min_samples`, default 8) and the margin from
+`routing.advice_margin` (default 0.10).
 
 Run the weekly fleet retrospective in one command:
 
