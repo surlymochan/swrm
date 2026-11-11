@@ -7,6 +7,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -244,6 +245,252 @@ class FleetTests(unittest.TestCase):
         valid = json.dumps({"run_id": "kept"}).encode() + b"\n"
         self.assertEqual([row["run_id"] for row in xs.ledger_records(oversized + valid, "h")], ["kept"])
         self.assertEqual(xs.ledger_records(b"\n" * xs.LEDGER_MAX_HOST_LINES + valid, "h"), [])
+
+
+STUB = pathlib.Path(_load.HERE) / "fixtures" / "fake_fleet_openswarm.py"
+OCGO_MODEL = "mid-coder"  # balanced ocgo model in the fixture state
+
+
+class _StdoutWithBuffer:
+    """sys.stdout stand-in for in-process cmd_fleet exec calls, which write
+    the forwarded bytes via sys.stdout.buffer."""
+
+    def __init__(self):
+        self.buffer = io.BytesIO()
+        self.text = io.StringIO()
+
+    def write(self, value):
+        return self.text.write(value)
+
+    def flush(self):
+        pass
+
+
+class FleetWeightedRoutingTests(unittest.TestCase):
+    """M7 slice 2 (#124): `fleet exec -- run ...` dispatches through
+    weighted routing at the controller, reusing the single-run / batch
+    decision path; the decision is recorded in the controller ledger."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="openswarm-fleet-weighted-")
+        self.root = pathlib.Path(self.tmp.name)
+        self.task = self.root / "task.md"
+        self.task.write_text("task one")
+        with open(_load.FIXTURE_STATE) as handle:
+            state = json.load(handle)
+        now = time.time()
+        state["codex"]["limits"] = {"codex": {"windows": {"seven_day": xs.window_stats(30, 10080, now + 100 * 3600)}}}
+        state["claude"].update({"provider": "official", "metered_by_anthropic": True, "stale": False,
+                                "five_hour": xs.window_stats(20, 300, now + 3 * 3600),
+                                "seven_day": xs.window_stats(30, 10080, now + 100 * 3600)})
+        state["deepseek"]["balance"] = 55.0
+        for model in state["ocgo"]["models"]:
+            model["usage"] = {"5h": 0.0, "7d": 0.0, "30d": 0.0}
+        self.state = state
+        (self.root / "state.json").write_text(json.dumps(state))
+        STUB.chmod(0o755)
+        self.config([{"name": "local", "kind": "local", "openswarm": str(STUB)}])
+        self.patch = mock.patch.object(xs, "DATA", str(self.root))
+        self.patch.start()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.patch.stop)
+
+    def config(self, hosts):
+        (self.root / "fleet.json").write_text(json.dumps({"hosts": hosts}))
+
+    def write_policy(self, **routing):
+        """Routing overrides via policy.local.json; codex require_default_model
+        off so the fixture state routes (as in test_weighted_routing)."""
+        local = {"codex": {"require_default_model": False}}
+        if routing:
+            local["routing"] = routing
+        (self.root / "policy.local.json").write_text(json.dumps(local))
+
+    def rows_for(self, backend, model, passes, n=8):
+        return [{"id": f"{backend[:2]}{i}", "backend": backend, "model": model, "card_type": "fix",
+                 "status": "done", "exec_pass": i < passes, "attempts": [{}], "seconds": 10,
+                 "tokens": {"total": 100}} for i in range(n)]
+
+    def seed(self, codex_pass=2, ocgo_pass=7, codex_n=8, ocgo_n=8):
+        """Seed the controller ledger around the live default pick (codex)."""
+        policy = xs.load_policy()
+        decision = xs.route({"type": "impl", "difficulty": 3}, self.state, policy)
+        self.assertTrue(decision["ok"], f"unroutable: {decision}")
+        self.assertEqual(decision["backend"], "codex")
+        rows = self.rows_for("codex", decision["model"], codex_pass, codex_n)
+        rows += self.rows_for("ocgo", OCGO_MODEL, ocgo_pass, ocgo_n)
+        (self.root / "ledger.jsonl").write_text("".join(json.dumps(entry) + "\n" for entry in rows))
+        return policy, decision
+
+    def env(self):
+        return {**os.environ, "OPENSWARM_HOME": str(self.root),
+                "OPENSWARM_STATE_FILE": str(self.root / "state.json")}
+
+    def run_cli(self, *argv):
+        return subprocess.run([sys.executable, str(pathlib.Path(_load.ROOT) / "bin" / "openswarm"), *argv],
+                              env=self.env(), capture_output=True, text=True, timeout=120)
+
+    def exec_run(self, *extra):
+        """`fleet exec local -- run ...` through the real CLI; returns the
+        CompletedProcess. The fake fleet stub needs a task file, cwd and
+        budget; --backend/--model are the caller's to add (or omit)."""
+        command = ["run", "--task-file", str(self.task), "--card-type", "fix",
+                   "--cwd", str(self.root), "--budget-minutes", "5", *extra]
+        return self.run_cli("fleet", "exec", "local", "--", *command)
+
+    def start_events(self):
+        path = self.root / "calls.jsonl"
+        if not path.exists():
+            return []
+        events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        return [event for event in events if event["event"] == "start"]
+
+    def ledger_entries(self):
+        path = self.root / "ledger.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+    def decision_entries(self):
+        return [entry for entry in self.ledger_entries() if entry.get("fleet_routing_decision")]
+
+    def test_weighted_on_reroutes_forwarded_run(self):
+        self.write_policy(weighted=True, default_order=["codex", "ocgo"], min_samples=8)
+        _, decision = self.seed()
+        proc = self.exec_run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        reply = json.loads(proc.stdout)
+        starts = self.start_events()
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0]["args"]["backend"], "ocgo")
+        self.assertEqual(starts[0]["args"]["model"], OCGO_MODEL)
+        decisions = self.decision_entries()
+        self.assertEqual(len(decisions), 1)
+        entry = decisions[0]
+        self.assertEqual(entry["run_id"], reply["id"])
+        self.assertEqual(entry["backend"], "ocgo")
+        self.assertEqual(entry["model"], OCGO_MODEL)
+        self.assertEqual(entry["status"], "dispatched")
+        self.assertEqual(entry["host"], "local")
+        self.assertTrue(entry["routed_by_advice"])
+        self.assertEqual(entry["routed_from"], {"backend": "codex", "model": decision["model"]})
+        self.assertEqual(entry["advice_pass_rate"], 0.875)
+        self.assertEqual(entry["advice_samples"], 8)
+        self.assertEqual(entry["actual_pass_rate"], 0.25)
+        self.assertEqual(entry["actual_samples"], 8)
+        self.assertTrue(entry["weighted_routing"]["applied"])
+        # The decision record must not move the weights it was computed from.
+        weights = xs.compute_routing_weights(self.ledger_entries(), 8)["entries"]
+        self.assertEqual({(row["backend"], row["runs"]) for row in weights},
+                         {("codex", 8), ("ocgo", 8)})
+
+    def test_weighted_off_forwards_verbatim_without_ledger_entry(self):
+        self.write_policy()
+        _, decision = self.seed()
+        before = self.ledger_entries()
+        proc = self.exec_run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        starts = self.start_events()
+        self.assertEqual(len(starts), 1)
+        self.assertIsNone(starts[0]["args"]["backend"])
+        self.assertIsNone(starts[0]["args"]["model"])
+        self.assertEqual(self.decision_entries(), [])
+        self.assertEqual(self.ledger_entries(), before)
+
+    def test_explicit_backend_wins(self):
+        self.write_policy(weighted=True, default_order=["codex", "ocgo"], min_samples=8)
+        self.seed()
+        proc = self.exec_run("--backend", "codex")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        starts = self.start_events()
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0]["args"]["backend"], "codex")
+        self.assertIsNone(starts[0]["args"]["model"])
+        decisions = self.decision_entries()
+        self.assertEqual(len(decisions), 1)
+        self.assertFalse(decisions[0]["weighted_routing"]["applied"])
+        self.assertIn("explicit --backend", decisions[0]["weighted_routing"]["reason"])
+        self.assertNotIn("routed_by_advice", decisions[0])
+
+    def test_margin_blocks_small_advantage(self):
+        self.write_policy(weighted=True, default_order=["codex", "ocgo"], min_samples=8,
+                          advice_margin=0.8)
+        self.seed()
+        proc = self.exec_run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        starts = self.start_events()
+        self.assertEqual(len(starts), 1)
+        self.assertIsNone(starts[0]["args"]["backend"])
+        decisions = self.decision_entries()
+        self.assertEqual(len(decisions), 1)
+        self.assertFalse(decisions[0]["weighted_routing"]["applied"])
+        self.assertIn("below margin", decisions[0]["weighted_routing"]["reason"])
+        self.assertNotIn("routed_by_advice", decisions[0])
+
+    def test_no_history_for_default_pick_means_no_switch(self):
+        self.write_policy(weighted=True, default_order=["codex", "ocgo"], min_samples=8)
+        self.seed(codex_n=0)
+        proc = self.exec_run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        starts = self.start_events()
+        self.assertEqual(len(starts), 1)
+        self.assertIsNone(starts[0]["args"]["backend"])
+        decisions = self.decision_entries()
+        self.assertEqual(len(decisions), 1)
+        self.assertFalse(decisions[0]["weighted_routing"]["applied"])
+        self.assertIn("comparison unavailable", decisions[0]["weighted_routing"]["reason"])
+        self.assertNotIn("routed_by_advice", decisions[0])
+
+    def test_non_run_command_is_untouched(self):
+        """`fleet exec` forwards non-run commands verbatim even with
+        weighted routing on: no routing decision, no ledger entry."""
+        echo = self.root / "echo-stub"
+        echo.write_text("#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+        echo.chmod(0o755)
+        self.config([{"name": "local", "kind": "local", "openswarm": str(echo)}])
+        self.write_policy(weighted=True, default_order=["codex", "ocgo"], min_samples=8)
+        self.seed()
+        proc = self.run_cli("fleet", "exec", "local", "--", "lane", "status")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout), ["lane", "status"])
+        self.assertEqual(self.decision_entries(), [])
+
+    def test_dry_run_is_rerouted_but_not_recorded(self):
+        """A dry run dispatches nothing, so the reroute is still forwarded
+        (the remote dry-run decision shows the advised pick) but no
+        `dispatched` ledger record is written."""
+        echo = self.root / "echo-stub"
+        echo.write_text("#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+        echo.chmod(0o755)
+        self.config([{"name": "local", "kind": "local", "openswarm": str(echo)}])
+        self.write_policy(weighted=True, default_order=["codex", "ocgo"], min_samples=8)
+        self.seed()
+        proc = self.run_cli("fleet", "exec", "local", "--", "run", "--dry-run",
+                            "--task-file", str(self.task), "--card-type", "fix",
+                            "--cwd", str(self.root), "--budget-minutes", "5")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        forwarded = json.loads(proc.stdout)
+        self.assertEqual(forwarded[:5], ["run", "--backend", "ocgo", "--model", OCGO_MODEL])
+        self.assertEqual(self.decision_entries(), [])
+
+    def test_transport_failure_records_no_entry(self):
+        """rc 124/127 means the command never ran on the host, so there is
+        no dispatch to record — even though a decision was computed."""
+        self.write_policy(weighted=True, default_order=["codex", "ocgo"], min_samples=8)
+        policy, _ = self.seed()
+        namespace = argparse.Namespace(fleet_cmd="exec", host="local", timeout=300,
+                                       args=["--", "run", "--task-file", str(self.task),
+                                             "--card-type", "fix", "--cwd", str(self.root),
+                                             "--budget-minutes", "5"])
+        stdout = _StdoutWithBuffer()
+        with mock.patch.object(xs, "get_state", return_value=self.state), \
+                mock.patch.object(xs, "host_run", return_value=(124, b"", b"")) as transport, \
+                mock.patch.object(sys, "stdout", stdout):
+            with self.assertRaises(SystemExit) as exited:
+                xs.cmd_fleet(namespace, policy)
+        self.assertEqual(exited.exception.code, 124)
+        transport.assert_called_once()
+        self.assertEqual(self.decision_entries(), [])
 
 
 if __name__ == "__main__":

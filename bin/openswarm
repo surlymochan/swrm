@@ -2176,9 +2176,10 @@ def compute_routing_weights(entries, min_samples=8):
     for entry in entries:
         if not isinstance(entry, dict) or not entry.get("backend"):
             continue
-        if entry.get("batch_routing_decision"):
-            # M7 slice 1 (#122): a batch routing-decision record is not a
-            # run outcome — it must not inflate run counts or pass rates.
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision"):
+            # M7 slice 1 (#122) / slice 2 (#124): a batch or fleet
+            # routing-decision record is not a run outcome — it must not
+            # inflate run counts or pass rates.
             continue
         key = (entry.get("backend"), entry.get("model"), entry.get("card_type"))
         groups.setdefault(key, []).append(entry)
@@ -9962,9 +9963,10 @@ def cmd_ledger_backfill_pass(args):
                 continue
             if not isinstance(entry, dict):
                 continue
-            if entry.get("batch_routing_decision"):
-                # M7 slice 1 (#122): a batch routing-decision record is not
-                # a run outcome — backfill must not stamp exec_pass on it.
+            if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision"):
+                # M7 slice 1 (#122) / slice 2 (#124): a batch or fleet
+                # routing-decision record is not a run outcome — backfill
+                # must not stamp exec_pass on it.
                 skipped += 1
                 continue
             status = entry.get("status")
@@ -10117,7 +10119,7 @@ def fleet_snapshot():
             "lane_config_error": config_error}
 
 
-def cmd_fleet(args):
+def cmd_fleet(args, policy=None):
     if args.fleet_cmd == "_snapshot":
         print(json.dumps(fleet_snapshot(), ensure_ascii=False))
         return
@@ -10137,9 +10139,41 @@ def cmd_fleet(args):
         command = args.args[1:] if args.args[:1] == ["--"] else args.args
         if not command:
             raise ValueError("fleet exec requires openswarm arguments after --")
-        rc, out, err = host_run(host, host_openswarm(host, command), timeout=args.timeout)
+        # M7 slice 2 (#124): a forwarded `run` is a fleet dispatch, so it
+        # goes through weighted routing at the controller like a batch card.
+        # Any other forwarded command is untouched. With routing.weighted
+        # false this returns the command unchanged with no info, so
+        # forwarding stays byte-identical and no ledger entry is written.
+        weighted_info = None
+        eff_decision = None
+        eff_command = command
+        entry_id = None
+        parsed = None
+        if command[0] == "run":
+            if policy is None:
+                policy = load_policy()
+            eff_command, weighted_info, eff_decision = fleet_weighted_route(command, policy)
+            if weighted_info is not None:
+                parsed, _ = fleet_run_arg_parser().parse_known_args(command[1:])
+                entry_id = f"fleet-{host['name']}-{uuid.uuid4().hex[:8]}"
+        rc, out, err = host_run(host, host_openswarm(host, eff_command), timeout=args.timeout)
         sys.stdout.buffer.write(out)
         sys.stderr.buffer.write(err)
+        if weighted_info is not None and rc not in (124, 127):
+            # A transport failure (124 timeout / 127 unavailable) means the
+            # command never ran, so there is no dispatch to record; a dry
+            # run likewise dispatches nothing.
+            if parsed is None or not parsed.dry_run:
+                if eff_decision is not None:
+                    backend, model = eff_decision.get("backend"), eff_decision.get("model")
+                else:
+                    eff_parsed, _ = fleet_run_arg_parser().parse_known_args(eff_command[1:])
+                    backend, model = eff_parsed.backend, eff_parsed.model
+                fleet_record_routing_decision(host["name"], entry_id, backend, model,
+                                              parsed.card_type if parsed else None,
+                                              parsed.scope if parsed else None,
+                                              weighted_info, eff_decision,
+                                              run_id=fleet_exec_run_id(out))
         raise SystemExit(rc)
     if args.fleet_cmd == "ledger" and args.fleet_ledger_cmd == "pull":
         cmd_fleet_ledger_pull(args)
@@ -10369,6 +10403,136 @@ def batch_record_routing_decision(summary, row, card_type, weighted_info, decisi
     except OSError as error:
         print(f"openswarm: warning: could not record routing decision for {row['card']} in ledger: {error}",
               file=sys.stderr)
+
+
+def fleet_run_arg_parser():
+    """Minimal parser for the forwarded `run` flags fleet weighted routing
+    needs (M7 slice 2, #124). parse_known_args: every other flag passes
+    through untouched, so forwarding stays byte-identical for it. Choices
+    are deliberately not restricted: a forwarded --backend may name a
+    custom backend the controller has not loaded yet."""
+    parser = argparse.ArgumentParser(prog="openswarm run", add_help=False)
+    parser.add_argument("--type", default="impl")
+    parser.add_argument("--difficulty", type=int, default=3)
+    parser.add_argument("--context-tokens", type=int, default=0)
+    parser.add_argument("--backend")
+    parser.add_argument("--model")
+    parser.add_argument("--effort")
+    parser.add_argument("--card-type")
+    parser.add_argument("--rework-of")
+    parser.add_argument("--backends-file")
+    parser.add_argument("--scope", default="repo")
+    parser.add_argument("--title")
+    parser.add_argument("--detach", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    return parser
+
+
+def fleet_weighted_route(command, policy, custom_backends=None):
+    """Effective (command, weighted_info, decision) for one `fleet exec`
+    forwarded `run` (M7 slice 2, #124), reusing apply_weighted_routing() —
+    the same decision path single runs (M6, #114) and batch cards (M7
+    slice 1, #122) use.
+
+    Returns weighted_info None and decision None when routing.weighted is
+    false, without calling route()/get_state() at all, so record-only
+    forwarding stays byte-identical. A user-explicit --backend always wins.
+    A reroute injects --backend/--model right after `run`, so the remote
+    run treats the advised pick as explicit and does not re-route it. The
+    returned decision is the live default pick when nothing rerouted (None
+    only when it is unroutable), so the caller can record the effective
+    backend/model either way. A state/probe failure falls back to the
+    forwarded command (never strands the dispatch); an invalid routing
+    config (ValueError, e.g. a bad advice_margin) fails loudly like a
+    single run.
+    """
+    if not command or command[0] != "run":
+        return command, None, None
+    routing = policy.get("routing") or {}
+    if not routing.get("weighted", False):
+        return command, None, None
+    parsed, _ = fleet_run_arg_parser().parse_known_args(command[1:])
+    if parsed.backend:
+        return command, {"applied": False,
+                         "reason": "explicit --backend wins over weighted routing"}, None
+    try:
+        if custom_backends is None:
+            custom_backends = load_custom_backends(policy, explicit=parsed.backends_file)
+        st = get_state(policy)
+        profile = profile_from_args(parsed)
+        profile["read_only"] = (profile.get("type") in READ_ONLY_CARD_TYPES
+                                or parsed.card_type in READ_ONLY_CARD_TYPES)
+        decision = route(profile, st, policy, custom_backends=custom_backends)
+        new_decision, info = apply_weighted_routing(profile, parsed.card_type, st, policy,
+                                                    decision, custom_backends=custom_backends)
+    except (RuntimeError, OSError) as error:
+        return command, {"applied": False,
+                         "reason": f"weighted routing unavailable ({error}); kept the default pick"}, None
+    if not new_decision.get("ok"):
+        return command, info, None
+    if not new_decision.get("routed_by_advice"):
+        return command, info, new_decision
+    injected = ["--backend", new_decision["backend"]]
+    if new_decision.get("model"):
+        injected += ["--model", new_decision["model"]]
+    return ["run", *injected, *command[1:]], info, new_decision
+
+
+def fleet_record_routing_decision(host, entry_id, backend, model, card_type, scope,
+                                  weighted_info, decision, run_id=None):
+    """Ledger entry for one `fleet exec` run's weighted-routing decision
+    (M7 slice 2, #124).
+
+    Mirrors batch_record_routing_decision: the controller ledger is where
+    fleet dispatch decisions are read (the remote run writes its own ledger
+    on the executor host), so the decision — routed_by_advice with both pass
+    rates and sample counts, the same six fields M6 slice 3 established for
+    single runs — is recorded here, joined to the remote run by run_id when
+    the reply carried one. The entry is flagged fleet_routing_decision so
+    compute_routing_weights() and ledger backfill-pass skip it: it is a
+    decision record, not a run outcome, and must not inflate run counts or
+    pass rates. A ledger write failure must not fail the exec, so it is
+    reported and the forwarded stdout stays authoritative.
+    """
+    try:
+        entry = {"id": entry_id, "run_id": run_id, "ts": NOW(),
+                 "title": f"fleet {host} routing decision",
+                 "status": "dispatched", "host": host,
+                 "backend": backend, "model": model,
+                 "card_type": card_type, "scope": scope,
+                 "fleet_routing_decision": True, "weighted_routing": weighted_info,
+                 "seconds": None}
+        if decision is not None and decision.get("routed_by_advice"):
+            entry.update({"routed_by_advice": True,
+                          "routed_from": decision.get("routed_from"),
+                          "advice_pass_rate": decision.get("advice_pass_rate"),
+                          "advice_samples": decision.get("advice_samples"),
+                          "actual_pass_rate": decision.get("actual_pass_rate"),
+                          "actual_samples": decision.get("actual_samples")})
+        append_ledger(entry)
+    except OSError as error:
+        print(f"openswarm: warning: could not record routing decision for fleet {host} in ledger: {error}",
+              file=sys.stderr)
+
+
+def fleet_exec_run_id(out):
+    """Best-effort remote run id from a `fleet exec -- run` reply.
+
+    A detached run prints one JSON object with "id"; a foreground run prints
+    its result JSON with "id" last. Either way the whole stdout usually
+    parses as one object; fall back to the last `"id": "..."` match. None
+    when the reply carries no id — the decision entry is still recorded
+    under its dispatch id.
+    """
+    text = out.decode("utf-8", errors="replace")
+    try:
+        value = json.loads(text)
+        if isinstance(value, dict) and isinstance(value.get("id"), str):
+            return value["id"]
+    except ValueError:
+        pass
+    matches = re.findall(r'"id"\s*:\s*"([A-Za-z0-9][A-Za-z0-9_.-]*)"', text)
+    return matches[-1] if matches else None
 
 
 def batch_plan(cards_dir):
@@ -13476,7 +13640,7 @@ def main():
     elif a.cmd in ("fleet", "batch", "verify-remote"):
         try:
             if a.cmd == "fleet":
-                cmd_fleet(a)
+                cmd_fleet(a, policy)
             elif a.cmd == "batch":
                 cmd_batch(a, policy)
             else:
