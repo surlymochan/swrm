@@ -3159,7 +3159,7 @@ def check_budget(policy, requests, exclude_id=None):
         s = jload(path, {}) or {}
         if s.get("id") == exclude_id or s.get("id") in completed:
             continue
-        if s.get("state") not in ("queued", "routing", "running", "finalizing", "verifying") or not pid_alive(s.get("runner_pid")):
+        if s.get("state") not in ("queued", "routing", "running", "finalizing", "verifying") or not runner_alive(s):
             continue
         for b, minutes in s.get("budget_requests") or [(s.get("backend") or "unknown", s.get("budget_minutes") or 0)]:
             reserved[b] = reserved.get(b, 0) + minutes
@@ -4147,6 +4147,14 @@ AUTH_ERROR_RE = re.compile(r"(authentication required|not authenticated|unauthen
 
 def set_status(rdir, **kw):
     s = jload(f"{rdir}/status.json", {}) or {}
+    if kw.get("runner_pid"):
+        # M11 slice 1 (#142): stamp the process identity next to the pid so
+        # later liveness checks can reject a recycled pid (#98). When the
+        # identity cannot be read (pid already gone / unsupported platform)
+        # no stamp is written and checks fall back to the legacy pid test.
+        start = proc_start_time(kw["runner_pid"])
+        if start is not None:
+            kw["runner_pid_start"] = start
     s.update(kw)
     s["updated"] = NOW()
     jsave(f"{rdir}/status.json", s)
@@ -4256,7 +4264,7 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
                 if row.get("state") != "running":
                     continue
                 pid = row.get("runner_pid")
-                if pid and not pid_alive(pid):
+                if pid and not runner_alive(row):
                     continue
                 active[row.get("id") or os.path.basename(os.path.dirname(path))] = row
             for path in glob.glob(os.path.join(DATA, "lanes", "*", "state.json")):
@@ -11395,14 +11403,89 @@ DEFAULT_RISKS = [
 ]
 
 
-def pid_alive(pid):
+def proc_start_time(pid):
+    """Stable identity for a live process: when it started.
+
+    Used to tell a recycled pid apart from the original runner (#98): the
+    pid alone only proves *some* process exists, the start time proves it
+    is the *same* process. Returns a string, or None when the pid does not
+    exist or its start time cannot be read on this platform (Windows has
+    neither /proc nor a usable `ps -o lstart=`).
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            stat = fh.read()
+        # comm may contain spaces / parens: fields start after the last ')'.
+        fields = stat[stat.rfind(")") + 2:].split()
+        # Field 22 (starttime, clock ticks since boot) is fields[19] here.
+        return f"proc:{fields[19]}"
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        proc = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=10)
+        start = (proc.stdout or "").strip()
+        return f"ps:{start}" if proc.returncode == 0 and start else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def pid_alive(pid, start=None):
+    """True when pid names a live process.
+
+    With `start` (a value previously returned by proc_start_time) the pid
+    must also be the *same* process that was recorded: a recycled pid
+    fails the identity check (#98). When the identity cannot be read on
+    this platform, fall back to the legacy existence check rather than
+    misjudging a live runner as dead.
+    """
     if not pid:
         return False
     try:
         os.kill(int(pid), 0)
-        return True
+        if start is None:
+            return True
+        actual = proc_start_time(pid)
+        return True if actual is None else actual == start
     except (OSError, TypeError, ValueError, OverflowError):
         return False
+
+
+def runner_alive(status):
+    """True when a run's recorded runner is alive *and* is the same process.
+
+    Reads runner_pid / runner_pid_start from a status dict; runs recorded
+    before start times were stamped fall back to the legacy pid check.
+    """
+    if not isinstance(status, dict):
+        return False
+    return pid_alive(status.get("runner_pid"), status.get("runner_pid_start"))
+
+
+def reap_dead_run(rdir, status=None):
+    """Persist a dead runner as finished/exited (M11 slice 1, #142).
+
+    A run whose runner process is gone (identity-checked, so a recycled
+    pid never counts as alive) can never resume: mark it finished with
+    status "exited" so watch passes take the DONE branch instead of
+    re-emitting BUDGET/STALL for it. Returns True when the run was
+    reaped, False when it was already terminal or its runner is alive.
+    """
+    st = status if status is not None else (jload(os.path.join(rdir, "status.json"), {}) or {})
+    if st.get("state") in ("finished", "unroutable", "dry-run"):
+        return False
+    if not st.get("runner_pid") or runner_alive(st):
+        return False
+    set_status(rdir, state="finished", status="exited", finished=NOW(),
+               reaped="dead-runner",
+               exit_note="runner process gone (pid identity checked, #98)")
+    return True
 
 
 def short(s, n=220):
@@ -11794,9 +11877,17 @@ def watch_wake_locked(args, run_ids, cursor_path):
                 if notify(rid, "DONE", f"status={result.get('status') or st.get('state')} backend={result.get('backend') or st.get('backend')}"):
                     return 0
                 continue
-            if st.get("runner_pid") and not pid_alive(st["runner_pid"]):
-                if notify(rid, "EXITED", f"runner process gone in state={st.get('state')}"):
+            if st.get("runner_pid") and not runner_alive(st):
+                delivered = notify(rid, "EXITED", f"runner process gone in state={st.get('state')}")
+                # M11 slice 1 (#142): persist the dead run as finished/exited
+                # so later watch passes take the DONE branch instead of
+                # re-emitting BUDGET/STALL for a run that can never resume.
+                # Reap after the notify: if emitting raises, the run stays
+                # unreaped and the next pass replays the same EXITED.
+                reap_dead_run(rdir, st)
+                if delivered:
                     return 0
+                continue
             if st.get("queue_reason") != "provider concurrency limit" and st.get("deadline") and now > st["deadline"] + 90:
                 if notify(rid, "BUDGET", f"past budget ({st.get('budget_minutes')}m) and still {st.get('state')}"):
                     return 0
@@ -11924,10 +12015,11 @@ def cmd_watch(args, policy):
             out("DONE", "status=unroutable (no backend had headroom)")
             return
         runner = st.get("runner_pid")
-        if runner and not pid_alive(runner) and st.get("state") != "finished":
+        if runner and not runner_alive(st) and st.get("state") != "finished":
             if fh:
                 fh.close()
             out("EXITED", f"runner process gone in state={st.get('state')} (cmds={cmds}); check {rdir}/run.out")
+            reap_dead_run(rdir, st)
             return
         if st.get("queue_reason") != "provider concurrency limit" and st.get("deadline") and now > st["deadline"] + 90:
             out("BUDGET", f"past budget ({st.get('budget_minutes')}m) and still {st.get('state')}")
@@ -11953,7 +12045,7 @@ def run_digest(rid):
     r = jload(f"{rdir}/result.json", {}) or {}
     now = NOW()
     state = st.get("state", "?")
-    if state not in ("finished", "unroutable", "dry-run") and st.get("runner_pid") and not pid_alive(st["runner_pid"]):
+    if state not in ("finished", "unroutable", "dry-run") and st.get("runner_pid") and not runner_alive(st):
         state = "dead"
     cmds, last = 0, ""
     messages = WatchMessages()
@@ -12097,8 +12189,20 @@ def diagnose_failure(run_id):
     evidence = []
     suspected = None
 
+    # 0. #140: final success wins. A run recorded done with host verify
+    # passed is a success even when an earlier attempt still carries a
+    # residual error_class (run 20261109-201952-a3b247: final status done,
+    # verify rc 0, diagnose still said exec-error). Attempt residue must
+    # never override the final outcome, so this check runs before every
+    # error-class branch below.
+    if status_value == "done" and verify_rc == 0:
+        category = "none"
+        reason = ("run finished done and host verification passed; "
+                  "residual attempt errors do not override the final outcome")
+        evidence.append(ev("result.json" if result.get("status") else "status.json",
+                           "status", None))
     # 1. Explicit stop: the run was terminated by request, not by a failure.
-    if status.get("stop_requested") or error_class == "stopped" or any(
+    elif status.get("stop_requested") or error_class == "stopped" or any(
             isinstance(a, dict) and a.get("error_class") == "stopped" for a in attempts):
         category = "stopped"
         reason = "run was stopped by request; no failure cause is recorded"
@@ -12182,7 +12286,7 @@ def diagnose_failure(run_id):
     # pid_alive false-positives when the pid has been recycled, so this must
     # stay unknown (suspected, never asserted as a cause).
     elif (not result and not ledger_entry and status.get("runner_pid")
-          and not pid_alive(status.get("runner_pid"))):
+          and not runner_alive(status)):
         category = "unknown"
         suspected = "pid_reuse (#98): runner pid is dead but no result, ledger entry, or log signal records why"
         reason = ("no result, ledger entry, or log signal records a cause; "
@@ -12246,8 +12350,7 @@ def cmd_resume(args):
         rid = os.path.basename(os.path.dirname(path))
         status = jload(path, {}) or {}
         state = status.get("state")
-        runner_pid = status.get("runner_pid")
-        if state in ("running", "queued") and pid_alive(runner_pid):
+        if state in ("running", "queued") and runner_alive(status):
             row = run_digest(rid)
             row["watch"] = f"openswarm watch {rid}"
             active_runs.append(row)
