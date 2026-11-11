@@ -36,6 +36,12 @@ if sys.argv[1:3] == ["fleet", "_snapshot"]:
             active_runs.append(status)
     print(json.dumps({"lanes": [], "active_runs": active_runs,
                       "providers": {"pi": None, "codex": None, "cursor": None}}))
+elif sys.argv[1:3] == ["fleet", "_health"]:
+    # M12 slice 1 (#146): delegate to the real binary so the controller-side
+    # aggregation is exercised against genuine verdicts for the fake runs.
+    real = Path(__file__).resolve().parent.parent.parent / "bin" / "openswarm"
+    print(subprocess.check_output(
+        [sys.executable, str(real), "fleet", "_health", *sys.argv[3:]], text=True))
 elif sys.argv[1:3] == ["fleet", "_run-info"]:
     rid = sys.argv[3]
     path = home / "runs" / rid / "stub.json"

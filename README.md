@@ -248,6 +248,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm budget status` | Show today's executor budget usage. | `openswarm budget status --json` |
 | `openswarm ingest-claude` | Record Claude plan usage from the statusline hook or from flags. | `openswarm ingest-claude --five-hour 80 --seven-day 40` |
 | `openswarm fleet status` | Show reachability, paused hosts, lanes, and active runs. | `openswarm fleet status --json` |
+| `openswarm fleet health` | Per-run alive/dead/zombie verdicts with evidence pointers (ledger line, pid identity, last activity); read-only. | `openswarm fleet health --json` |
 | `openswarm fleet exec` | Run an swrm command on another host; stdout and the exit code are forwarded. | `openswarm fleet exec worker -- lane status` |
 | `openswarm fleet ledger pull` | Merge the host ledgers into one fleet ledger file. | `openswarm fleet ledger pull --hosts worker,sandbox` |
 | `openswarm run --rework-of` | Resume an earlier run's task as a rework, linked in the ledger as `rework_of`. | `openswarm run --rework-of <run-id> --cwd ~/code/myrepo --task-file /tmp/task.md` |

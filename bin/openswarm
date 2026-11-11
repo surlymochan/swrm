@@ -18,7 +18,7 @@ Subcommands:
   lessons          preview, propose, and escalate executor lessons
   patterns         propose reusable patterns and check active patterns for retirement
   lane             manage long-lived Codex app-server / Cursor ACP / Pi RPC executor lanes
-  fleet            inspect hosts and forward openswarm commands over local / SSH / instabox transports
+  fleet            inspect hosts, check fleet health, and forward openswarm commands over local / SSH / instabox transports
   batch            queue task cards across fleet hosts and collect their branches
   verify-remote    verify a fleet run on another host in a temporary worktree
   bus              initialize or inspect a GitHub issue bus repository
@@ -10407,6 +10407,59 @@ def cmd_fleet(args, policy=None):
     if args.fleet_cmd == "_verify":
         print(json.dumps(verify_in_worktree(args.repo, args.rev, args.verify, args.timeout), ensure_ascii=False))
         return
+    if args.fleet_cmd == "_health":
+        # M12 slice 1 (#146): per-host health verdicts, called over the
+        # fleet transport by `fleet health` exactly like `_snapshot`.
+        print(json.dumps(fleet_health_snapshot(getattr(args, "stall_minutes", 10)), ensure_ascii=False))
+        return
+    if args.fleet_cmd == "health":
+        # M12 slice 1 (#146): aggregate one health snapshot per host, the
+        # same reachability/paused handling as `fleet status`. Read-only.
+        stall = getattr(args, "stall_minutes", 10)
+        hosts = list(fleet_config().values())
+        states = instabox_states(hosts)
+        rows = []
+        for host in hosts:
+            row = {"name": host["name"], "reachable": False, "paused": False, "health": None}
+            state = states.get(host.get("box"), "").lower()
+            if host["kind"] == "instabox" and state not in ("running", "ready", "active"):
+                row.update(paused=state == "paused", state=state or "unknown")
+            else:
+                try:
+                    row.update(health=host_json(host, ["fleet", "_health", "--stall-minutes", str(stall)],
+                                                timeout=20), reachable=True)
+                except RuntimeError as e:
+                    row["error"] = str(e)
+            if row["paused"]:
+                row["status"] = "paused"
+            elif not row["reachable"]:
+                row["status"] = "unreachable"
+            elif (row.get("health") or {}).get("lane_config_valid") is False:
+                row["status"] = "config invalid"
+            else:
+                row["status"] = "reachable"
+            rows.append(row)
+        if args.json:
+            print(json.dumps({"hosts": rows}, indent=2, ensure_ascii=False))
+        else:
+            for row in rows:
+                health = row.get("health") or {}
+                summary = health.get("summary") or {}
+                print(f"{row['name']}  {row['status']}  "
+                      f"alive={summary.get('alive', 0)} dead={summary.get('dead', 0)} "
+                      f"zombie={summary.get('zombie', 0)} unknown={summary.get('unknown', 0)}")
+                if row["status"] == "config invalid" and health.get("lane_config_error"):
+                    print(f"  config invalid: {health['lane_config_error']}")
+                if row.get("error"):
+                    print(f"  {row['error']}")
+                for run in health.get("runs") or []:
+                    ev = run.get("evidence") or {}
+                    idle = ev.get("idle_minutes")
+                    ledger = ev.get("ledger_line")
+                    print(f"  run {run['id']} {run['verdict']} pid={ev.get('runner_pid') or '-'} "
+                          f"({ev.get('pid_identity')}) idle={'%.1fm' % idle if idle is not None else '-'} "
+                          f"last={ev.get('last_activity') or '-'} ledger:{ledger if ledger is not None else '-'}")
+        return
     if args.fleet_cmd == "exec":
         host = fleet_host(args.host)
         command = args.args[1:] if args.args[:1] == ["--"] else args.args
@@ -12073,6 +12126,175 @@ def run_digest(rid):
     if lane:
         out["lane"] = lane
     return out
+
+
+# ---------------------------------------------------------------- fleet health (M12 slice 1, #146)
+# Read-only: `fleet health` never dispatches, retries, reaps, or mutates a
+# run. Slice 1 only checks and reports; reaping stays in slice 2 (#145).
+# Verdicts reuse M11's identity-checked runner_alive(): a pid that is alive
+# but is a different (recycled) process counts as dead, never alive (#98).
+
+HEALTH_VERDICTS = ("alive", "dead", "zombie", "done", "unknown")
+HEALTH_TERMINAL_STATES = ("finished", "unroutable", "dry-run")
+
+
+def ledger_run_lines(path=None):
+    """Map run id -> last 1-based ledger line number (evidence pointer).
+
+    One bounded pass over the ledger (same line cap as the fleet ledger
+    pull); a run with no entry maps to nothing, and the caller reports
+    ledger_line None rather than inventing a pointer.
+    """
+    lines = {}
+    try:
+        with open(path or LEDGER, "rb") as stream:
+            for number, raw in enumerate(stream, 1):
+                if number > LEDGER_MAX_HOST_LINES:
+                    break
+                try:
+                    entry = json.loads(raw)
+                except (ValueError, UnicodeError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                run_id = entry.get("run_id") or entry.get("id")
+                if isinstance(run_id, str) and run_id:
+                    lines[run_id] = number
+    except OSError:
+        return {}
+    return lines
+
+
+def run_pid_identity(st):
+    """Classify the recorded runner pid: match/mismatch/legacy/unreadable/gone/no-pid.
+
+    - no-pid: no runner_pid recorded at all.
+    - gone: the pid does not exist.
+    - match: pid alive and its start time equals the recorded one.
+    - mismatch: pid alive but a different (recycled) process (#98).
+    - legacy: pid alive, no start time was recorded (pre-M11 run); the plain
+      existence check applies.
+    - unreadable: pid alive, a start time was recorded, but this platform
+      cannot read the live start time; treated as alive (M11 fallback).
+    """
+    pid = st.get("runner_pid")
+    if not pid:
+        return "no-pid"
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, TypeError, ValueError, OverflowError):
+        return "gone"
+    start = st.get("runner_pid_start")
+    if not start:
+        return "legacy"
+    actual = proc_start_time(pid)
+    if actual is None:
+        return "unreadable"
+    return "match" if actual == start else "mismatch"
+
+
+def run_last_activity(rid, st):
+    """(ISO timestamp, idle minutes) of the newest run activity.
+
+    The events file mtime is the activity signal (the same source
+    run_digest uses for idle_min): it moves only when the executor emits.
+    The status.json mtime is used only when there is no events file, since
+    control-plane writes (watch, resume, reap) also touch it without any
+    executor activity. Falls back to `started` last. Returns (None, None)
+    when no timestamp can be found at all.
+    """
+    events = st.get("events")
+    if isinstance(events, str) and events and os.path.exists(events):
+        try:
+            latest = os.path.getmtime(events)
+        except OSError:
+            latest = None
+    else:
+        latest = None
+    if latest is None:
+        try:
+            latest = os.path.getmtime(os.path.join(RUNS, rid, "status.json"))
+        except OSError:
+            latest = None
+    if latest is None:
+        started = st.get("started")
+        if isinstance(started, (int, float)):
+            latest = started
+    if latest is None:
+        return None, None
+    iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(latest))
+    return iso, round((NOW() - latest) / 60, 1)
+
+
+def run_health(rid, status=None, stall_minutes=10, ledger_lines=None):
+    """Health verdict for one run, with evidence pointers (M12 slice 1, #146).
+
+    Verdicts: alive (runner alive and active), zombie (runner alive but no
+    activity for >= stall_minutes), dead (runner gone, identity-checked),
+    done (terminal state), unknown (no runner pid recorded, so liveness
+    cannot be checked). Read-only: status.json and the ledger are never
+    written here.
+    """
+    st = status if status is not None else (jload(os.path.join(RUNS, rid, "status.json"), {}) or {})
+    state = st.get("state", "?")
+    identity = run_pid_identity(st)
+    last_activity, idle_minutes = run_last_activity(rid, st)
+    if ledger_lines is None:
+        ledger_lines = ledger_run_lines()
+    evidence = {"status_file": os.path.join(RUNS, rid, "status.json"),
+                "ledger_line": ledger_lines.get(rid),
+                "runner_pid": st.get("runner_pid"),
+                "runner_pid_start": st.get("runner_pid_start"),
+                "pid_identity": identity,
+                "last_activity": last_activity,
+                "idle_minutes": idle_minutes}
+    if state in HEALTH_TERMINAL_STATES:
+        verdict, reason = "done", "terminal state=%s" % state
+    elif identity == "no-pid":
+        verdict, reason = "unknown", "no runner_pid recorded; liveness cannot be checked"
+    elif identity in ("gone", "mismatch"):
+        if identity == "gone":
+            reason = "runner process gone (pid_identity=gone)"
+        else:
+            reason = "runner pid recycled: live pid is a different process (#98)"
+        verdict = "dead"
+    elif idle_minutes is not None and idle_minutes >= stall_minutes:
+        verdict, reason = "zombie", ("runner alive but no activity for %.1fm (>= %g m)"
+                                     % (idle_minutes, stall_minutes))
+    else:
+        verdict, reason = "alive", "runner alive (identity-checked) and active"
+    return {"id": rid, "state": state, "status": st.get("status"),
+            "title": st.get("title"), "backend": st.get("backend"),
+            "verdict": verdict, "reason": reason, "evidence": evidence}
+
+
+def fleet_health_snapshot(stall_minutes=10):
+    """Local fleet health: one verdict per non-terminal run, plus lanes.
+
+    Finished runs are counted, not listed: only live health matters here,
+    and listing history would flood the output. Lanes come from the same
+    lane config `fleet status` reads, so a lane row names the runner a
+    run's verdict can be traced to.
+    """
+    lines = ledger_run_lines()
+    runs, finished = [], 0
+    for path in sorted(glob.glob(os.path.join(RUNS, "*", "status.json"))):
+        rid = os.path.basename(os.path.dirname(path))
+        st = jload(path, {}) or {}
+        if st.get("state") in HEALTH_TERMINAL_STATES:
+            finished += 1
+            continue
+        runs.append(run_health(rid, st, stall_minutes, lines))
+    config_error = None
+    try:
+        lanes = lane_status_rows() if os.path.exists(envvar("LANES_FILE", os.path.join(DATA, "lanes.json"))) else []
+    except ValueError as error:
+        lanes, config_error = [], str(error)
+    summary = {verdict: sum(1 for row in runs if row["verdict"] == verdict)
+               for verdict in ("alive", "dead", "zombie", "unknown")}
+    return {"runs": runs, "lanes": lanes, "summary": summary,
+            "finished_runs": finished, "stall_minutes": stall_minutes,
+            "lane_config_valid": config_error is None, "lane_config_error": config_error}
 
 
 # ---------------------------------------------------------------- failure diagnosis (M10 slice 1, #137)
@@ -13999,10 +14221,14 @@ def main():
     sp = sub.add_parser("stop", help="terminate a running run")
     sp.add_argument("run_id")
 
-    sp = sub.add_parser("fleet", help="status and execution across configured hosts")
+    sp = sub.add_parser("fleet", help="status, health and execution across configured hosts")
     fleet_sub = sp.add_subparsers(dest="fleet_cmd", required=True)
     fp = fleet_sub.add_parser("status")
     fp.add_argument("--json", action="store_true")
+    fp = fleet_sub.add_parser("health", help="per-run alive/dead/zombie verdicts with evidence pointers (M12, #146)")
+    fp.add_argument("--json", action="store_true")
+    fp.add_argument("--stall-minutes", type=float, default=10,
+                    help="no-activity minutes after which a live runner counts as zombie (default 10, same as watch)")
     fp = fleet_sub.add_parser("exec")
     fp.add_argument("--timeout", type=float, default=300)
     fp.add_argument("host")
@@ -14013,6 +14239,8 @@ def main():
     fp.add_argument("--hosts", help="comma-separated fleet host names")
     fp.add_argument("--into", help="destination JSONL path")
     fleet_sub.add_parser("_snapshot", help=argparse.SUPPRESS)
+    fp = fleet_sub.add_parser("_health", help=argparse.SUPPRESS)
+    fp.add_argument("--stall-minutes", type=float, default=10)
     fp = fleet_sub.add_parser("_run-info", help=argparse.SUPPRESS)
     fp.add_argument("run_id")
     fp = fleet_sub.add_parser("_verify", help=argparse.SUPPRESS)
