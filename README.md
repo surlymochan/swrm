@@ -268,6 +268,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm patterns retire-check` | Propose retirement when active patterns do not improve outcomes. | `openswarm patterns retire-check` |
 | `openswarm routing weights` | Compute per-backend routing metrics and write the weights file. | `openswarm routing weights --fleet` |
 | `openswarm routing compare` | Compare recorded routing advice with the actual run outcomes. | `openswarm routing compare --days 30 --fleet` |
+| `openswarm report --advice-accuracy` | Advice calibration table by (backend, card type): quoted vs observed pass rates. | `openswarm report --advice-accuracy [--json] [--fleet]` |
 | `openswarm retro` | Run the weekly retrospective: pull, ingest, backfill, weights, proposals, report. | `openswarm retro --days 7 --repos acme/project` |
 | `openswarm regress run` | Run the regression card suite on a backend, a lane, or a routing mode. | `openswarm regress run --backend codex --cards card-a,card-b --label nightly --parallel 2` |
 | `openswarm regress compare` | Compare two regression result files card by card. | `openswarm regress compare before.json after.json` |
@@ -452,6 +453,14 @@ and the per-card decision is recorded on the batch summary row and in the contro
 only records the advice. Compare recorded advice
 with actual outcomes using `openswarm routing compare --days 30`. An advice outcome is shown as `not run` when the
 actual route used a different backend or model, because that counterfactual was not executed.
+
+`openswarm report --advice-accuracy` (M8, #127) aggregates those same advice records into a calibration table, one
+row per (advised backend, card type): the advised pass rate is the mean of the pass rate the advice quoted on each
+scored run, the actual pass rate is the observed pass rate of the runs that actually ran on the advised backend, and
+the difference is `|advised - actual|`. A group is marked `MISCALIBRATED` when the difference is over 0.20 with at
+least 8 scored samples. Advice the run did not follow never enters the sample count, and groups with advice records
+but no scored run show `n=0` with `n/a` rates instead of invented numbers. Add `--json` for machine-readable output
+or `--fleet` to read the merged fleet ledger. The command is read-only and never changes routing.
 
 Run the weekly fleet retrospective in one command:
 

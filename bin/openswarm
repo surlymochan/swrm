@@ -2418,6 +2418,117 @@ def cmd_routing_compare(args, policy):
               f"{actual:<28} {outcome_label(entry)}")
 
 
+# ---------------------------------------------------------------- advice accuracy (M8 slice 1, #127)
+
+ADVICE_ACCURACY_FLAG_DIFF = 0.20
+ADVICE_ACCURACY_FLAG_MIN_SAMPLES = 8
+
+
+def compute_advice_accuracy(entries):
+    """Calibration table for recorded routing advice, by (advised backend, card type).
+
+    A scored sample is a ledger run that actually ran on the backend its
+    recorded `routing_advice` named, with a known outcome (`accepted` when
+    present, else `exec_pass`). For each group:
+
+    - advised_pass_rate: mean of the pass rate the advice quoted on each
+      scored run's `routing_advice` (the rate advice claimed at dispatch
+      time); None when the group has no scored run.
+    - actual_pass_rate: observed pass rate over the group's scored runs.
+    - diff: |advised - actual|; None when either rate is missing.
+    - miscalibrated: diff > 0.20 and n >= 8.
+
+    Advice that named a backend the run did not use is counted as
+    `not_followed`: that run's outcome says nothing about the advised
+    backend, so it never enters n. Batch/fleet routing-decision records are
+    not run outcomes and are excluded, as in `compute_routing_weights`.
+    Groups with advice records but no scored run still appear, with n=0 and
+    no invented rates. Read-only: this never touches routing decisions.
+    """
+    groups = {}
+    total_advice = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision"):
+            continue
+        advice = entry.get("routing_advice")
+        if not isinstance(advice, dict) or not advice.get("backend"):
+            continue
+        total_advice += 1
+        key = (str(advice["backend"]), str(entry.get("card_type") or "-"))
+        group = groups.setdefault(key, {"advised_rates": [], "outcomes": [], "not_followed": 0})
+        if entry.get("backend") != advice.get("backend"):
+            group["not_followed"] += 1
+            continue
+        outcome = routing_outcome(entry)
+        if outcome is None:
+            continue
+        rate = advice.get("pass_rate")
+        if isinstance(rate, (int, float)) and not isinstance(rate, bool) and math.isfinite(rate):
+            group["advised_rates"].append(rate)
+        group["outcomes"].append(outcome)
+    rows = []
+    for (backend, card_type), group in sorted(groups.items()):
+        n = len(group["outcomes"])
+        advised = (sum(group["advised_rates"]) / len(group["advised_rates"])
+                   if group["advised_rates"] else None)
+        actual = sum(group["outcomes"]) / n if n else None
+        # Round so a hand-computed boundary (e.g. 0.90 - 0.70 = 0.20) is not
+        # flipped by binary float noise (0.20000000000000007 > 0.20).
+        advised = round(advised, 6) if advised is not None else None
+        actual = round(actual, 6) if actual is not None else None
+        diff = (round(abs(advised - actual), 6)
+                if advised is not None and actual is not None else None)
+        rows.append({
+            "backend": backend,
+            "card_type": card_type,
+            "advised_pass_rate": advised,
+            "actual_pass_rate": actual,
+            "n": n,
+            "diff": diff,
+            "miscalibrated": bool(diff is not None and diff > ADVICE_ACCURACY_FLAG_DIFF
+                                  and n >= ADVICE_ACCURACY_FLAG_MIN_SAMPLES),
+            "not_followed": group["not_followed"],
+        })
+    return {"groups": rows,
+            "total_advice_records": total_advice,
+            "total_scored": sum(row["n"] for row in rows)}
+
+
+def advice_accuracy_text(result, source):
+    """Text rendering of a `compute_advice_accuracy` result."""
+    lines = [f"advice accuracy (ledger: {source})",
+             "advised = mean pass rate quoted on each scored run's routing_advice; "
+             "actual = observed pass rate of runs that ran on the advised backend; "
+             "diff = |advised - actual|; MISCALIBRATED when diff > 0.20 and n >= 8"]
+    rows = result["groups"]
+    if not rows:
+        lines.append("no advice history in ledger")
+        return "\n".join(lines) + "\n"
+    lines.append(f"{'backend':<10} {'card_type':<12} {'advised':>8} {'actual':>8} {'n':>4} {'diff':>6}  flag")
+    lines.append("-" * 64)
+    for row in rows:
+        advised = f"{row['advised_pass_rate']:.2f}" if row["advised_pass_rate"] is not None else "n/a"
+        actual = f"{row['actual_pass_rate']:.2f}" if row["actual_pass_rate"] is not None else "n/a"
+        diff = f"{row['diff']:.2f}" if row["diff"] is not None else "n/a"
+        flag = "MISCALIBRATED" if row["miscalibrated"] else ""
+        lines.append(f"{row['backend']:<10} {row['card_type']:<12} {advised:>8} {actual:>8} "
+                     f"{row['n']:>4} {diff:>6}  {flag}")
+    lines.append(f"scored runs: {result['total_scored']} across {len(rows)} groups; "
+                 f"advice records: {result['total_advice_records']}")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_advice_accuracy(args, policy):
+    path = fleet_ledger_path() if getattr(args, "fleet", False) else LEDGER
+    result = compute_advice_accuracy(ledger_entries_from(path))
+    if getattr(args, "json", False):
+        print(json.dumps({"ledger": path, **result}, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    print(advice_accuracy_text(result, path), end="")
+
+
 # ---------------------------------------------------------------- weekly retro
 
 def retro_safe(value, limit=240):
@@ -12063,6 +12174,9 @@ def cmd_daily_report(args, policy):
 
 def cmd_report(args, policy):
     """Compact check-in: quota headroom + active runs + runs finished since --since-minutes. For scheduled reports."""
+    if getattr(args, "advice_accuracy", None):
+        cmd_advice_accuracy(args, policy)
+        return
     if any(getattr(args, key, None) for key in ("daily", "date", "json")):
         cmd_daily_report(args, policy)
         return
@@ -13370,6 +13484,11 @@ def main():
     sp.add_argument("--html", help="write a self-contained HTML report: live check-in snapshot "
                                     "(with --daily/--date, the daily report)")
     sp.add_argument("--json", action="store_true", help="daily report as JSON")
+    sp.add_argument("--advice-accuracy", action="store_true",
+                    help="advice calibration table by (backend, card type) from ledger history "
+                         "(M8, #127); with --json, print it as JSON")
+    sp.add_argument("--fleet", action="store_true",
+                    help="with --advice-accuracy, read the merged fleet ledger")
 
     sp = sub.add_parser("retro", help="run the weekly fleet retrospective")
     sp.add_argument("--days", type=int, default=7, help="include runs from the last N days")
