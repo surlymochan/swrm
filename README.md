@@ -556,6 +556,16 @@ openswarm fleet exec --timeout 120 worker -- runs --active --json
 
 Status uses `instabox ls` and never connects to a paused box. Unknown box states also remain uncontacted.
 `fleet exec` forwards stdout, stderr and the exit code; it does not issue a separate wake command.
+A forwarded `run` can request evalid verification with `--verify-evalid` (plus `--evalid-bin` to point at
+the evalid binary on the executor host): the remote run replays the executor's claimed test command in a
+clean clone via `xflow audit`, and `fleet exec` waits for the run to finish, then copies the
+claim-vs-evidence verdict into the controller ledger (`fleet_verify_evalid` entry, with the full
+`verify_evalid` record and replay verdict). `--verify-evalid` requires `--verify` — the controller refuses
+before dispatching — and a missing or unusable evalid is a loud error on the remote run, never a silent
+fall back to plain verify; a remote run with no `verify_evalid` record is likewise recorded as an explicit
+`error`, never as a pass. A `mismatch` or `error` verdict downgrades the remote run from `done` to
+`partial`, exactly as for a single run. Routing and redispatch semantics are unchanged, and the
+`fleet_verify_evalid` record is skipped by routing-weight, advice and backfill passes.
 
 Write one self-contained task per regular file in a cards directory, then dispatch:
 
