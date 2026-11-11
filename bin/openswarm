@@ -2177,13 +2177,14 @@ def compute_routing_weights(entries, min_samples=8):
     for entry in entries:
         if not isinstance(entry, dict) or not entry.get("backend"):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid"):
             # M7 slice 1 (#122) / slice 2 (#124): a batch or fleet
             # routing-decision record is not a run outcome — it must not
             # inflate run counts or pass rates. A fleet-health reap record
             # (M12 slice 2, #148) is likewise an action log, not an outcome.
             # A batch verify-evalid record (M13 slice 1, #151) is likewise
-            # a verification record, not a second run outcome.
+            # a verification record, not a second run outcome. A fleet
+            # verify-evalid record (M13 slice 2, #153) is the same.
             continue
         key = (entry.get("backend"), entry.get("model"), entry.get("card_type"))
         groups.setdefault(key, []).append(entry)
@@ -2454,7 +2455,7 @@ def compute_advice_accuracy(entries):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -2572,7 +2573,7 @@ def compute_weighted_eval(entries, margin=0.10, plan_ok=None):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -10239,12 +10240,14 @@ def cmd_ledger_backfill_pass(args):
                 continue
             if not isinstance(entry, dict):
                 continue
-            if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid"):
+            if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid"):
                 # M7 slice 1 (#122) / slice 2 (#124): a batch or fleet
                 # routing-decision record is not a run outcome — backfill
                 # must not stamp exec_pass on it. Same for a fleet-health
                 # reap record (M12 slice 2, #148) and a batch verify-evalid
-                # record (M13 slice 1, #151).
+                # record (M13 slice 1, #151). A fleet verify-evalid record
+                # (M13 slice 2, #153) is likewise a verification record,
+                # not a run outcome.
                 skipped += 1
                 continue
             status = entry.get("status")
@@ -10505,11 +10508,20 @@ def cmd_fleet(args, policy=None):
         entry_id = None
         parsed = None
         if command[0] == "run":
+            # M13 slice 2 (#153): parse the forwarded run flags once, so
+            # the --verify-evalid guard can fail before any dispatch and
+            # the routing-decision and verify-evalid records share one
+            # parse. The guard mirrors the remote run's own M2 fail-fast:
+            # --verify-evalid without --verify is a usage error, never a
+            # silent plain-verify run.
+            parsed, _ = fleet_run_arg_parser().parse_known_args(command[1:])
+            if parsed.verify_evalid and not parsed.verify:
+                raise ValueError("--verify-evalid requires --verify: "
+                                 "evalid can only replay a claimed acceptance command")
             if policy is None:
                 policy = load_policy()
             eff_command, weighted_info, eff_decision = fleet_weighted_route(command, policy)
             if weighted_info is not None:
-                parsed, _ = fleet_run_arg_parser().parse_known_args(command[1:])
                 entry_id = f"fleet-{host['name']}-{uuid.uuid4().hex[:8]}"
         rc, out, err = host_run(host, host_openswarm(host, eff_command), timeout=args.timeout)
         sys.stdout.buffer.write(out)
@@ -10529,6 +10541,36 @@ def cmd_fleet(args, policy=None):
                                               parsed.scope if parsed else None,
                                               weighted_info, eff_decision,
                                               run_id=fleet_exec_run_id(out))
+        if parsed is not None and parsed.verify_evalid and rc not in (124, 127):
+            # M13 slice 2 (#153): copy the remote run's claim-vs-evidence
+            # verdict into the controller ledger, like batch does per card.
+            # Independent of weighted routing: a verify-evalid run is
+            # recorded even when routing is off. A dry run dispatches
+            # nothing, so there is no verdict to record.
+            if not parsed.dry_run:
+                run_id = fleet_exec_run_id(out)
+                verify_entry_id = (f"fleet-{host['name']}-{run_id}" if run_id
+                                   else f"fleet-{host['name']}-{uuid.uuid4().hex[:8]}")
+                if eff_decision is not None:
+                    backend, model = eff_decision.get("backend"), eff_decision.get("model")
+                else:
+                    eff_parsed, _ = fleet_run_arg_parser().parse_known_args(eff_command[1:])
+                    backend, model = eff_parsed.backend, eff_parsed.model
+                if run_id is None:
+                    fleet_record_verify_evalid(
+                        host["name"], verify_entry_id, {}, run_id=None,
+                        card_type=parsed.card_type, scope=parsed.scope,
+                        backend=backend, model=model,
+                        fetch_error="could not determine remote run id from the fleet reply")
+                else:
+                    result, fetch_error = fleet_wait_run_result(host, run_id,
+                                                                 timeout=args.timeout)
+                    fleet_record_verify_evalid(
+                        host["name"], verify_entry_id, result or {}, run_id=run_id,
+                        card_type=parsed.card_type, scope=parsed.scope,
+                        backend=backend, model=model,
+                        seconds=(result or {}).get("seconds") if isinstance(result, dict) else None,
+                        fetch_error=fetch_error)
         raise SystemExit(rc)
     if args.fleet_cmd == "ledger" and args.fleet_ledger_cmd == "pull":
         cmd_fleet_ledger_pull(args)
@@ -10871,6 +10913,9 @@ def fleet_run_arg_parser():
     parser.add_argument("--backends-file")
     parser.add_argument("--scope", default="repo")
     parser.add_argument("--title")
+    parser.add_argument("--verify")
+    parser.add_argument("--verify-evalid", action="store_true")
+    parser.add_argument("--evalid-bin")
     parser.add_argument("--detach", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -10961,6 +11006,84 @@ def fleet_record_routing_decision(host, entry_id, backend, model, card_type, sco
     except OSError as error:
         print(f"openswarm: warning: could not record routing decision for fleet {host} in ledger: {error}",
               file=sys.stderr)
+
+
+def fleet_record_verify_evalid(host, entry_id, result, run_id=None, card_type=None,
+                               scope=None, backend=None, model=None, seconds=None,
+                               fetch_error=None):
+    """Ledger entry for one `fleet exec` run's evalid verification (M13 slice 2, #153).
+
+    Mirrors batch_record_verify_evalid: the controller ledger is where
+    fleet outcomes are read (a remote run writes its own ledger on the
+    executor host), so the claim-vs-evidence verdict — the same
+    `verify_evalid` dict single runs record (M2 slice 1, #99: mode, verdict,
+    claim, replay, error) — is copied here, joined to the run by run_id.
+    The entry is flagged fleet_verify_evalid so compute_routing_weights()
+    and the ledger backfill-pass skip it: it is a verification record, not
+    a run outcome, and must not inflate run counts or pass rates. When the
+    remote run carried no verify_evalid record even though one was
+    requested (old remote binary, or evalid failed before audit), that is
+    recorded as verdict "error" with an explicit reason — never silently
+    treated as a plain-verify pass. A fetch_error (run id unknown, or the
+    remote run could not be read back) is likewise an explicit error entry.
+    A ledger write failure must not fail the exec, so it is reported and
+    the forwarded stdout stays authoritative.
+    """
+    if fetch_error is not None:
+        verdict, error, replay, ve = "error", fetch_error, None, None
+    else:
+        ve = (result or {}).get("verify_evalid") if isinstance(result, dict) else None
+        if isinstance(ve, dict) and ve.get("verdict") in ("pass", "mismatch", "error"):
+            verdict, error = ve["verdict"], ve.get("error")
+            replay = ve.get("replay")
+        else:
+            verdict = "error"
+            error = ("remote run returned no verify_evalid record for a fleet run that requested it "
+                     "(remote swrm predates M13, or evalid failed before audit)")
+            replay, ve = None, None
+    try:
+        entry = {"id": entry_id, "run_id": run_id, "ts": NOW(),
+                 "title": f"fleet {host} verify-evalid {verdict}",
+                 "status": "dispatched", "host": host,
+                 "backend": backend, "model": model,
+                 "card_type": card_type, "scope": scope,
+                 "fleet_verify_evalid": True, "verify_evalid_verdict": verdict,
+                 "verify_evalid": ve if ve is not None else {"mode": "verify-evalid",
+                                                             "verdict": verdict, "error": error,
+                                                             "claim": "", "replay": None},
+                 "seconds": seconds}
+        if error:
+            entry["error"] = error
+        if isinstance(replay, dict):
+            entry["verify_evalid_replay_verdict"] = replay.get("verdict")
+        append_ledger(entry)
+    except OSError as error:
+        print(f"openswarm: warning: could not record verify-evalid for fleet {host} in ledger: {error}",
+              file=sys.stderr)
+
+
+def fleet_wait_run_result(host, run_id, timeout=300, poll_seconds=1.0):
+    """Poll `fleet _run-info` until the remote run is terminal (M13 slice 2, #153).
+
+    Returns (result_dict, None) once the remote run reaches a terminal
+    state (the same set batch collection uses: finished, unroutable, dead,
+    dry-run), or (None, reason) when the run cannot be read back or does
+    not finish within `timeout` seconds. A foreground run is already
+    finished when its `fleet exec` returns, so the first poll answers at
+    once; a detached run is waited on, because its claim-vs-evidence
+    verdict can only be recorded once the remote run has one.
+    """
+    deadline = NOW() + timeout
+    while True:
+        try:
+            info = host_json(host, ["fleet", "_run-info", run_id], timeout=20)
+        except (ValueError, RuntimeError, KeyError) as error:
+            return None, f"could not read remote run {run_id}: {error}"
+        if info.get("state") in ("finished", "unroutable", "dead", "dry-run"):
+            return info.get("result") or {}, None
+        if NOW() >= deadline:
+            return None, f"remote run {run_id} did not finish within {timeout}s"
+        time.sleep(min(poll_seconds, max(0.05, deadline - NOW())))
 
 
 def fleet_exec_run_id(out):
