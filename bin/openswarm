@@ -2177,10 +2177,11 @@ def compute_routing_weights(entries, min_samples=8):
     for entry in entries:
         if not isinstance(entry, dict) or not entry.get("backend"):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap"):
             # M7 slice 1 (#122) / slice 2 (#124): a batch or fleet
             # routing-decision record is not a run outcome — it must not
-            # inflate run counts or pass rates.
+            # inflate run counts or pass rates. A fleet-health reap record
+            # (M12 slice 2, #148) is likewise an action log, not an outcome.
             continue
         key = (entry.get("backend"), entry.get("model"), entry.get("card_type"))
         groups.setdefault(key, []).append(entry)
@@ -2451,7 +2452,7 @@ def compute_advice_accuracy(entries):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -2569,7 +2570,7 @@ def compute_weighted_eval(entries, margin=0.10, plan_ok=None):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -10236,10 +10237,11 @@ def cmd_ledger_backfill_pass(args):
                 continue
             if not isinstance(entry, dict):
                 continue
-            if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision"):
+            if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap"):
                 # M7 slice 1 (#122) / slice 2 (#124): a batch or fleet
                 # routing-decision record is not a run outcome — backfill
-                # must not stamp exec_pass on it.
+                # must not stamp exec_pass on it. Same for a fleet-health
+                # reap record (M12 slice 2, #148).
                 skipped += 1
                 continue
             status = entry.get("status")
@@ -10412,10 +10414,18 @@ def cmd_fleet(args, policy=None):
         # fleet transport by `fleet health` exactly like `_snapshot`.
         print(json.dumps(fleet_health_snapshot(getattr(args, "stall_minutes", 10)), ensure_ascii=False))
         return
+    if args.fleet_cmd == "_reap":
+        # M12 slice 2 (#148): per-host reap, called over the fleet
+        # transport by `fleet health --reap` exactly like `_health`.
+        print(json.dumps(fleet_health_reap(getattr(args, "stall_minutes", 10)), ensure_ascii=False))
+        return
     if args.fleet_cmd == "health":
-        # M12 slice 1 (#146): aggregate one health snapshot per host, the
-        # same reachability/paused handling as `fleet status`. Read-only.
+        # M12 slice 1 (#146) + slice 2 (#148): aggregate one health
+        # snapshot per host, the same reachability/paused handling as
+        # `fleet status`. Read-only by default; --reap reaps dead runs on
+        # each reachable host (paused/unreachable hosts are never reaped).
         stall = getattr(args, "stall_minutes", 10)
+        reap = getattr(args, "reap", False)
         hosts = list(fleet_config().values())
         states = instabox_states(hosts)
         rows = []
@@ -10426,8 +10436,13 @@ def cmd_fleet(args, policy=None):
                 row.update(paused=state == "paused", state=state or "unknown")
             else:
                 try:
-                    row.update(health=host_json(host, ["fleet", "_health", "--stall-minutes", str(stall)],
-                                                timeout=20), reachable=True)
+                    if reap:
+                        row.update(reap=host_json(host, ["fleet", "_reap", "--stall-minutes", str(stall)],
+                                                  timeout=20), reachable=True)
+                        row["health"] = row["reap"]["health"]
+                    else:
+                        row.update(health=host_json(host, ["fleet", "_health", "--stall-minutes", str(stall)],
+                                                    timeout=20), reachable=True)
                 except RuntimeError as e:
                     row["error"] = str(e)
             if row["paused"]:
@@ -10445,9 +10460,16 @@ def cmd_fleet(args, policy=None):
             for row in rows:
                 health = row.get("health") or {}
                 summary = health.get("summary") or {}
-                print(f"{row['name']}  {row['status']}  "
-                      f"alive={summary.get('alive', 0)} dead={summary.get('dead', 0)} "
-                      f"zombie={summary.get('zombie', 0)} unknown={summary.get('unknown', 0)}")
+                if row.get("reap"):
+                    reap_summary = row["reap"].get("summary") or {}
+                    print(f"{row['name']}  {row['status']}  "
+                          f"alive={summary.get('alive', 0)} dead={summary.get('dead', 0)} "
+                          f"zombie={summary.get('zombie', 0)} unknown={summary.get('unknown', 0)} "
+                          f"reaped={reap_summary.get('reaped', 0)} skipped={reap_summary.get('skipped', 0)}")
+                else:
+                    print(f"{row['name']}  {row['status']}  "
+                          f"alive={summary.get('alive', 0)} dead={summary.get('dead', 0)} "
+                          f"zombie={summary.get('zombie', 0)} unknown={summary.get('unknown', 0)}")
                 if row["status"] == "config invalid" and health.get("lane_config_error"):
                     print(f"  config invalid: {health['lane_config_error']}")
                 if row.get("error"):
@@ -10459,6 +10481,10 @@ def cmd_fleet(args, policy=None):
                     print(f"  run {run['id']} {run['verdict']} pid={ev.get('runner_pid') or '-'} "
                           f"({ev.get('pid_identity')}) idle={'%.1fm' % idle if idle is not None else '-'} "
                           f"last={ev.get('last_activity') or '-'} ledger:{ledger if ledger is not None else '-'}")
+                for entry in (row.get("reap") or {}).get("reaped") or []:
+                    print(f"  reaped {entry['id']} dead -> exited ledger:{entry.get('ledger_line')}")
+                for entry in (row.get("reap") or {}).get("skipped") or []:
+                    print(f"  skip {entry['id']} {entry.get('verdict')} ({entry.get('reason')})")
         return
     if args.fleet_cmd == "exec":
         host = fleet_host(args.host)
@@ -12128,9 +12154,14 @@ def run_digest(rid):
     return out
 
 
-# ---------------------------------------------------------------- fleet health (M12 slice 1, #146)
-# Read-only: `fleet health` never dispatches, retries, reaps, or mutates a
-# run. Slice 1 only checks and reports; reaping stays in slice 2 (#145).
+# ---------------------------------------------------------------- fleet health (M12 slice 1, #146; reap: slice 2, #148)
+# Default `fleet health` is read-only: it never dispatches, retries, reaps,
+# or mutates a run. `fleet health --reap` explicitly reaps runs judged dead
+# (M11 semantics: mark finished/exited so watch stops re-emitting
+# BUDGET/STALL), one flagged ledger line per reap, reviewable via the
+# run's ledger pointer. Zombie runs are never reaped: their runner is
+# alive, and M11's reap guard refuses a live runner — they are reported as
+# skipped with the reason instead of being silently marked finished.
 # Verdicts reuse M11's identity-checked runner_alive(): a pid that is alive
 # but is a different (recycled) process counts as dead, never alive (#98).
 
@@ -12295,6 +12326,81 @@ def fleet_health_snapshot(stall_minutes=10):
     return {"runs": runs, "lanes": lanes, "summary": summary,
             "finished_runs": finished, "stall_minutes": stall_minutes,
             "lane_config_valid": config_error is None, "lane_config_error": config_error}
+
+
+def append_reap_ledger(rid, row):
+    """Append one reap record to the ledger (M12 slice 2, #148).
+
+    The record is a reviewable action log, not a run outcome: it carries
+    its own id (``reap-<run>-<epoch>``) so diagnose / run_ledger_verdict —
+    which match ledger entries on ``id`` — keep reading the run's outcome
+    record, while ``run_id`` joins it to the run so ledger_run_lines()
+    points at the reap line as the run's latest evidence. Flagged
+    ``fleet_health_reap`` so routing/advice accounting skips it, exactly
+    like the routing-decision records (M7). Returns the 1-based ledger
+    line number of the appended record. Written under the same budget.lock
+    as append_ledger so concurrent completion writes stay coherent.
+    """
+    record = {"id": "reap-%s-%d" % (rid, int(NOW())), "run_id": rid, "ts": NOW(),
+              "event": "reap", "fleet_health_reap": True, "status": "exited",
+              "reaped": "dead-runner", "reaped_by": "fleet health --reap",
+              "verdict": row["verdict"],
+              "runner_pid": (row.get("evidence") or {}).get("runner_pid"),
+              "pid_identity": (row.get("evidence") or {}).get("pid_identity"),
+              "title": row.get("title") or ""}
+    record = bus_sanitize(record)
+    os.makedirs(DATA, exist_ok=True)
+    with open(os.path.join(DATA, "budget.lock"), "a") as lock:
+        _flock(lock, LOCK_EX)
+        try:
+            with open(LEDGER, "rb") as stream:
+                line_no = sum(1 for _ in stream) + 1
+        except OSError:
+            line_no = 1
+        with open(LEDGER, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return line_no
+
+
+def fleet_health_reap(stall_minutes=10):
+    """Reap dead runs from a fresh health snapshot (M12 slice 2, #148).
+
+    Only ``dead`` verdicts are reaped, via M11's reap_dead_run: mark
+    finished/exited (``reaped="dead-runner"``) so later watch passes take
+    the DONE branch instead of re-emitting BUDGET/STALL, and append one
+    flagged ledger line per reap. Everything else is reported as skipped
+    with an explicit reason — zombie (runner alive; M11's guard refuses a
+    live runner), alive, unknown — and nothing about those runs is touched.
+    The returned ``health`` is the pre-reap snapshot, so the verdict each
+    reap was based on stays attached to the action. Idempotent: a reaped
+    run is terminal, so a second call finds nothing to reap and writes no
+    further ledger line.
+    """
+    snap = fleet_health_snapshot(stall_minutes)
+    reaped, skipped = [], []
+    for row in snap["runs"]:
+        rid = row["id"]
+        rdir = os.path.join(RUNS, rid)
+        if row["verdict"] == "dead":
+            st = jload(os.path.join(rdir, "status.json"), {}) or {}
+            if reap_dead_run(rdir, st):
+                line_no = append_reap_ledger(rid, row)
+                reaped.append({"id": rid, "verdict": "dead", "ledger_line": line_no,
+                               "runner_pid": (row.get("evidence") or {}).get("runner_pid"),
+                               "pid_identity": (row.get("evidence") or {}).get("pid_identity")})
+            else:
+                skipped.append({"id": rid, "verdict": "dead",
+                                "reason": "runner alive or already terminal on re-read; not reaped"})
+        elif row["verdict"] == "zombie":
+            skipped.append({"id": rid, "verdict": "zombie",
+                            "reason": "runner alive; M11 reap only applies to dead runners, "
+                                      "so a zombie is reported, not reaped"})
+        else:
+            skipped.append({"id": rid, "verdict": row["verdict"],
+                            "reason": "only dead runs are reaped"})
+    return {"health": snap, "reaped": reaped, "skipped": skipped,
+            "summary": {"reaped": len(reaped), "skipped": len(skipped), **snap["summary"]},
+            "stall_minutes": stall_minutes}
 
 
 # ---------------------------------------------------------------- failure diagnosis (M10 slice 1, #137)
@@ -14229,6 +14335,9 @@ def main():
     fp.add_argument("--json", action="store_true")
     fp.add_argument("--stall-minutes", type=float, default=10,
                     help="no-activity minutes after which a live runner counts as zombie (default 10, same as watch)")
+    fp.add_argument("--reap", action="store_true",
+                    help="explicitly reap runs judged dead (M11 semantics: mark finished/exited, one ledger line per reap; "
+                         "zombie/alive/unknown runs are reported as skipped, never reaped). Default is read-only.")
     fp = fleet_sub.add_parser("exec")
     fp.add_argument("--timeout", type=float, default=300)
     fp.add_argument("host")
@@ -14240,6 +14349,8 @@ def main():
     fp.add_argument("--into", help="destination JSONL path")
     fleet_sub.add_parser("_snapshot", help=argparse.SUPPRESS)
     fp = fleet_sub.add_parser("_health", help=argparse.SUPPRESS)
+    fp.add_argument("--stall-minutes", type=float, default=10)
+    fp = fleet_sub.add_parser("_reap", help=argparse.SUPPRESS)
     fp.add_argument("--stall-minutes", type=float, default=10)
     fp = fleet_sub.add_parser("_run-info", help=argparse.SUPPRESS)
     fp.add_argument("run_id")
