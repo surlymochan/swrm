@@ -72,6 +72,23 @@ elif sys.argv[1:3] == ["fleet", "_run-info"]:
                       "seconds": 0.1, "verify": {"rc": 1 if failed else 0},
                       "workspace": {"repo": repo, "path": repo, "base": spec["base"]},
                       "result": {"summary": spec["card"].strip().splitlines()[0]}}
+            if spec.get("verify_evalid"):
+                # M13 slice 1 (#151): mirror the real run's verify_evalid
+                # record — a card whose text says EVALID-MISMATCH replays
+                # as mismatch (and, like the real run, downgrades done to
+                # partial); anything else verifies as pass.
+                mismatch = "EVALID-MISMATCH" in spec["card"]
+                verdict = "mismatch" if mismatch else "pass"
+                if mismatch and result["status"] == "done":
+                    result["status"] = "partial"
+                claim = "Ran `%s` — all pass (exit 0)" % spec.get("verify", "true")
+                result["verify_evalid"] = {
+                    "mode": "verify-evalid", "verdict": verdict, "claim": claim,
+                    "claims_text": claim,
+                    "replay": {"verdict": "verified" if verdict == "pass" else "mismatch",
+                               "claims": [{"command": spec.get("verify", "true"),
+                                           "match": verdict == "pass"}]},
+                    "error": None if verdict == "pass" else "evalid audit verdict mismatch: see replay report"}
             save(result_path, result)
             save(path.with_name("status.json"), {"id": rid, "state": "finished", "status": result["status"]})
             record({"event": "finish", "id": rid})
@@ -82,15 +99,17 @@ elif sys.argv[1:2] == ["run"]:
     parser.add_argument("--detach", action="store_true")
     parser.add_argument("--scope", choices=("repo", "host"), default="repo")
     for flag in ("cwd", "task-file", "base", "backend", "model", "effort", "verify", "budget-minutes",
-                 "card-type", "rework-of", "backends-file"):
+                 "card-type", "rework-of", "backends-file", "evalid-bin"):
         parser.add_argument("--" + flag)
+    parser.add_argument("--verify-evalid", action="store_true")
     parser.add_argument("--paths", nargs="*")
     args = parser.parse_args(sys.argv[2:])
     rid = "fake-" + uuid.uuid4().hex[:10]
     active = [path for path in (home / "runs").glob("*/stub.json") if not path.with_name("result.json").exists()]
     card = Path(args.task_file).read_text()
     record({"event": "start", "id": rid, "active_before": len(active), "args": vars(args), "card": card})
-    save(home / "runs" / rid / "stub.json", {"repo": args.cwd, "base": args.base, "card": card, "polls": 0})
+    save(home / "runs" / rid / "stub.json", {"repo": args.cwd, "base": args.base, "card": card, "polls": 0,
+                                             "verify": args.verify, "verify_evalid": bool(args.verify_evalid)})
     backend = args.backend
     save(home / "runs" / rid / "status.json", {"id": rid, "state": "running", "backend": backend,
                                                  "concurrency_keys": [backend, "total"] if backend else ["total"]})
