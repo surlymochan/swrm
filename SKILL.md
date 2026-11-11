@@ -154,6 +154,7 @@ and authenticated executors on the hosts. Full config example: [README](README.m
 
 ```bash
 $XS fleet status --json                  # never wakes paused instaboxes
+$XS fleet health --json                  # per-run alive/dead/zombie verdicts + evidence pointers; read-only
 $XS fleet exec worker -- lane status     # arbitrary openswarm arguments, stdout/rc forwarded
 $XS batch --repo project --cards ./cards --hosts worker,sandbox --per-host 1 \
   --backend pi --model cheap-model --budget-minutes 20 --detach
@@ -313,6 +314,7 @@ Grouped by what the command does. `openswarm <command> --help` lists every flag.
 | `budget status` | Show today's executor budget usage. | `$XS budget status --json` |
 | `ingest-claude` | Record Claude plan usage from the statusline hook or from flags. | `$XS ingest-claude --five-hour 80 --seven-day 40` |
 | `fleet status` | Show reachability, paused hosts, lanes, and active runs. | `$XS fleet status --json` |
+| `fleet health` | Per-run alive/dead/zombie verdicts with evidence pointers (ledger line, pid identity, last activity); read-only. | `$XS fleet health --json` |
 | `fleet exec` | Run an swrm command on another host; stdout and the exit code are forwarded. | `$XS fleet exec worker -- lane status` |
 | `fleet ledger pull` | Merge the host ledgers into one fleet ledger file. | `$XS fleet ledger pull --hosts worker,sandbox` |
 
