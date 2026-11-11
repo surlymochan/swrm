@@ -864,19 +864,24 @@ class BatchVerifyEvalidTests(FakeFleetFixture, unittest.TestCase):
     def test_batch_flag_applies_to_all_cards_and_forwards_evalid_bin(self):
         (self.cards / "a.md").write_text("task a")
         (self.cards / "b.md").write_text("task b")
-        rc, summary, _ = self.run_batch(verify_evalid=True, evalid_bin="/tmp/fake-xflow")
+        # The fake bin lives in the platform temp dir: a POSIX "/tmp/..."
+        # literal is rewritten to the Windows Temp dir by MSYS path
+        # conversion when the batch forwards it through `sh -c` on
+        # Windows, so build it from gettempdir() instead.
+        fake_bin = os.path.join(tempfile.gettempdir(), "fake-xflow")
+        rc, summary, _ = self.run_batch(verify_evalid=True, evalid_bin=fake_bin)
         self.assertEqual(rc, 0)
         starts = self.start_events()
         self.assertEqual(len(starts), 2)
         for start in starts:
             self.assertTrue(start["args"]["verify_evalid"])
-            self.assertEqual(start["args"]["evalid_bin"], "/tmp/fake-xflow")
+            self.assertEqual(start["args"]["evalid_bin"], fake_bin)
         self.assertTrue(all(row["verify_evalid"] for row in summary["cards"]))
         self.assertTrue(all(row["verify_evalid_verdict"] == "pass" for row in summary["cards"]))
         self.assertEqual(len(self.ve_entries()), 2)
         spec = json.loads((self.data / "batches" / summary["id"] / "spec.json").read_text())
         self.assertTrue(spec["verify_evalid"])
-        self.assertEqual(spec["evalid_bin"], "/tmp/fake-xflow")
+        self.assertEqual(spec["evalid_bin"], fake_bin)
 
     def test_mismatch_downgrades_and_blocks_dependent(self):
         (self.cards / "a.md").write_text("verify-evalid: true\nEVALID-MISMATCH task a")
