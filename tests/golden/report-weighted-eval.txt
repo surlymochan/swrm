@@ -1,0 +1,12 @@
+weighted eval (ledger: LEDGER; margin: 0.10)
+replay: a scored run would divert when the advised backend/model differs from the run's backend/model and the quoted advice pass rate beats the recorded actual-pick pass rate by at least the margin; expected = quoted advice rate for diverted runs, observed outcome otherwise; small-n = n < 8, expected delta indicative only
+backend    card_type       n diverted  share  advised   actual expected  delta  flag
+------------------------------------------------------------------------------------
+agy        fix             8        8   1.00     0.75     0.50     0.75  +0.25  
+codex      fix            10       10   1.00     0.80     0.70     0.80  +0.10  
+codex      test            5        4   0.80     0.86     0.40     0.72  +0.32  small-n
+cursor     review          7        0   0.00      n/a     0.57     0.57  +0.00  small-n
+deepseek   docs            5        0   0.00     0.60     0.60     0.60  +0.00  small-n
+ocgo       fix             8        0   0.00     0.70     0.50     0.50  +0.00  
+pi         fix             0        0    n/a      n/a      n/a      n/a    n/a  no scored runs
+scored runs: 43 across 7 groups; diverted: 22; advice records: 46

@@ -269,6 +269,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm routing weights` | Compute per-backend routing metrics and write the weights file. | `openswarm routing weights --fleet` |
 | `openswarm routing compare` | Compare recorded routing advice with the actual run outcomes. | `openswarm routing compare --days 30 --fleet` |
 | `openswarm report --advice-accuracy` | Advice calibration table by (backend, card type): quoted vs observed pass rates. | `openswarm report --advice-accuracy [--json] [--fleet]` |
+| `openswarm report --weighted-eval` | Weighted-routing counterfactual replay by (backend, card type): diverted share and expected vs actual pass rate. | `openswarm report --weighted-eval [--json] [--fleet]` |
 | `openswarm retro` | Run the weekly retrospective: pull, ingest, backfill, weights, proposals, report. | `openswarm retro --days 7 --repos acme/project` |
 | `openswarm regress run` | Run the regression card suite on a backend, a lane, or a routing mode. | `openswarm regress run --backend codex --cards card-a,card-b --label nightly --parallel 2` |
 | `openswarm regress compare` | Compare two regression result files card by card. | `openswarm regress compare before.json after.json` |
@@ -461,6 +462,17 @@ the difference is `|advised - actual|`. A group is marked `MISCALIBRATED` when t
 least 8 scored samples. Advice the run did not follow never enters the sample count, and groups with advice records
 but no scored run show `n=0` with `n/a` rates instead of invented numbers. Add `--json` for machine-readable output
 or `--fleet` to read the merged fleet ledger. The command is read-only and never changes routing.
+
+`openswarm report --weighted-eval` (M9, #132) replays those same advice records through the diversion rule
+`apply_weighted_routing` enforces: a scored run would divert when the advised (backend, model) differs from the
+run's own (backend, model) and the quoted advice pass rate beats the recorded actual-pick pass rate by at least
+`routing.advice_margin` (equal diverts). One row per (advised backend, card type) shows the diverted share and
+the expected pass rate under weighted routing — the quoted advice rate for diverted runs, the observed outcome
+otherwise — against the actually observed pass rate. No per-run counterfactual outcome is invented, and groups
+with fewer than 8 scored runs are flagged `small-n` (their expected delta is indicative only); groups with
+advice records but no scored run show `n=0` with `n/a` rates. Add `--json` for machine-readable output or
+`--fleet` to read the merged fleet ledger. The command is read-only and never changes routing; the margin it
+replays is the policy's `routing.advice_margin` (default 0.10).
 
 Run the weekly fleet retrospective in one command:
 
