@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import copy
 import io
 import json
 import os
@@ -590,6 +591,226 @@ class BatchSlice2Tests(FakeFleetFixture, unittest.TestCase):
         markdown = (self.data / "batches" / summary["id"] / "summary.md").read_text()
         self.assertIn("blocked", markdown)
 
+
+
+class BatchWeightedRoutingTests(FakeFleetFixture, unittest.TestCase):
+    """M7 slice 1 (#122): batch cards follow ledger advice per card, reusing
+    the single-run weighted-routing decision path; M4 semantics preserved."""
+
+    def setUp(self):
+        super().setUp()
+        with open(_load.FIXTURE_STATE) as f:
+            self.base_state = json.load(f)
+        self.now = time.time()
+
+    def win(self, used, hours_left, minutes):
+        return xs.window_stats(used * 100, minutes, self.now + hours_left * 3600)
+
+    def scenario(self):
+        st = copy.deepcopy(self.base_state)
+        st["codex"]["limits"] = {"codex": {"windows": {"seven_day": self.win(0.3, 100, 10080)}}}
+        st["claude"].update({"provider": "official", "metered_by_anthropic": True, "stale": False,
+                             "five_hour": self.win(0.2, 3, 300), "seven_day": self.win(0.3, 100, 10080)})
+        st["deepseek"]["balance"] = 55.0
+        for m in st["ocgo"]["models"]:
+            m["usage"] = {"5h": 0.0, "7d": 0.0, "30d": 0.0}
+        return st
+
+    def write_policy(self, **routing):
+        """Routing overrides via policy.local.json; codex require_default_model
+        off so the fixture state routes (as in test_weighted_routing)."""
+        local = {"codex": {"require_default_model": False}}
+        if routing:
+            local["routing"] = routing
+        (self.data / "policy.local.json").write_text(json.dumps(local))
+
+    def rows_for(self, backend, model, passes, n=8):
+        return [{"id": f"{backend[:2]}{i}", "backend": backend, "model": model, "card_type": "fix",
+                 "status": "done", "exec_pass": i < passes, "attempts": [{}], "seconds": 10,
+                 "tokens": {"total": 100}} for i in range(n)]
+
+    def seed(self, codex_pass=2, ocgo_pass=7, codex_n=8, ocgo_n=8):
+        """Seed the controller ledger around the live default pick (codex);
+        return (state, default decision)."""
+        policy = xs.load_policy()
+        state = self.scenario()
+        decision = xs.route({"type": "impl", "difficulty": 3}, state, policy)
+        self.assertTrue(decision["ok"], f"unroutable: {decision}")
+        self.assertEqual(decision["backend"], "codex")
+        rows = self.rows_for("codex", decision["model"], codex_pass, codex_n)
+        rows += self.rows_for("ocgo", "mid-coder", ocgo_pass, ocgo_n)
+        (self.data / "ledger.jsonl").write_text("".join(json.dumps(e) + "\n" for e in rows))
+        return state, decision
+
+    def run_weighted_batch(self, state, **fields):
+        with mock.patch.object(xs, "get_state", return_value=state):
+            return self.run_batch(**fields)
+
+    def start_events(self):
+        events = []
+        for host in ("b1", "b2"):
+            path = self.root / host / "data" / "calls.jsonl"
+            if path.exists():
+                events.extend(json.loads(line) for line in path.read_text().splitlines())
+        return [e for e in events if e["event"] == "start"]
+
+    def ledger_entries(self):
+        path = self.data / "ledger.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+    def decision_entries(self):
+        return [e for e in self.ledger_entries() if e.get("batch_routing_decision")]
+
+    def spec_json(self, summary):
+        return json.loads((self.data / "batches" / summary["id"] / "spec.json").read_text())
+
+    def test_weighted_on_reroutes_card_to_advised_backend(self):
+        (self.cards / "one.md").write_text("task one")
+        self.write_policy(weighted=True, default_order=["codex", "ocgo"], min_samples=8)
+        state, decision = self.seed()
+        rc, summary, _ = self.run_weighted_batch(state, backend=None, model=None, card_type="fix")
+        self.assertEqual(rc, 0)
+        self.assertFalse(self.spec_json(summary)["backend_explicit"])
+        starts = self.start_events()
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0]["args"]["backend"], "ocgo")
+        self.assertEqual(starts[0]["args"]["model"], "mid-coder")
+        row = summary["cards"][0]
+        self.assertEqual(row["backend"], "ocgo")
+        self.assertEqual(row["model"], "mid-coder")
+        self.assertTrue(row["routed_by_advice"])
+        self.assertEqual(row["routed_from"], {"backend": "codex", "model": decision["model"]})
+        self.assertEqual(row["advice_pass_rate"], 0.875)
+        self.assertEqual(row["advice_samples"], 8)
+        self.assertEqual(row["actual_pass_rate"], 0.25)
+        self.assertEqual(row["actual_samples"], 8)
+        self.assertTrue(row["weighted_routing"]["applied"])
+        decisions = self.decision_entries()
+        self.assertEqual(len(decisions), 1)
+        entry = decisions[0]
+        self.assertEqual(entry["backend"], "ocgo")
+        self.assertEqual(entry["model"], "mid-coder")
+        self.assertEqual(entry["run_id"], row["run_id"])
+        self.assertEqual(entry["status"], "dispatched")
+        self.assertTrue(entry["routed_by_advice"])
+        self.assertEqual(entry["routed_from"], {"backend": "codex", "model": decision["model"]})
+        self.assertEqual(entry["advice_pass_rate"], 0.875)
+        self.assertEqual(entry["advice_samples"], 8)
+        self.assertEqual(entry["actual_pass_rate"], 0.25)
+        self.assertEqual(entry["actual_samples"], 8)
+        self.assertTrue(entry["weighted_routing"]["applied"])
+        # The decision record must not move the weights it was computed from.
+        weights = xs.compute_routing_weights(self.ledger_entries(), 8)["entries"]
+        self.assertEqual({(r["backend"], r["runs"]) for r in weights},
+                         {("codex", 8), ("ocgo", 8)})
+
+    def test_weighted_off_dispatches_without_new_fields(self):
+        """Shipped default: no weighted fields anywhere, remote run gets the
+        creation-time default pick exactly as before this change."""
+        (self.cards / "one.md").write_text("task one")
+        self.write_policy()
+        state, decision = self.seed()
+        rc, summary, _ = self.run_weighted_batch(state, backend=None, model=None, card_type="fix")
+        self.assertEqual(rc, 0)
+        starts = self.start_events()
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0]["args"]["backend"], "codex")
+        self.assertIsNone(starts[0]["args"]["model"])
+        row = summary["cards"][0]
+        for key in ("weighted_routing", "routed_by_advice", "routed_from",
+                    "advice_pass_rate", "advice_samples",
+                    "actual_pass_rate", "actual_samples", "backend", "model"):
+            self.assertNotIn(key, row)
+        self.assertEqual(self.decision_entries(), [])
+
+    def test_explicit_backend_wins(self):
+        (self.cards / "one.md").write_text("task one")
+        self.write_policy(weighted=True, default_order=["codex", "ocgo"], min_samples=8)
+        state, decision = self.seed()
+        rc, summary, _ = self.run_weighted_batch(state, backend="codex", model=None, card_type="fix")
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.spec_json(summary)["backend_explicit"])
+        starts = self.start_events()
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0]["args"]["backend"], "codex")
+        self.assertIsNone(starts[0]["args"]["model"])
+        row = summary["cards"][0]
+        self.assertEqual(row["backend"], "codex")
+        self.assertFalse(row["weighted_routing"]["applied"])
+        self.assertIn("explicit --backend", row["weighted_routing"]["reason"])
+        self.assertNotIn("routed_by_advice", row)
+        decisions = self.decision_entries()
+        self.assertEqual(len(decisions), 1)
+        self.assertFalse(decisions[0]["weighted_routing"]["applied"])
+        self.assertNotIn("routed_by_advice", decisions[0])
+
+    def test_margin_blocks_small_advantage(self):
+        (self.cards / "one.md").write_text("task one")
+        self.write_policy(weighted=True, default_order=["codex", "ocgo"], min_samples=8,
+                          advice_margin=0.8)
+        state, decision = self.seed()
+        rc, summary, _ = self.run_weighted_batch(state, backend=None, model=None, card_type="fix")
+        self.assertEqual(rc, 0)
+        starts = self.start_events()
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0]["args"]["backend"], "codex")
+        row = summary["cards"][0]
+        self.assertFalse(row["weighted_routing"]["applied"])
+        self.assertIn("below margin", row["weighted_routing"]["reason"])
+        self.assertNotIn("routed_by_advice", row)
+
+    def test_no_history_for_default_pick_means_no_switch(self):
+        (self.cards / "one.md").write_text("task one")
+        self.write_policy(weighted=True, default_order=["codex", "ocgo"], min_samples=8)
+        state, decision = self.seed(codex_n=0)
+        rc, summary, _ = self.run_weighted_batch(state, backend=None, model=None, card_type="fix")
+        self.assertEqual(rc, 0)
+        starts = self.start_events()
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0]["args"]["backend"], "codex")
+        row = summary["cards"][0]
+        self.assertFalse(row["weighted_routing"]["applied"])
+        self.assertIn("comparison unavailable", row["weighted_routing"]["reason"])
+        self.assertNotIn("routed_by_advice", row)
+
+    def test_weighted_reroute_keeps_stacked_branches(self):
+        (self.cards / "a.md").write_text("task a")
+        (self.cards / "b.md").write_text("depends_on: a.md\ntask b")
+        self.write_policy(weighted=True, default_order=["codex", "ocgo"], min_samples=8)
+        state, decision = self.seed()
+        rc, summary, _ = self.run_weighted_batch(state, backend=None, model=None, card_type="fix")
+        self.assertEqual(rc, 0)
+        a_row, b_row = summary["cards"]
+        self.assertTrue(a_row["routed_by_advice"])
+        self.assertTrue(b_row["routed_by_advice"])
+        self.assertEqual(b_row["base"], a_row["commit"])
+        self.assertEqual(b_row["stacked_on"], {"a.md": a_row["commit"]})
+        starts = self.start_events()
+        self.assertEqual({s["args"]["backend"] for s in starts}, {"ocgo"})
+        self.assertEqual(len(self.decision_entries()), 2)
+
+    def test_weighted_reroute_keeps_failed_dependency_blocked(self):
+        (self.cards / "a.md").write_text("FAIL task a")
+        (self.cards / "b.md").write_text("depends_on: a.md\ntask b")
+        (self.cards / "c.md").write_text("depends_on: b.md\ntask c")
+        self.write_policy(weighted=True, default_order=["codex", "ocgo"], min_samples=8)
+        state, decision = self.seed()
+        rc, summary, _ = self.run_weighted_batch(state, backend=None, model=None, card_type="fix")
+        self.assertEqual(rc, 1)
+        a_row, b_row, c_row = summary["cards"]
+        self.assertEqual(a_row["status"], "failed")
+        self.assertTrue(a_row["routed_by_advice"])
+        self.assertEqual(b_row["status"], "blocked")
+        self.assertEqual(b_row["blocked_by"], "a.md")
+        self.assertEqual(c_row["status"], "blocked")
+        self.assertEqual(c_row["blocked_by"], "b.md")
+        self.assertNotIn("run_id", b_row)
+        self.assertNotIn("run_id", c_row)
+        # Only the dispatched card gets a routing-decision record.
+        self.assertEqual(len(self.decision_entries()), 1)
+        self.assertEqual(self.decision_entries()[0]["card"], "a.md")
 
 
 if __name__ == "__main__":

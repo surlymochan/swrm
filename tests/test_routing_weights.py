@@ -214,5 +214,25 @@ class RoutingWeightsTests(unittest.TestCase):
         self.assertTrue(line.endswith("pass"))
 
 
+    def test_batch_routing_decision_entries_do_not_change_weights(self):
+        """M7 slice 1 (#122): a batch routing-decision record is not a run
+        outcome, so it must not move run counts, pass rates, or the advice
+        sample counts that later rounds read."""
+        runs = [
+            {"backend": "codex", "model": "m1", "card_type": "fix", "status": "done",
+             "exec_pass": True, "attempts": [{}], "seconds": 10, "tokens": {"total": 100}},
+            {"backend": "ocgo", "model": "m2", "card_type": "fix", "status": "done",
+             "exec_pass": True, "attempts": [{}], "seconds": 5, "tokens": {"total": 50}},
+        ]
+        before = xs.compute_routing_weights(runs, min_samples=1)
+        decision = {"id": "batch-x-one.md", "run_id": "fake-run", "ts": xs.NOW(),
+                    "status": "dispatched", "backend": "ocgo", "model": "m2", "card_type": "fix",
+                    "batch_routing_decision": True, "routed_by_advice": True,
+                    "advice_pass_rate": 1.0, "advice_samples": 1,
+                    "actual_pass_rate": 1.0, "actual_samples": 1, "seconds": None}
+        after = xs.compute_routing_weights([*runs, decision], min_samples=1)
+        self.assertEqual(before, after)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

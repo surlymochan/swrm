@@ -444,7 +444,12 @@ tokens and seconds as cost tie-breakers. With `routing.weighted: false` (the shi
 alongside the real route and does not change the selected backend or model. Set `routing.weighted: true` and the
 run follows the advice when its observed pass rate beats the default pick by at least `routing.advice_margin`
 (default 0.10); the switch is recorded in the ledger as `weighted_routing` and on the decision as
-`routed_by_advice`, and an explicit `--backend` always wins. Compare recorded advice
+`routed_by_advice`, and an explicit `--backend` always wins. Batch cards follow the same switch per card (M7):
+each card is decided on the controller with the same code path, the advised backend is passed to the remote run,
+and the per-card decision is recorded on the batch summary row and in the controller ledger as
+`routed_by_advice` with both pass rates and sample counts; only a user-explicit batch `--backend` wins over it
+(a backend the batch creation-time route picked is the default pick, not an explicit one). Fleet dispatch still
+only records the advice. Compare recorded advice
 with actual outcomes using `openswarm routing compare --days 30`. An advice outcome is shown as `not run` when the
 actual route used a different backend or model, because that counterfactual was not executed.
 

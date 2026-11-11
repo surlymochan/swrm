@@ -2176,6 +2176,10 @@ def compute_routing_weights(entries, min_samples=8):
     for entry in entries:
         if not isinstance(entry, dict) or not entry.get("backend"):
             continue
+        if entry.get("batch_routing_decision"):
+            # M7 slice 1 (#122): a batch routing-decision record is not a
+            # run outcome — it must not inflate run counts or pass rates.
+            continue
         key = (entry.get("backend"), entry.get("model"), entry.get("card_type"))
         groups.setdefault(key, []).append(entry)
 
@@ -9958,6 +9962,11 @@ def cmd_ledger_backfill_pass(args):
                 continue
             if not isinstance(entry, dict):
                 continue
+            if entry.get("batch_routing_decision"):
+                # M7 slice 1 (#122): a batch routing-decision record is not
+                # a run outcome — backfill must not stamp exec_pass on it.
+                skipped += 1
+                continue
             status = entry.get("status")
             if not isinstance(status, str) or status in ("queued", "routing", "running", "verifying"):
                 skipped += 1
@@ -10272,6 +10281,96 @@ def topo_sort_cards(deps_by_card):
     return order
 
 
+_UNSET = object()
+"""Sentinel for "no per-card override given" in batch_launch() /
+batch_provider_slot_available(): a batch backend may legitimately be None
+(no --backend flag for the remote run), so None cannot mean "use spec"."""
+
+
+def batch_weighted_route(spec, policy, custom_backends=None):
+    """Effective (backend, model, weighted_info, decision) for one batch card
+    (M7 slice 1, #122), reusing apply_weighted_routing() — the same decision
+    path single runs use (M6, #114).
+
+    Returns weighted_info None and decision None when routing.weighted is
+    false, without calling route()/get_state() at all, so record-only batches
+    dispatch byte-identically to before.
+
+    The batch-level backend in spec is the *default pick*, not an explicit
+    --backend: it comes from the creation-time route() unless the user passed
+    --backend (spec["backend_explicit"]). Only a user-explicit backend wins
+    over weighted routing; a routed default is re-derived live per card and
+    may be rerouted. Specs written before backend_explicit existed are
+    treated conservatively: a present backend counts as explicit, so an old
+    queued batch never reroutes. A state/probe failure falls back to the
+    spec backend (never strands the card); an invalid routing config
+    (ValueError, e.g. a bad advice_margin) fails loudly like a single run.
+    """
+    backend, model = spec.get("backend"), spec.get("model")
+    routing = policy.get("routing") or {}
+    if not routing.get("weighted", False):
+        return backend, model, None, None
+    explicit = spec.get("backend_explicit")
+    if explicit is None:
+        explicit = bool(backend)
+    if explicit:
+        return backend, model, {"applied": False,
+                                "reason": "explicit --backend wins over weighted routing"}, None
+    try:
+        if custom_backends is None:
+            custom_backends = load_custom_backends(policy, explicit=spec.get("backends_file"))
+        st = get_state(policy)
+        profile = {"type": "impl", "difficulty": 3}
+        if model:
+            profile["model"] = model
+        decision = route(profile, st, policy, custom_backends=custom_backends)
+        new_decision, info = apply_weighted_routing(profile, spec.get("card_type"), st, policy,
+                                                    decision, custom_backends=custom_backends)
+    except (RuntimeError, OSError) as error:
+        return backend, model, {"applied": False,
+                                "reason": f"weighted routing unavailable ({error}); kept the default pick"}, None
+    if not new_decision.get("ok"):
+        return backend, model, info, None
+    return new_decision.get("backend"), new_decision.get("model"), info, new_decision
+
+
+def batch_record_routing_decision(summary, row, card_type, weighted_info, decision):
+    """Ledger entry for one batch card's weighted-routing decision (M7 slice 1,
+    #122).
+
+    Mirrors batch_record_blocked: the controller ledger is where batch
+    decisions are read (a remote run writes its own ledger on the executor
+    host), so the per-card decision — routed_by_advice with both pass rates
+    and sample counts, the same six fields M6 slice 3 established for single
+    runs — is recorded here under the batch-card id, joined to the run by
+    run_id. The entry is flagged batch_routing_decision so
+    compute_routing_weights() and ledger backfill-pass skip it: it is a
+    decision record, not a run outcome, and must not inflate run counts or
+    pass rates. A ledger write failure must not fail the batch, so it is
+    reported and the batch summary (which always records the decision)
+    stays authoritative.
+    """
+    try:
+        entry = {"id": f"batch-{summary['id']}-{row['card']}", "run_id": row.get("run_id"),
+                 "ts": NOW(), "title": f"batch {row['card']} routing decision",
+                 "status": "dispatched", "batch_id": summary["id"], "card": row["card"],
+                 "backend": row.get("backend"), "model": row.get("model"),
+                 "card_type": card_type, "scope": summary.get("scope"),
+                 "batch_routing_decision": True, "weighted_routing": weighted_info,
+                 "seconds": None}
+        if decision is not None and decision.get("routed_by_advice"):
+            entry.update({"routed_by_advice": True,
+                          "routed_from": decision.get("routed_from"),
+                          "advice_pass_rate": decision.get("advice_pass_rate"),
+                          "advice_samples": decision.get("advice_samples"),
+                          "actual_pass_rate": decision.get("actual_pass_rate"),
+                          "actual_samples": decision.get("actual_samples")})
+        append_ledger(entry)
+    except OSError as error:
+        print(f"openswarm: warning: could not record routing decision for {row['card']} in ledger: {error}",
+              file=sys.stderr)
+
+
 def batch_plan(cards_dir):
     """Validate a cards directory and return its dispatch plan in topo order.
 
@@ -10451,7 +10550,18 @@ def batch_collect(spec, row, result):
             "summary": short((result.get("result") or {}).get("summary") or result.get("summary"), 200)}
 
 
-def batch_launch(spec, row, base=None):
+def batch_launch(spec, row, base=None, backend=_UNSET, model=_UNSET):
+    """Dispatch one card to its host's `run --detach`.
+
+    backend/model override spec when given (M7 slice 1, #122: the batch
+    controller passes the per-card weighted-routing pick); _UNSET means
+    "use the spec value", so a batch backend of None still means "pass no
+    --backend flag and let the remote run route itself".
+    """
+    if backend is _UNSET:
+        backend = spec.get("backend")
+    if model is _UNSET:
+        model = spec.get("model")
     host = spec["hosts"][row["host"]]
     with open(row["path"], "rb") as stream:
         # depends_on is planner metadata (M4 slice 1, #106); strip it so the
@@ -10472,9 +10582,11 @@ def batch_launch(spec, row, base=None):
     try:
         args = ["run", "--detach", "--cwd", spec["repos"][row["host"]], "--task-file", path, "--base", base,
                 "--scope", spec.get("scope", "repo")]
+        routed = {"backend": backend, "model": model}
         for key in ("backend", "model", "effort", "verify", "budget_minutes", "card_type", "rework_of"):
-            if spec.get(key) is not None:
-                args += ["--" + key.replace("_", "-"), str(spec[key])]
+            value = routed[key] if key in routed else spec.get(key)
+            if value is not None:
+                args += ["--" + key.replace("_", "-"), str(value)]
         if spec.get("backends_file"):
             args += ["--backends-file", spec["backends_file"]]
         if spec.get("paths"):
@@ -10485,9 +10597,14 @@ def batch_launch(spec, row, base=None):
         host_python(host, "import os, sys; os.unlink(sys.argv[1])", [path])
 
 
-def batch_provider_slot_available(spec, row):
+def batch_provider_slot_available(spec, row, backend=_UNSET):
+    """Provider-concurrency slot check for one card's effective backend (M7
+    slice 1, #122: a rerouted card consumes the advised backend's slot, not
+    the batch default's). _UNSET means "use the spec backend"."""
+    if backend is _UNSET:
+        backend = spec.get("backend")
     caps = spec.get("concurrency") or {}
-    if not isinstance(caps, dict) or not caps or not spec.get("backend"):
+    if not isinstance(caps, dict) or not caps or not backend:
         return True
     hosts = fleet_config()
     target_host = hosts[row["host"]]
@@ -10499,8 +10616,8 @@ def batch_provider_slot_available(spec, row):
         target_snapshot = host_json(target_host, ["fleet", "_snapshot"], timeout=20, capacity_only=True)
     except RuntimeError:
         return False
-    provider = ((target_snapshot.get("providers") or {}).get(spec["backend"])) or spec.get("provider")
-    keys = concurrency_keys(spec["backend"], provider)
+    provider = ((target_snapshot.get("providers") or {}).get(backend)) or spec.get("provider")
+    keys = concurrency_keys(backend, provider)
     limits = provider_concurrency_limits({"concurrency": caps}, keys)
     if not limits:
         return True
@@ -10530,7 +10647,8 @@ def batch_provider_slot_available(spec, row):
 
 
 def execute_batch(spec, summary):
-    validate_card_type(load_policy(), spec.get("card_type"))
+    policy = load_policy()
+    validate_card_type(policy, spec.get("card_type"))
     summary.update(state="running", runner_pid=os.getpid())
     blocked_hosts = set()
     batch_save(summary)
@@ -10616,17 +10734,36 @@ def execute_batch(spec, summary):
                         # no live run can be hiding behind this card.
                         batch_change(summary, row, "finished", status="failed", summary=str(e))
                         continue
+                    # M7 slice 1 (#122): per-card weighted routing, same
+                    # decision path as single runs. With routing.weighted
+                    # false this returns the spec backend/model with no info
+                    # and touches nothing, so dispatch stays byte-identical.
+                    eff_backend, eff_model, weighted_info, eff_decision = batch_weighted_route(spec, policy)
                     lock_path = os.path.join(DATA, "fleet-provider-concurrency.lock")
                     with open(lock_path, "a") as lock:
                         _flock(lock, LOCK_EX)
-                        if not batch_provider_slot_available(spec, row):
+                        if not batch_provider_slot_available(spec, row, backend=eff_backend):
                             continue
                         try:
-                            row["run_id"] = batch_launch(spec, row, base=base)
+                            row["run_id"] = batch_launch(spec, row, base=base,
+                                                         backend=eff_backend, model=eff_model)
                             row["started"] = NOW()
                             row["base"] = base or spec["base"]
                             if stacked_on:
                                 row["stacked_on"] = stacked_on
+                            if weighted_info is not None:
+                                row["backend"] = eff_backend
+                                row["model"] = eff_model
+                                row["weighted_routing"] = weighted_info
+                                if eff_decision is not None and eff_decision.get("routed_by_advice"):
+                                    row["routed_by_advice"] = True
+                                    row["routed_from"] = eff_decision.get("routed_from")
+                                    row["advice_pass_rate"] = eff_decision.get("advice_pass_rate")
+                                    row["advice_samples"] = eff_decision.get("advice_samples")
+                                    row["actual_pass_rate"] = eff_decision.get("actual_pass_rate")
+                                    row["actual_samples"] = eff_decision.get("actual_samples")
+                                batch_record_routing_decision(summary, row, spec.get("card_type"),
+                                                            weighted_info, eff_decision)
                             batch_change(summary, row, "started", status="running")
                             count += 1
                         except (OSError, ValueError, RuntimeError, KeyError) as e:
@@ -10704,6 +10841,10 @@ def cmd_batch(args, policy):
     spec = {"id": bid, "repo": args.repo, "repo_path": repo, "base": base, "local": local, "hosts": chosen,
             "repos": {name: host_repo(host, args.repo, local=host["kind"] == "local") for name, host in chosen.items()},
             "per_host": args.per_host, "backend": backend, "provider": execution_provider(backend, decision, policy),
+            # M7 slice 1 (#122): only a user-explicit --backend wins over
+            # weighted routing; a backend from the creation-time route() is
+            # the default pick and may be rerouted per card.
+            "backend_explicit": bool(args.backend),
             "backends_file": getattr(args, "backends_file", None),
             "concurrency": concurrency_caps, "model": args.model, "effort": args.effort,
             "card_type": getattr(args, "card_type", None), "rework_of": getattr(args, "rework_of", None),

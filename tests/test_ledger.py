@@ -265,6 +265,27 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(fleet_result["updated"], 1)
         self.assertTrue(json.loads(fleet.read_text())["exec_pass"])
 
+    def test_backfill_pass_skips_batch_routing_decisions(self):
+        """M7 slice 1 (#122): a batch routing-decision record is not a run
+        outcome, so backfill-pass must not stamp exec_pass on it (a stamped
+        False would later count as a failed run in routing weights)."""
+        Path(xs.LEDGER).parent.mkdir(parents=True)
+        Path(xs.LEDGER).write_text("".join(json.dumps(record) + "\n" for record in (
+            {"id": "batch-x-one.md", "run_id": "fake-run", "status": "dispatched",
+             "backend": "ocgo", "model": "m2", "card_type": "fix",
+             "batch_routing_decision": True, "routed_by_advice": True,
+             "advice_pass_rate": 1.0, "advice_samples": 1,
+             "actual_pass_rate": 0.5, "actual_samples": 2},
+            {"id": "done-run", "status": "done", "commit": "abc", "verify_requested": False},
+        )))
+        result = self.run_ledger_command("backfill-pass")
+        rows = {record["id"]: record for record in
+                (json.loads(line) for line in Path(xs.LEDGER).read_text().splitlines())}
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["skipped"], 1)
+        self.assertNotIn("exec_pass", rows["batch-x-one.md"])
+        self.assertTrue(rows["done-run"]["exec_pass"])
+
     def pull_list_endpoint(self, repo, page=1):
         query = urllib.parse.urlencode({"state": "all", "sort": "updated", "direction": "desc",
                                         "per_page": 100, "page": page})
