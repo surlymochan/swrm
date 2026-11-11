@@ -2177,11 +2177,13 @@ def compute_routing_weights(entries, min_samples=8):
     for entry in entries:
         if not isinstance(entry, dict) or not entry.get("backend"):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid"):
             # M7 slice 1 (#122) / slice 2 (#124): a batch or fleet
             # routing-decision record is not a run outcome — it must not
             # inflate run counts or pass rates. A fleet-health reap record
             # (M12 slice 2, #148) is likewise an action log, not an outcome.
+            # A batch verify-evalid record (M13 slice 1, #151) is likewise
+            # a verification record, not a second run outcome.
             continue
         key = (entry.get("backend"), entry.get("model"), entry.get("card_type"))
         groups.setdefault(key, []).append(entry)
@@ -2452,7 +2454,7 @@ def compute_advice_accuracy(entries):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -2570,7 +2572,7 @@ def compute_weighted_eval(entries, margin=0.10, plan_ok=None):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -10237,11 +10239,12 @@ def cmd_ledger_backfill_pass(args):
                 continue
             if not isinstance(entry, dict):
                 continue
-            if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap"):
+            if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid"):
                 # M7 slice 1 (#122) / slice 2 (#124): a batch or fleet
                 # routing-decision record is not a run outcome — backfill
                 # must not stamp exec_pass on it. Same for a fleet-health
-                # reap record (M12 slice 2, #148).
+                # reap record (M12 slice 2, #148) and a batch verify-evalid
+                # record (M13 slice 1, #151).
                 skipped += 1
                 continue
             status = entry.get("status")
@@ -10614,6 +10617,51 @@ def strip_card_dependencies(text):
     return re.sub(r"^depends_on:[^\n]*\n?", "", text, flags=re.MULTILINE)
 
 
+_VERIFY_EVALID_RE = re.compile(r"^verify-evalid:[ \t]*([^\n]*?)[ \t]*$", re.MULTILINE)
+
+
+def parse_card_verify_evalid(text):
+    """Declared per-card evalid verification from a card's `verify-evalid:` line.
+
+    One line, e.g. `verify-evalid: true`. Accepted values are true/yes/1
+    (case-insensitive) for on and false/no/0 for off; anything else is a
+    hard error naming the card and the fix — an unrecognised value must
+    never silently mean "plain verify". No such line means off.
+    """
+    match = _VERIFY_EVALID_RE.search(text)
+    if not match:
+        return False
+    raw = match.group(1).strip().lower()
+    if raw in ("true", "yes", "1"):
+        return True
+    if raw in ("false", "no", "0", ""):
+        return False
+    raise ValueError(
+        "invalid verify-evalid value %r: use `verify-evalid: true` or remove the line "
+        "(accepted: true/yes/1, false/no/0)" % match.group(1).strip())
+
+
+def strip_card_verify_evalid(text):
+    """Remove the planner-only `verify-evalid:` line before dispatch.
+
+    Like `depends_on:` (M4 slice 1, #106), the declaration is planner
+    metadata; the executor only ever sees the task text. Accepts str or
+    bytes and preserves everything else byte-for-byte.
+    """
+    if isinstance(text, bytes):
+        return re.sub(rb"^verify-evalid:[^\n]*\n?", b"", text, flags=re.MULTILINE)
+    return re.sub(r"^verify-evalid:[^\n]*\n?", "", text, flags=re.MULTILINE)
+
+
+def strip_card_planner_lines(text):
+    """Remove every planner-only declaration line before dispatch.
+
+    `depends_on:` (M4) and `verify-evalid:` (M13 slice 1, #151) are both
+    planner metadata; the executor only ever sees the task text.
+    """
+    return strip_card_verify_evalid(strip_card_dependencies(text))
+
+
 def topo_sort_cards(deps_by_card):
     """Order batch cards so every dependency precedes its dependents.
 
@@ -10757,6 +10805,54 @@ def batch_record_routing_decision(summary, row, card_type, weighted_info, decisi
               file=sys.stderr)
 
 
+def batch_record_verify_evalid(summary, row, result, card_type=None):
+    """Ledger entry for one batch card's evalid verification (M13 slice 1, #151).
+
+    Mirrors batch_record_routing_decision: the controller ledger is where
+    batch outcomes are read (a remote run writes its own ledger on the
+    executor host), so the claim-vs-evidence verdict — the same
+    `verify_evalid` dict single runs record (M2 slice 1, #99: mode, verdict,
+    claim, replay, error) — is copied here under the batch-card id, joined
+    to the run by run_id. The entry is flagged batch_verify_evalid so
+    compute_routing_weights() and the ledger backfill-pass skip it: it is a
+    verification record, not a run outcome, and must not inflate run counts
+    or pass rates. When the remote run carried no verify_evalid record even
+    though one was requested (old remote binary, or evalid failed before
+    audit), that is recorded as verdict "error" with an explicit reason —
+    never silently treated as a plain-verify pass. A ledger write failure
+    must not fail the batch, so it is reported and the batch summary (which
+    always records the verdict) stays authoritative.
+    """
+    ve = (result or {}).get("verify_evalid") if isinstance(result, dict) else None
+    if isinstance(ve, dict) and ve.get("verdict") in ("pass", "mismatch", "error"):
+        verdict, error = ve["verdict"], ve.get("error")
+        replay = ve.get("replay")
+    else:
+        verdict = "error"
+        error = ("remote run returned no verify_evalid record for a card that requested it "
+                 "(remote swrm predates M13, or evalid failed before audit)")
+        replay, ve = None, None
+    try:
+        entry = {"id": f"batch-{summary['id']}-{row['card']}", "run_id": row.get("run_id"),
+                 "ts": NOW(), "title": f"batch {row['card']} verify-evalid {verdict}",
+                 "status": "dispatched", "batch_id": summary["id"], "card": row["card"],
+                 "backend": row.get("backend"), "model": row.get("model"),
+                 "card_type": card_type, "scope": summary.get("scope"),
+                 "batch_verify_evalid": True, "verify_evalid_verdict": verdict,
+                 "verify_evalid": ve if ve is not None else {"mode": "verify-evalid",
+                                                             "verdict": verdict, "error": error,
+                                                             "claim": "", "replay": None},
+                 "seconds": row.get("seconds")}
+        if error:
+            entry["error"] = error
+        if isinstance(replay, dict):
+            entry["verify_evalid_replay_verdict"] = replay.get("verdict")
+        append_ledger(entry)
+    except OSError as error:
+        print(f"openswarm: warning: could not record verify-evalid for {row['card']} in ledger: {error}",
+              file=sys.stderr)
+
+
 def fleet_run_arg_parser():
     """Minimal parser for the forwarded `run` flags fleet weighted routing
     needs (M7 slice 2, #124). parse_known_args: every other flag passes
@@ -10890,20 +10986,39 @@ def fleet_exec_run_id(out):
 def batch_plan(cards_dir):
     """Validate a cards directory and return its dispatch plan in topo order.
 
-    Returns {"cards": [{"card", "depends_on", "order"}], "order": [names]}.
-    Raises ValueError for an empty directory or any invalid dependency.
+    Returns {"cards": [{"card", "depends_on", "verify_evalid", "order"}], "order": [names]}.
+    Raises ValueError for an empty directory, any invalid dependency, or an
+    invalid `verify-evalid:` value (M13 slice 1, #151).
     """
     paths = sorted(path for path in glob.glob(os.path.join(os.path.abspath(cards_dir), "*"))
                    if os.path.isfile(path))
     if not paths:
         raise ValueError("cards directory contains no files")
-    deps = {}
+    deps, evalid = {}, {}
     for path in paths:
         with open(path, encoding="utf-8", errors="replace") as stream:
-            deps[os.path.basename(path)] = parse_card_dependencies(stream.read())
+            text = stream.read()
+        name = os.path.basename(path)
+        deps[name] = parse_card_dependencies(text)
+        try:
+            evalid[name] = parse_card_verify_evalid(text)
+        except ValueError as error:
+            raise ValueError(f"card {name!r}: {error}")
     order = topo_sort_cards(deps)
-    cards = [{"card": name, "depends_on": deps[name], "order": i} for i, name in enumerate(order)]
+    cards = [{"card": name, "depends_on": deps[name], "verify_evalid": evalid[name], "order": i}
+             for i, name in enumerate(order)]
     return {"cards": cards, "order": order}
+
+
+def batch_verify_evalid_requested(spec, row):
+    """True when one batch card runs under --verify-evalid (M13 slice 1, #151).
+
+    Effective per card: the batch-level `--verify-evalid` flag applies to
+    every card, or the card itself declares `verify-evalid: true`. Either
+    source requires a `--verify` command; the check lives in cmd_batch /
+    batch_launch so a missing --verify fails before any dispatch.
+    """
+    return bool(spec.get("verify_evalid") or row.get("verify_evalid"))
 
 
 def batch_dependencies_finished(summary, row):
@@ -11061,9 +11176,18 @@ def batch_collect(spec, row, result):
                          "remote branch cleanup")
     if commit:
         batch_verify_stacked(spec, row, commit)
-    return {"status": result.get("status") or "failed", "verify_rc": (result.get("verify") or {}).get("rc"),
-            "branch": branch, "commit": commit, "seconds": result.get("seconds"),
-            "summary": short((result.get("result") or {}).get("summary") or result.get("summary"), 200)}
+    # M13 slice 1 (#151): carry the remote run's claim-vs-evidence record
+    # into the batch row (the controller ledger copy is written by
+    # batch_record_verify_evalid at the call site). A missing record stays
+    # None here — the ledger entry, not this field, reports it as error.
+    ve = result.get("verify_evalid") if isinstance(result, dict) else None
+    fields = {"status": result.get("status") or "failed", "verify_rc": (result.get("verify") or {}).get("rc"),
+              "branch": branch, "commit": commit, "seconds": result.get("seconds"),
+              "summary": short((result.get("result") or {}).get("summary") or result.get("summary"), 200)}
+    if isinstance(ve, dict):
+        fields["verify_evalid"] = ve
+        fields["verify_evalid_verdict"] = ve.get("verdict")
+    return fields
 
 
 def batch_launch(spec, row, base=None, backend=_UNSET, model=_UNSET):
@@ -11078,11 +11202,19 @@ def batch_launch(spec, row, base=None, backend=_UNSET, model=_UNSET):
         backend = spec.get("backend")
     if model is _UNSET:
         model = spec.get("model")
+    # M13 slice 1 (#151): guardrail — a card that requests --verify-evalid
+    # without a --verify command is a loud failure before any dispatch,
+    # never a silent plain-verify run. The remote run re-checks this
+    # itself (M2 fail-fast), so a hand-built spec cannot slip through.
+    if batch_verify_evalid_requested(spec, row) and not spec.get("verify"):
+        raise ValueError("--verify-evalid requires --verify: evalid can only replay "
+                         f"a claimed acceptance command (card {row.get('card')!r})")
     host = spec["hosts"][row["host"]]
     with open(row["path"], "rb") as stream:
-        # depends_on is planner metadata (M4 slice 1, #106); strip it so the
-        # executor only ever sees the task text.
-        card = strip_card_dependencies(stream.read())
+        # depends_on (M4 slice 1, #106) and verify-evalid: (M13 slice 1,
+        # #151) are planner metadata; strip them so the executor only ever
+        # sees the task text.
+        card = strip_card_planner_lines(stream.read())
     base = base or spec["base"]
     if base != spec["base"]:
         # M4 slice 2 (#108): the successor starts from its predecessor's
@@ -11107,6 +11239,16 @@ def batch_launch(spec, row, base=None, backend=_UNSET, model=_UNSET):
             args += ["--backends-file", spec["backends_file"]]
         if spec.get("paths"):
             args += ["--paths", *spec["paths"]]
+        # M13 slice 1 (#151): per-card --verify-evalid, forwarded only to
+        # cards that requested it (batch flag or card declaration). The
+        # remote run's own fail-fast covers an evalid binary that is
+        # missing/unusable on the executor host: it exits 2 with
+        # error_class evalid_unavailable and never falls back to plain
+        # verify, so the batch records that card failed instead.
+        if batch_verify_evalid_requested(spec, row):
+            args += ["--verify-evalid"]
+            if spec.get("evalid_bin"):
+                args += ["--evalid-bin", spec["evalid_bin"]]
         reply = host_json(host, args)
         return safe_id(reply["id"])
     finally:
@@ -11207,6 +11349,14 @@ def execute_batch(spec, summary):
                             row["terminal_seen"] = True
                             fields = batch_collect(spec, row, info.get("result") or {"status": "failed"})
                             batch_change(summary, row, "finished", **fields)
+                            if batch_verify_evalid_requested(spec, row):
+                                # M13 slice 1 (#151): copy the remote run's
+                                # claim-vs-evidence verdict into the
+                                # controller ledger (remote ledger lives on
+                                # the executor host). A missing record is an
+                                # explicit error entry, never a silent pass.
+                                batch_record_verify_evalid(summary, row, info.get("result") or {},
+                                                           spec.get("card_type"))
                         elif NOW() - row["started"] > spec["budget_minutes"] * 60 + 180:
                             raise RuntimeError(f"{name}: run exceeded its reporting deadline")
                         else:
@@ -11322,6 +11472,12 @@ def cmd_batch(args, policy):
         if not spec or not summary:
             raise ValueError("no such batch")
         validate_card_type(policy, spec.get("card_type"))
+        # M13 slice 1 (#151): a resumed batch that requests --verify-evalid
+        # without --verify fails before any dispatch, like a fresh batch.
+        for row in summary.get("cards") or []:
+            if batch_verify_evalid_requested(spec, row) and not spec.get("verify"):
+                raise ValueError("--verify-evalid requires --verify: evalid can only replay "
+                                 f"a claimed acceptance command (card {row.get('card')!r})")
         raise SystemExit(execute_batch(spec, summary))
     if not args.repo or not args.cards or not args.hosts:
         raise ValueError("batch requires --repo, --cards and --hosts")
@@ -11340,6 +11496,13 @@ def cmd_batch(args, policy):
     base = host_require(local, host_git(local, repo, ["rev-parse", "--verify", "--end-of-options",
                                                     (args.base or "HEAD") + "^{commit}"]), "base resolution").decode().strip()
     plan = batch_plan(args.cards)
+    # M13 slice 1 (#151): guardrail — --verify-evalid (batch flag or any
+    # card's `verify-evalid: true`) without --verify fails before any host
+    # is woken or card dispatched, never a silent plain-verify batch.
+    verify_evalid = getattr(args, "verify_evalid", False)
+    if (verify_evalid or any(entry["verify_evalid"] for entry in plan["cards"])) and not args.verify:
+        raise ValueError("--verify-evalid requires --verify: evalid can only replay "
+                         "a claimed acceptance command")
     paths = [os.path.join(os.path.abspath(args.cards), entry["card"]) for entry in plan["cards"]]
     minutes = args.budget_minutes if args.budget_minutes is not None else policy["run"]["timeout_seconds"] / 60
     backend = args.backend
@@ -11365,13 +11528,23 @@ def cmd_batch(args, policy):
             "concurrency": concurrency_caps, "model": args.model, "effort": args.effort,
             "card_type": getattr(args, "card_type", None), "rework_of": getattr(args, "rework_of", None),
             "paths": getattr(args, "paths", None) or [],
-            "verify": args.verify, "scope": getattr(args, "scope", "repo"),
+            "verify": args.verify,
+            # M13 slice 1 (#151): batch-level --verify-evalid applies to
+            # every card; --evalid-bin is forwarded verbatim (the binary
+            # lives on the executor host, so the controller never resolves
+            # it — the remote run's fail-fast is the unavailability guard).
+            "verify_evalid": verify_evalid, "evalid_bin": getattr(args, "evalid_bin", None),
+            "scope": getattr(args, "scope", "repo"),
             "budget_minutes": args.budget_minutes or round(policy["run"]["timeout_seconds"] / 60),
             "poll_seconds": args.poll_seconds}
     summary = {"id": bid, "repo": args.repo, "base": base, "scope": getattr(args, "scope", "repo"),
                "state": "queued", "started": NOW(), "plan": plan["cards"], "cards": [
         {"card": os.path.basename(path), "path": path, "host": names[i % len(names)], "state": "queued", "status": "queued",
          "depends_on": plan["cards"][i]["depends_on"], "order": i,
+         # M13 slice 1 (#151): effective per-card flag (batch flag or the
+         # card's own declaration); the verdict lands here at collection.
+         "verify_evalid": bool(verify_evalid or plan["cards"][i]["verify_evalid"]),
+         "verify_evalid_verdict": None,
          "verify_rc": None, "branch": None, "commit": None, "seconds": None, "summary": ""} for i, path in enumerate(paths)]}
     directory = os.path.join(DATA, "batches", bid)
     jsave(os.path.join(directory, "spec.json"), spec)
@@ -14373,6 +14546,15 @@ def main():
     sp.add_argument("--backends-file", help="custom backends config (JSON, M3 slice 1, #101); "
                                             "defaults to $OPENSWARM_HOME/backends.json; "
                                             "passed through to each run")
+    sp.add_argument("--verify-evalid", action="store_true",
+                    help="verify every card with evalid: replay the executor's claimed test command in a clean "
+                         "clone via `xflow audit` and record the claim-vs-replay verdict in the ledger "
+                         "(M13 slice 1, #151); a card may instead declare `verify-evalid: true` on its own line; "
+                         "requires --verify; fails loudly when evalid is unavailable, never falls back to "
+                         "plain verify")
+    sp.add_argument("--evalid-bin", help="evalid binary forwarded to each run: path to xflow, or to a "
+                                         "bin/xflow.js checkout (run via node); overrides EVALID_BIN, xflow on "
+                                         "PATH, and the sibling ../evalid checkout on the executor host")
     sp.add_argument("--base")
     sp.add_argument("--scope", choices=("repo", "host"), default="repo", help="task scope (repo by default; host for authorized host operations)")
     sp.add_argument("--detach", action="store_true")

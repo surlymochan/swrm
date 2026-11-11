@@ -3,7 +3,8 @@ usage: openswarm batch [-h] [--repo REPO] [--cards CARDS] [--hosts HOSTS]
                        [--backend {codex,ocgo,deepseek,cursor,agy,pi,hermes,copilot}]
                        [--model MODEL] [--effort EFFORT] [--verify VERIFY]
                        [--budget-minutes BUDGET_MINUTES]
-                       [--backends-file BACKENDS_FILE] [--base BASE]
+                       [--backends-file BACKENDS_FILE] [--verify-evalid]
+                       [--evalid-bin EVALID_BIN] [--base BASE]
                        [--scope {repo,host}] [--detach]
                        [--card-type CARD_TYPE] [--rework-of REWORK_OF]
                        [--paths PATHS [PATHS ...]]
@@ -28,6 +29,18 @@ options:
                         custom backends config (JSON, M3 slice 1, #101);
                         defaults to $OPENSWARM_HOME/backends.json; passed
                         through to each run
+  --verify-evalid       verify every card with evalid: replay the executor's
+                        claimed test command in a clean clone via `xflow
+                        audit` and record the claim-vs-replay verdict in the
+                        ledger (M13 slice 1, #151); a card may instead declare
+                        `verify-evalid: true` on its own line; requires
+                        --verify; fails loudly when evalid is unavailable,
+                        never falls back to plain verify
+  --evalid-bin EVALID_BIN
+                        evalid binary forwarded to each run: path to xflow, or
+                        to a bin/xflow.js checkout (run via node); overrides
+                        EVALID_BIN, xflow on PATH, and the sibling ../evalid
+                        checkout on the executor host
   --base BASE
   --scope {repo,host}   task scope (repo by default; host for authorized host
                         operations)

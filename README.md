@@ -578,7 +578,14 @@ has dependencies, its run starts from the latest finished dependency's branch HE
 predecessor's change; the stacked commits are recorded in the batch's `summary.json` as `stacked_on`, and
 collection verifies each stacked commit is an ancestor of the result commit. If a dependency finishes without
 passing (run failure or verify failure), its dependents are never dispatched: they are recorded as `blocked` in
-`summary.json`/`summary.md` and in the ledger, with `blocked_by` naming the dependency and the reason. Backend, model and effort flags are optional and pass
+`summary.json`/`summary.md` and in the ledger, with `blocked_by` naming the dependency and the reason. A card
+can also request evalid verification with a `verify-evalid: true` line (or the whole batch with
+`--verify-evalid`, plus `--evalid-bin` to point at the evalid binary on the executor host): the card's run
+replays the executor's claimed test command in a clean clone via `xflow audit`, and the claim-vs-evidence
+verdict lands in the card's `summary.json` row (`verify_evalid_verdict`) and in the controller ledger
+(`batch_verify_evalid` entry). `--verify-evalid` requires `--verify`, and a missing or unusable evalid is a
+loud per-card error, never a silent fall back to plain verify. A `mismatch` or `error` verdict downgrades the
+card from `done` to `partial`, so its dependents stay blocked like any other verify failure. Backend, model and effort flags are optional and pass
 through to each `run --detach`. One line is printed per state change; detached output goes to
 `$OPENSWARM_HOME/batches/<id>/batch.out`. Polling works without Monitor.
 

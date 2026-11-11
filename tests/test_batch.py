@@ -87,6 +87,7 @@ class FakeFleetFixture:
     def args(self, **fields):
         values = dict(batch_action=None, id=None, batch_id=None, repo="project", cards=str(self.cards), hosts="b1,b2",
                       per_host=1, backend="pi", model="cheap", effort=None, verify="true", budget_minutes=1,
+                      verify_evalid=False, evalid_bin=None,
                       base=None, detach=False, poll_seconds=0.001)
         values.update(fields)
         return argparse.Namespace(**values)
@@ -386,9 +387,9 @@ class BatchPlanTests(FakeFleetFixture, unittest.TestCase):
         plan = self.plan()
         self.assertEqual(plan["order"], ["a.md", "b.md", "c.md"])
         self.assertEqual(plan["cards"], [
-            {"card": "a.md", "depends_on": [], "order": 0},
-            {"card": "b.md", "depends_on": ["a.md"], "order": 1},
-            {"card": "c.md", "depends_on": ["a.md", "b.md"], "order": 2},
+            {"card": "a.md", "depends_on": [], "verify_evalid": False, "order": 0},
+            {"card": "b.md", "depends_on": ["a.md"], "verify_evalid": False, "order": 1},
+            {"card": "c.md", "depends_on": ["a.md", "b.md"], "verify_evalid": False, "order": 2},
         ])
 
     def test_plan_without_dependencies_keeps_filename_order(self):
@@ -427,8 +428,8 @@ class BatchPlanTests(FakeFleetFixture, unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual([row["card"] for row in summary["cards"]], ["a.md", "b.md"])
         self.assertEqual(summary["plan"], [
-            {"card": "a.md", "depends_on": [], "order": 0},
-            {"card": "b.md", "depends_on": ["a.md"], "order": 1},
+            {"card": "a.md", "depends_on": [], "verify_evalid": False, "order": 0},
+            {"card": "b.md", "depends_on": ["a.md"], "verify_evalid": False, "order": 1},
         ])
         self.assertEqual(summary["cards"][1]["depends_on"], ["a.md"])
         self.assertEqual(summary["cards"][1]["order"], 1)
@@ -811,6 +812,125 @@ class BatchWeightedRoutingTests(FakeFleetFixture, unittest.TestCase):
         # Only the dispatched card gets a routing-decision record.
         self.assertEqual(len(self.decision_entries()), 1)
         self.assertEqual(self.decision_entries()[0]["card"], "a.md")
+
+
+class BatchVerifyEvalidTests(FakeFleetFixture, unittest.TestCase):
+    """M13 slice 1 (#151): batch-path --verify-evalid end to end through the
+    fake fleet transport (the stub mirrors the real run's verify_evalid
+    record: pass, or mismatch when the card says EVALID-MISMATCH)."""
+
+    def start_events(self):
+        events = []
+        for host in ("b1", "b2"):
+            path = self.root / host / "data" / "calls.jsonl"
+            if path.exists():
+                events.extend(json.loads(line) for line in path.read_text().splitlines())
+        return [e for e in events if e["event"] == "start"]
+
+    def ledger_entries(self):
+        path = self.data / "ledger.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+    def ve_entries(self):
+        return [e for e in self.ledger_entries() if e.get("batch_verify_evalid")]
+
+    def test_per_card_declaration_forwards_flag_only_to_that_card(self):
+        (self.cards / "a.md").write_text("verify-evalid: true\ntask a")
+        (self.cards / "b.md").write_text("task b")
+        rc, summary, _ = self.run_batch()
+        self.assertEqual(rc, 0)
+        starts = {e["card"].strip().splitlines()[-1]: e for e in self.start_events()}
+        self.assertTrue(starts["task a"]["args"]["verify_evalid"])
+        self.assertFalse(starts["task b"]["args"]["verify_evalid"])
+        # The executor never sees the planner-only declaration line.
+        self.assertNotIn("verify-evalid:", starts["task a"]["card"])
+        a_row, b_row = summary["cards"]
+        self.assertTrue(a_row["verify_evalid"])
+        self.assertEqual(a_row["verify_evalid_verdict"], "pass")
+        self.assertEqual(a_row["verify_evalid"]["replay"]["verdict"], "verified")
+        self.assertFalse(b_row["verify_evalid"])
+        self.assertIsNone(b_row["verify_evalid_verdict"])
+        entries = self.ve_entries()
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["card"], "a.md")
+        self.assertEqual(entry["run_id"], a_row["run_id"])
+        self.assertEqual(entry["verify_evalid_verdict"], "pass")
+        self.assertIn("true", entry["verify_evalid"]["claim"])
+        self.assertEqual(entry["verify_evalid_replay_verdict"], "verified")
+
+    def test_batch_flag_applies_to_all_cards_and_forwards_evalid_bin(self):
+        (self.cards / "a.md").write_text("task a")
+        (self.cards / "b.md").write_text("task b")
+        # The fake bin lives in the platform temp dir: a POSIX "/tmp/..."
+        # literal is rewritten to the Windows Temp dir by MSYS path
+        # conversion when the batch forwards it through `sh -c` on
+        # Windows, so build it from gettempdir() instead.
+        fake_bin = os.path.join(tempfile.gettempdir(), "fake-xflow")
+        rc, summary, _ = self.run_batch(verify_evalid=True, evalid_bin=fake_bin)
+        self.assertEqual(rc, 0)
+        starts = self.start_events()
+        self.assertEqual(len(starts), 2)
+        for start in starts:
+            self.assertTrue(start["args"]["verify_evalid"])
+            self.assertEqual(start["args"]["evalid_bin"], fake_bin)
+        self.assertTrue(all(row["verify_evalid"] for row in summary["cards"]))
+        self.assertTrue(all(row["verify_evalid_verdict"] == "pass" for row in summary["cards"]))
+        self.assertEqual(len(self.ve_entries()), 2)
+        spec = json.loads((self.data / "batches" / summary["id"] / "spec.json").read_text())
+        self.assertTrue(spec["verify_evalid"])
+        self.assertEqual(spec["evalid_bin"], fake_bin)
+
+    def test_mismatch_downgrades_and_blocks_dependent(self):
+        (self.cards / "a.md").write_text("verify-evalid: true\nEVALID-MISMATCH task a")
+        (self.cards / "b.md").write_text("depends_on: a.md\ntask b")
+        rc, summary, _ = self.run_batch()
+        self.assertEqual(rc, 1)
+        a_row, b_row = summary["cards"]
+        self.assertEqual(a_row["status"], "partial")
+        self.assertEqual(a_row["verify_evalid_verdict"], "mismatch")
+        self.assertEqual(b_row["status"], "blocked")
+        self.assertEqual(b_row["blocked_by"], "a.md")
+        entries = self.ve_entries()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["verify_evalid_verdict"], "mismatch")
+        self.assertEqual(entries[0]["verify_evalid_replay_verdict"], "mismatch")
+
+    def test_card_declaration_without_verify_is_a_loud_error(self):
+        (self.cards / "a.md").write_text("verify-evalid: true\ntask a")
+        with self.assertRaises(ValueError) as ctx:
+            self.run_batch(verify=None)
+        self.assertIn("--verify-evalid requires --verify", str(ctx.exception))
+        self.assertFalse(list((self.data / "batches").glob("*/summary.json")))
+
+    def test_batch_flag_without_verify_is_a_loud_error(self):
+        (self.cards / "a.md").write_text("task a")
+        with self.assertRaises(ValueError) as ctx:
+            self.run_batch(verify=None, verify_evalid=True)
+        self.assertIn("--verify-evalid requires --verify", str(ctx.exception))
+        self.assertFalse(list((self.data / "batches").glob("*/summary.json")))
+
+    def test_invalid_verify_evalid_value_is_a_loud_error(self):
+        (self.cards / "a.md").write_text("verify-evalid: maybe\ntask a")
+        with self.assertRaises(ValueError) as ctx:
+            self.run_batch()
+        self.assertIn("a.md", str(ctx.exception))
+        self.assertIn("maybe", str(ctx.exception))
+        self.assertFalse(list((self.data / "batches").glob("*/summary.json")))
+
+    def test_plan_includes_per_card_verify_evalid(self):
+        (self.cards / "a.md").write_text("verify-evalid: true\ntask a")
+        (self.cards / "b.md").write_text("task b")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            xs.cmd_batch(self.args(batch_action="plan"), xs.load_policy())
+        plan = json.loads(output.getvalue())
+        self.assertEqual(plan["cards"], [
+            {"card": "a.md", "depends_on": [], "verify_evalid": True, "order": 0},
+            {"card": "b.md", "depends_on": [], "verify_evalid": False, "order": 1},
+        ])
 
 
 if __name__ == "__main__":
