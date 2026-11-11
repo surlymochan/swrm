@@ -25,6 +25,7 @@ Subcommands:
   bus-worker       run the reference GitHub issue bus executor
   watch            stream actionable events (progress, risk, stalls) for one or more runs
   runs / report    snapshot of recent runs / compact scheduled check-in
+  diagnose         classify a failed run: cause + evidence pointers (read-only)
   resume           recover active runs and recent results after planner restart
   retro            weekly fleet retrospective (Markdown report + JSON summary)
   stop             terminate a run (partial work is still committed to its branch)
@@ -11982,6 +11983,235 @@ def run_digest(rid):
     return out
 
 
+# ---------------------------------------------------------------- failure diagnosis (M10 slice 1, #137)
+# Read-only: diagnose never dispatches, retries, or mutates a run. Every
+# category must be backed by explicit evidence; when the evidence cannot pin
+# a cause the category is "unknown", never a guess.
+
+DIAGNOSE_CATEGORIES = ("timeout", "quota", "verify-fail", "exec-error", "runner-error",
+                       "stopped", "none", "unknown")
+_DIAGNOSE_RUNNER_ERROR_CLASSES = ("worktree_unavailable", "prepare_failed", "bus_error",
+                                  "executor_io_lost", "risk_blocked")
+_DIAGNOSE_EXEC_ERROR_CLASSES = ("exec_error", "model_unavailable", "auth",
+                                "upstream_forbidden", "no_report")
+_TIMEOUT_LOG_RE = re.compile(r"(timed?\s*out|deadline exceeded|context deadline|"
+                             r"execution timed out|budget exceeded)", re.I)
+
+
+def _diagnose_log_signals(rdir):
+    """Scan run event logs for explicit quota/timeout markers.
+
+    Returns [(kind, excerpt, filename)] with kind in ("quota", "timeout").
+    Only the tail of each log is read; a marker must name the cause, a bare
+    nonzero exit never counts as a signal here.
+    """
+    signals = []
+    try:
+        names = sorted(os.path.basename(p) for p in glob.glob(os.path.join(rdir, "events.*.jsonl")))
+    except OSError:
+        return signals
+    for name in names:
+        try:
+            with open(os.path.join(rdir, name), errors="ignore") as fh:
+                lines = fh.readlines()[-200:]
+        except OSError:
+            continue
+        for line in lines:
+            text = line.strip()
+            if not text:
+                continue
+            if RATE_LIMIT_RE.search(text):
+                signals.append(("quota", short(text, 200), name))
+            elif _TIMEOUT_LOG_RE.search(text):
+                signals.append(("timeout", short(text, 200), name))
+    return signals
+
+
+def diagnose_failure(run_id):
+    """Classify one finished (or dead) run from its recorded evidence.
+
+    Reads, in order: result.json, status.json, the ledger entry for the run,
+    then the run's event logs. Returns a JSON-able dict with the category, a
+    one-sentence reason, and evidence pointers (source file + field + excerpt
+    and rc where one was recorded). Raises ValueError for an unknown run id.
+    """
+    rdir = os.path.join(RUNS, run_id)
+    if not os.path.isdir(rdir):
+        raise ValueError(f"unknown run: {run_id!r} (no run directory under {RUNS})")
+    status = jload(os.path.join(rdir, "status.json"), {}) or {}
+    result = jload(os.path.join(rdir, "result.json"), {}) or {}
+    ledger_entry = {}
+    try:
+        with open(LEDGER) as stream:
+            for line in stream:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and entry.get("id") == run_id:
+                    ledger_entry = entry
+    except FileNotFoundError:
+        pass
+
+    attempts = result.get("attempts") or ledger_entry.get("attempts") or []
+    if not isinstance(attempts, list):
+        attempts = []
+    error_class = (result.get("error_class") or ledger_entry.get("error_class")
+                   or status.get("error_class"))
+    verify = result.get("verify") or ledger_entry.get("verify")
+    verify_rc = verify.get("rc") if isinstance(verify, dict) else None
+    status_value = result.get("status") or ledger_entry.get("status") or status.get("status")
+    state = status.get("state")
+    log_signals = _diagnose_log_signals(rdir)
+
+    def ev(source, pointer, excerpt=None, rc=None):
+        item = {"source": source, "pointer": pointer}
+        if excerpt is not None:
+            item["excerpt"] = short(excerpt, 200)
+        if rc is not None:
+            item["rc"] = rc
+        return item
+
+    def attempt_evidence(attempt, index, source):
+        pointer = f"attempts[{index}]"
+        if attempt.get("error_class"):
+            return ev(source, f"{pointer}.error_class", attempt.get("error_tail"),
+                      attempt.get("rc"))
+        if isinstance(attempt.get("rc"), int):
+            return ev(source, f"{pointer}.rc", attempt.get("error_tail"), attempt.get("rc"))
+        return ev(source, pointer, attempt.get("error_tail"))
+
+    attempts_source = ("result.json" if result.get("attempts")
+                       else "ledger.jsonl" if ledger_entry.get("attempts") else None)
+    error_source = ("result.json" if result.get("error_class")
+                    else "ledger.jsonl" if ledger_entry.get("error_class")
+                    else "status.json" if status.get("error_class") else None)
+    executor_failed = any(
+        (isinstance(a, dict) and (a.get("error_class") in _DIAGNOSE_EXEC_ERROR_CLASSES
+                                  or a.get("error_class") in _DIAGNOSE_RUNNER_ERROR_CLASSES
+                                  or (isinstance(a.get("rc"), int) and a["rc"] != 0)))
+        for a in attempts)
+
+    category = None
+    reason = ""
+    evidence = []
+    suspected = None
+
+    # 1. Explicit stop: the run was terminated by request, not by a failure.
+    if status.get("stop_requested") or error_class == "stopped" or any(
+            isinstance(a, dict) and a.get("error_class") == "stopped" for a in attempts):
+        category = "stopped"
+        reason = "run was stopped by request; no failure cause is recorded"
+        if error_source:
+            evidence.append(ev(error_source, "error_class", None))
+    # 2. Quota: a named rate-limit / daily-budget signal beats a generic rc.
+    elif (error_class in ("rate_limit", "budget_exceeded_daily")
+          or any(isinstance(a, dict) and a.get("error_class") == "rate_limit" for a in attempts)
+          or any(isinstance(a, dict) and a.get("rc") == 75 for a in attempts)
+          or any(kind == "quota" for kind, _, _ in log_signals)):
+        category = "quota"
+        reason = "executor hit a rate limit / quota before the run could finish"
+        if error_class in ("rate_limit", "budget_exceeded_daily"):
+            evidence.append(ev(error_source, "error_class", None))
+        for index, attempt in enumerate(attempts):
+            if isinstance(attempt, dict) and (
+                    attempt.get("error_class") == "rate_limit" or attempt.get("rc") == 75):
+                evidence.append(attempt_evidence(attempt, index, attempts_source))
+        for kind, excerpt, name in log_signals:
+            if kind == "quota":
+                evidence.append(ev(name, "log line", excerpt))
+    # 3. Timeout: budget exceeded (rc 124) or an explicit timeout marker.
+    elif (status_value == "budget_exceeded" or error_class == "budget_exceeded"
+          or any(isinstance(a, dict) and (a.get("error_class") == "budget_exceeded"
+                                          or a.get("rc") == 124) for a in attempts)
+          or any(kind == "timeout" for kind, _, _ in log_signals)):
+        category = "timeout"
+        reason = "run hit its execution budget before finishing"
+        if status_value == "budget_exceeded":
+            evidence.append(ev("result.json" if result.get("status") else "status.json",
+                               "status", None))
+        if error_class == "budget_exceeded":
+            evidence.append(ev(error_source, "error_class", None))
+        for index, attempt in enumerate(attempts):
+            if isinstance(attempt, dict) and (attempt.get("error_class") == "budget_exceeded"
+                                              or attempt.get("rc") == 124):
+                evidence.append(attempt_evidence(attempt, index, attempts_source))
+        for kind, excerpt, name in log_signals:
+            if kind == "timeout":
+                evidence.append(ev(name, "log line", excerpt))
+    # 4. Verify failure: the executor finished (rc 0) but host verify failed.
+    # When the executor itself failed, the executor failure is the cause and
+    # a failing verify is only a consequence, so this branch does not fire.
+    elif isinstance(verify_rc, int) and verify_rc != 0 and not executor_failed:
+        category = "verify-fail"
+        reason = "executor finished but host verification failed"
+        evidence.append(ev("result.json" if result.get("verify") else "ledger.jsonl",
+                           "verify.rc", result.get("verify_note"), verify_rc))
+    # 5. Runner error: the harness itself could not run the task.
+    elif (error_class in _DIAGNOSE_RUNNER_ERROR_CLASSES
+          or any(isinstance(a, dict) and a.get("error_class") in _DIAGNOSE_RUNNER_ERROR_CLASSES
+                 for a in attempts)):
+        category = "runner-error"
+        reason = "runner infrastructure failed before / around execution"
+        if error_class in _DIAGNOSE_RUNNER_ERROR_CLASSES:
+            evidence.append(ev(error_source, "error_class", None))
+        for index, attempt in enumerate(attempts):
+            if isinstance(attempt, dict) and attempt.get("error_class") in _DIAGNOSE_RUNNER_ERROR_CLASSES:
+                evidence.append(attempt_evidence(attempt, index, attempts_source))
+    # 6. Executor error: a recorded nonzero exit / executor error class.
+    elif (error_class in _DIAGNOSE_EXEC_ERROR_CLASSES
+          or any(isinstance(a, dict) and (a.get("error_class") in _DIAGNOSE_EXEC_ERROR_CLASSES
+                                          or (isinstance(a.get("rc"), int)
+                                              and a["rc"] != 0)) for a in attempts)):
+        category = "exec-error"
+        reason = "executor exited nonzero / reported an executor error"
+        if error_class in _DIAGNOSE_EXEC_ERROR_CLASSES:
+            evidence.append(ev(error_source, "error_class", None))
+        for index, attempt in enumerate(attempts):
+            if isinstance(attempt, dict) and (attempt.get("error_class") in _DIAGNOSE_EXEC_ERROR_CLASSES
+                                              or (isinstance(attempt.get("rc"), int)
+                                                  and attempt["rc"] != 0)):
+                evidence.append(attempt_evidence(attempt, index, attempts_source))
+    # 7. Successful run: there is no failure to diagnose.
+    elif status_value == "done" or (status_value == "partial" and verify_rc == 0):
+        category = "none"
+        reason = "run did not fail (recorded status is done / verify passed)"
+        evidence.append(ev("result.json" if result.get("status") else "status.json",
+                           "status", None))
+    # 8. #98 pid ambiguity: the only failure signal is a dead runner pid.
+    # pid_alive false-positives when the pid has been recycled, so this must
+    # stay unknown (suspected, never asserted as a cause).
+    elif (not result and not ledger_entry and status.get("runner_pid")
+          and not pid_alive(status.get("runner_pid"))):
+        category = "unknown"
+        suspected = "pid_reuse (#98): runner pid is dead but no result, ledger entry, or log signal records why"
+        reason = ("no result, ledger entry, or log signal records a cause; "
+                  "the dead runner pid alone cannot pin one (#98 pid reuse)")
+        evidence.append(ev("status.json", "runner_pid",
+                           f"runner_pid={status.get('runner_pid')} not alive"))
+    # 9. Nothing pins a cause: say so instead of guessing.
+    else:
+        category = "unknown"
+        reason = "recorded status is failed but no result, ledger, or log evidence names a cause"
+
+    return {"run_id": run_id, "category": category, "status": status_value, "state": state,
+            "backend": status.get("backend") or result.get("backend") or ledger_entry.get("backend"),
+            "model": status.get("model") or result.get("model") or ledger_entry.get("model"),
+            "reason": reason,
+            "suspected": suspected,
+            "evidence": evidence, "run_dir": rdir}
+
+
+def cmd_diagnose(args):
+    """Print the structured diagnosis for one run (read-only)."""
+    try:
+        payload = diagnose_failure(args.run_id)
+    except ValueError as error:
+        print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(2)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
 def cmd_runs(args, policy):
     """Snapshot report of recent/active runs — for scheduled check-ins."""
     if not os.path.isdir(RUNS):
@@ -13628,6 +13858,10 @@ def main():
     sp.add_argument("--active", action="store_true")
     sp.add_argument("--json", action="store_true")
 
+    sp = sub.add_parser("diagnose", help="classify a failed run from its ledger, status and logs (M10, #137)")
+    sp.add_argument("run_id", help="run id under $OPENSWARM_HOME/runs")
+    sp.add_argument("--json", action="store_true", help="print the diagnosis as JSON (default output is JSON)")
+
     sp = sub.add_parser("resume", help="list active runs and busy lanes after planner restart")
     sp.add_argument("--since-hours", type=float, default=6,
                     help="include finished runs from the last N hours (default: 6)")
@@ -13884,6 +14118,8 @@ def main():
         cmd_watch(a, policy)
     elif a.cmd == "runs":
         cmd_runs(a, policy)
+    elif a.cmd == "diagnose":
+        cmd_diagnose(a)
     elif a.cmd == "resume":
         try:
             cmd_resume(a)
