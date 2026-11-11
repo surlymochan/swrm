@@ -42,6 +42,11 @@ elif sys.argv[1:3] == ["fleet", "_health"]:
     real = Path(__file__).resolve().parent.parent.parent / "bin" / "openswarm"
     print(subprocess.check_output(
         [sys.executable, str(real), "fleet", "_health", *sys.argv[3:]], text=True))
+elif sys.argv[1:3] == ["fleet", "_reap"]:
+    # M12 slice 2 (#148): same delegation as _health, for the reap path.
+    real = Path(__file__).resolve().parent.parent.parent / "bin" / "openswarm"
+    print(subprocess.check_output(
+        [sys.executable, str(real), "fleet", "_reap", *sys.argv[3:]], text=True))
 elif sys.argv[1:3] == ["fleet", "_run-info"]:
     rid = sys.argv[3]
     path = home / "runs" / rid / "stub.json"
