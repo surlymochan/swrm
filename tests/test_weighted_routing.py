@@ -219,8 +219,8 @@ class WeightedRoutingTests(unittest.TestCase):
         spec = {"backend": "codex", "backend_explicit": False, "model": None, "card_type": "fix"}
         with mock.patch.object(xs, "route", side_effect=AssertionError("route must not be called")), \
                 mock.patch.object(xs, "get_state", side_effect=AssertionError("get_state must not be called")):
-            backend, model, info, decision = xs.batch_weighted_route(spec, policy)
-        self.assertEqual((backend, model, info, decision), ("codex", None, None, None))
+            backend, model, info, decision, quota = xs.batch_weighted_route(spec, policy)
+        self.assertEqual((backend, model, info, decision, quota), ("codex", None, None, None, None))
 
     def test_batch_weighted_route_falls_back_when_advised_backend_fails_to_plan(self):
         policy = weighted_policy(weighted=True)
@@ -236,7 +236,8 @@ class WeightedRoutingTests(unittest.TestCase):
         spec = {"backend": "codex", "backend_explicit": False, "model": None, "card_type": "fix"}
         with mock.patch.object(xs, "get_state", return_value=st), \
                 mock.patch.object(xs, "route", side_effect=flaky_route):
-            backend, model, info, new_decision = xs.batch_weighted_route(spec, policy)
+            backend, model, info, new_decision, quota = xs.batch_weighted_route(spec, policy)
+            self.assertIsNone(quota)
         self.assertEqual(backend, "codex")
         self.assertFalse(info["applied"])
         self.assertIn("failed to plan", info["reason"])
@@ -250,7 +251,8 @@ class WeightedRoutingTests(unittest.TestCase):
         self.seed(policy, st)
         spec = {"backend": "codex", "backend_explicit": False, "model": None, "card_type": "fix"}
         with mock.patch.object(xs, "get_state", side_effect=RuntimeError("probe failed")):
-            backend, model, info, new_decision = xs.batch_weighted_route(spec, policy)
+            backend, model, info, new_decision, quota = xs.batch_weighted_route(spec, policy)
+            self.assertIsNone(quota)
         self.assertEqual(backend, "codex")
         self.assertFalse(info["applied"])
         self.assertIn("unavailable", info["reason"])
@@ -265,7 +267,8 @@ class WeightedRoutingTests(unittest.TestCase):
         self.seed(policy, st)
         spec = {"backend": "codex", "model": None, "card_type": "fix"}
         with mock.patch.object(xs, "get_state", return_value=st):
-            backend, model, info, new_decision = xs.batch_weighted_route(spec, policy)
+            backend, model, info, new_decision, quota = xs.batch_weighted_route(spec, policy)
+            self.assertIsNone(quota)
         self.assertEqual(backend, "codex")
         self.assertFalse(info["applied"])
         self.assertIn("explicit --backend", info["reason"])
@@ -383,22 +386,23 @@ class FleetWeightedRoutingTests(unittest.TestCase):
         cmd = self.command()
         with mock.patch.object(xs, "route", side_effect=AssertionError("route must not be called")), \
                 mock.patch.object(xs, "get_state", side_effect=AssertionError("get_state must not be called")):
-            eff, info, decision = xs.fleet_weighted_route(cmd, policy)
-        self.assertEqual((eff, info, decision), (cmd, None, None))
+            eff, info, decision, quota = xs.fleet_weighted_route(cmd, policy)
+        self.assertEqual((eff, info, decision, quota), (cmd, None, None, None))
 
     def test_non_run_command_passes_through(self):
         policy = weighted_policy(weighted=True)
         cmd = ["lane", "status"]
         with mock.patch.object(xs, "route", side_effect=AssertionError("route must not be called")), \
                 mock.patch.object(xs, "get_state", side_effect=AssertionError("get_state must not be called")):
-            self.assertEqual(xs.fleet_weighted_route(cmd, policy), (cmd, None, None))
+            self.assertEqual(xs.fleet_weighted_route(cmd, policy), (cmd, None, None, None))
 
     def test_weighted_on_injects_advised_backend_after_run(self):
         policy = weighted_policy(weighted=True)
         st = scenario()
         decision = self.seed(policy, st)
         with mock.patch.object(xs, "get_state", return_value=st):
-            eff, info, new_decision = xs.fleet_weighted_route(self.command(), policy)
+            eff, info, new_decision, quota = xs.fleet_weighted_route(self.command(), policy)
+            self.assertIsNone(quota)
         self.assertTrue(info["applied"])
         self.assertTrue(new_decision["routed_by_advice"])
         self.assertEqual(new_decision["routed_from"], {"backend": "codex", "model": decision["model"]})
@@ -413,7 +417,8 @@ class FleetWeightedRoutingTests(unittest.TestCase):
         self.seed(policy, st)
         cmd = self.command(backend="codex")
         with mock.patch.object(xs, "get_state", return_value=st):
-            eff, info, decision = xs.fleet_weighted_route(cmd, policy)
+            eff, info, decision, quota = xs.fleet_weighted_route(cmd, policy)
+            self.assertIsNone(quota)
         self.assertEqual(eff, cmd)
         self.assertFalse(info["applied"])
         self.assertIn("explicit --backend", info["reason"])
@@ -425,7 +430,8 @@ class FleetWeightedRoutingTests(unittest.TestCase):
         self.seed(policy, st)
         cmd = self.command()
         with mock.patch.object(xs, "get_state", return_value=st):
-            eff, info, decision = xs.fleet_weighted_route(cmd, policy)
+            eff, info, decision, quota = xs.fleet_weighted_route(cmd, policy)
+            self.assertIsNone(quota)
         self.assertEqual(eff, cmd)
         self.assertFalse(info["applied"])
         self.assertIn("below margin", info["reason"])
@@ -438,7 +444,8 @@ class FleetWeightedRoutingTests(unittest.TestCase):
         self.write_ledger(rows_for("ocgo", OCGO_MODEL, 7))
         cmd = self.command()
         with mock.patch.object(xs, "get_state", return_value=st):
-            eff, info, new_decision = xs.fleet_weighted_route(cmd, policy)
+            eff, info, new_decision, quota = xs.fleet_weighted_route(cmd, policy)
+            self.assertIsNone(quota)
         self.assertEqual(eff, cmd)
         self.assertFalse(info["applied"])
         self.assertIn("comparison unavailable", info["reason"])
@@ -458,7 +465,8 @@ class FleetWeightedRoutingTests(unittest.TestCase):
         cmd = self.command()
         with mock.patch.object(xs, "get_state", return_value=st), \
                 mock.patch.object(xs, "route", side_effect=flaky_route):
-            eff, info, new_decision = xs.fleet_weighted_route(cmd, policy)
+            eff, info, new_decision, quota = xs.fleet_weighted_route(cmd, policy)
+            self.assertIsNone(quota)
         self.assertEqual(eff, cmd)
         self.assertFalse(info["applied"])
         self.assertIn("failed to plan", info["reason"])
@@ -471,7 +479,8 @@ class FleetWeightedRoutingTests(unittest.TestCase):
         self.seed(policy, st)
         cmd = self.command()
         with mock.patch.object(xs, "get_state", side_effect=RuntimeError("probe failed")):
-            eff, info, new_decision = xs.fleet_weighted_route(cmd, policy)
+            eff, info, new_decision, quota = xs.fleet_weighted_route(cmd, policy)
+            self.assertIsNone(quota)
         self.assertEqual(eff, cmd)
         self.assertFalse(info["applied"])
         self.assertIn("unavailable", info["reason"])

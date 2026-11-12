@@ -782,16 +782,20 @@ backends, configured in policy under `routing.quota`:
 }
 ```
 
-When `enabled`, `openswarm run` reroutes off a default backend whose
+When `enabled`, `openswarm run` — and, per card, `openswarm batch`, and, per
+forwarded run, `openswarm fleet exec` — reroute off a default backend whose
 remaining quota is at or below `threshold`, to the next backend with
 remaining quota above it; the decision (`quota_before` with both
-remainings, the reason) lands in the ledger and `result.json`, and when
-every routable backend is exhausted the run fails loudly with
-`quota_exhausted` instead of dispatching. An explicit `--backend` always
-wins, and a failed quota read keeps the old behaviour on the record instead
-of silently downgrading. `enabled` ships `false`: the mechanism is present,
-the behaviour is unchanged until it is flipped on. `openswarm quota`
-reports the same readings read-only, without routing or dispatching.
+remainings, the reason) lands in the ledger and `result.json` (for batch and
+fleet, in the controller ledger's per-card / per-run routing-decision
+entry), and when every routable backend is exhausted the run fails loudly
+with `quota_exhausted` instead of dispatching — a batch card is marked
+failed without dispatching, so its dependents block, and a fleet exec exits
+2 without forwarding. An explicit `--backend` always wins, and a failed
+quota read keeps the old behaviour on the record instead of silently
+downgrading. `enabled` ships `false`: the mechanism is present, the
+behaviour is unchanged until it is flipped on. `openswarm quota` reports the
+same readings read-only, without routing or dispatching.
 
 A second shipped example proves the same contract with a different backend
 in all three dimensions — no code changes: [`examples/patch-cli.py`](examples/patch-cli.py)
