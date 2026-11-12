@@ -2431,8 +2431,9 @@ CALIBRATION_GATE_DEFAULT_MIN_SAMPLES = 8
 def calibration_gate_settings(policy):
     """Validated calibration-gate settings from policy (M15, #160).
 
-    `routing.calibration_gate` is the master switch (default false: shipped
-    behaviour is byte-identical to today). `diff` is the M8 miscalibration
+    `routing.calibration_gate` is the master switch (default true since
+    M16, #163; with the switch off, behaviour is byte-identical to the
+    pre-M16 behaviour). `diff` is the M8 miscalibration
     bar (|advised - actual| > diff) and `min_samples` the sample bar; both
     default to the `report --advice-accuracy` flag values (0.20 and 8)."""
     routing = policy.get("routing") or {}

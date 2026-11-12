@@ -83,7 +83,7 @@
     "adaptive_margin_floor": 0.05,
     "adaptive_margin_cap": 0.3,
     "adaptive_margin_min_samples": 8,
-    "calibration_gate": false,
+    "calibration_gate": true,
     "calibration_gate_diff": 0.2,
     "calibration_gate_min_samples": 8
   },
