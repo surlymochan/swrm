@@ -241,7 +241,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm watch --from-end` | Resume a watch whose window expired; events already written are skipped. | `openswarm watch <run-id> --from-end` |
 | `openswarm status` | Show plans, quota windows, models, breakers, and recommended concurrency. | `openswarm status --refresh` |
 | `openswarm probe` | Discover models, plans, and quotas into `$OPENSWARM_HOME/state.json`. | `openswarm probe --quiet` |
-| `openswarm quota` | Read-only probe: remaining quota per backend from its configured source. | `openswarm quota --json` |
+| `openswarm quota` | Read-only probe: remaining quota per backend — live built-in readings (pi MiniMax, codex, deepseek, ocgo) or its configured source. | `openswarm quota --json` |
 | `openswarm runs` | Snapshot recent or active runs. | `openswarm runs --active --json` |
 | `openswarm diagnose` | Classify a failed run (timeout / quota / verify-fail / exec-error / runner-error / unknown) with evidence pointers; read-only. | `openswarm diagnose <run-id>` |
 | `openswarm resume` | Recover live runs, busy lanes and recent results after a planner restart. | `openswarm resume --since-hours 12 --json` |
@@ -798,6 +798,18 @@ backends, configured in policy under `routing.quota`:
   }
 }
 ```
+
+Built-in backends also report real quota with no policy source at all
+(M20): `pi` reads the MiniMax token-plan remains live (or the PAYG
+balance for `sk-api-` keys) using Pi's own credential; `codex` reads its
+remaining fraction from local rollout windows; `deepseek` reads its
+account balance in CNY; `ocgo` reads its remaining fraction from local
+opencode spend. A configured policy or custom-backend source still wins
+over the built-in reader. Units differ per backend — pi/codex/ocgo report
+a 0..1 remaining fraction, deepseek reports CNY — so set `threshold` in
+the unit of the backend you mean to guard; the shipped default `0` means
+"exhausted only at zero" in every unit. `openswarm quota` reports the
+same readings read-only, without routing or dispatching.
 
 When `enabled`, `openswarm run` — and, per card, `openswarm batch`, and, per
 forwarded run, `openswarm fleet exec` — reroute off a default backend whose

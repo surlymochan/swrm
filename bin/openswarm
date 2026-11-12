@@ -2065,11 +2065,16 @@ def probe_deepseek(policy):
 
 # ---------------------------------------------------------------- state
 
+def probe_state(policy, quiet=False):
+    """Build the probe state without writing it (read-only callers)."""
+    return {"generated_at": NOW(), "generated_at_local": iso(NOW()),
+            "claude": probe_claude(policy), "codex": probe_codex(policy),
+            "ocgo": probe_ocgo(policy), "deepseek": probe_deepseek(policy),
+            "cursor": probe_cursor(policy), "agy": probe_agy(policy), "pi": probe_pi(policy)}
+
+
 def probe(policy, quiet=False):
-    state = {"generated_at": NOW(), "generated_at_local": iso(NOW()),
-             "claude": probe_claude(policy), "codex": probe_codex(policy),
-             "ocgo": probe_ocgo(policy), "deepseek": probe_deepseek(policy),
-             "cursor": probe_cursor(policy), "agy": probe_agy(policy), "pi": probe_pi(policy)}
+    state = probe_state(policy, quiet)
     jsave(STATE, state)
     return state
 
@@ -4501,7 +4506,7 @@ def pi_bin():
 def probe_pi(policy):
     cfg = policy.get("pi") or {}
     return {"binary": pi_bin(), "provider": cfg.get("provider"), "default_model": cfg.get("default_model"),
-            "quota": None}
+            "quota": minimax_quota()}
 
 
 def plan_pi(prof, st, policy, forced, notes):
@@ -4522,7 +4527,14 @@ def plan_pi(prof, st, policy, forced, notes):
             return None, "isolated Pi provider or model does not match the broker"
     if f"pi/{model or 'default'}" in breakers() or "pi/all" in breakers():
         return None, "pi breaker open"
-    notes.append("pi quota unknown (opt-in backend; not metered by openswarm)")
+    quota = (st.get("pi") or {}).get("quota") or {}
+    if isinstance(quota, dict) and isinstance(quota.get("remaining"), (int, float)):
+        notes.append(f"pi quota remaining {quota['remaining']:.0%} "
+                     f"({quota.get('source') or 'MiniMax live probe'})")
+    elif isinstance(quota, dict) and quota.get("error"):
+        notes.append(f"pi quota unreadable ({quota['error']}); routing without quota data")
+    else:
+        notes.append("pi quota unknown (opt-in backend; not metered by openswarm)")
     tier = policy["difficulty_map"][str(prof["difficulty"])]["tier"]
     return {"backend": "pi", "model": model, "effort": None, "tier": tier}, None
 
@@ -4535,6 +4547,111 @@ def minimax_key_from_pi():
     auth = jload(os.path.join(home, ".pi", "agent", "auth.json"), {}) or {}
     entry = auth.get("minimax-cn") or {}
     return entry.get("key") if isinstance(entry, dict) else None
+
+
+# ---------------------------------------------------------------- MiniMax quota (M20 slice 1, #181)
+# Pi runs on MiniMax (provider minimax-cn) but probe_pi() used to report
+# quota: None, so quota-aware routing could never judge pi on real data.
+# The official MiniMax CLI (v1.0.28, src/client/endpoints.ts) selects the
+# quota endpoint by key kind: a `sk-api-` (pay-as-you-go) key reads
+# {base}/account/query_balance, any other key (Token Plan / coding plan)
+# reads {base}/v1/token_plan/remains. Domestic base is www.minimaxi.com.
+# The remains payload reports per-model interval/weekly remaining percents
+# plus a server status (1 = normal, 2 = exhausted, 3 = unlimited); the
+# routing number is the most binding interval remaining as a fraction
+# (status 2 forces 0.0, status 3 with no percent reads as 1.0). The balance
+# payload reports available_amount as a decimal string. Either way the
+# number is a live provider reading, never a constructed value. Failures
+# (no key, HTTP error, bad payload) return {"error": ...}: the probe
+# records the failure and routing falls back to old behaviour on the
+# record (M17 guardrail), never silently.
+MINIMAX_QUOTA_BASE_URL = "https://www.minimaxi.com"
+MINIMAX_QUOTA_TIMEOUT = 15
+
+
+def minimax_quota_from_payload(data):
+    """Parse a MiniMax quota/balance payload → (remaining, unit, detail).
+
+    Raises ValueError when the payload has no usable quota number, so the
+    caller records an error instead of routing on a guess.
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"MiniMax quota payload is not an object, got {type(data).__name__}")
+    base = data.get("base_resp") or {}
+    if isinstance(base, dict) and base.get("status_code") not in (None, 0):
+        raise ValueError(f"MiniMax quota error {base.get('status_code')}: "
+                         f"{str(base.get('status_msg') or '')[:200]}")
+    if "model_remains" in data:
+        remains = data.get("model_remains")
+        if not isinstance(remains, list) or not remains:
+            raise ValueError("MiniMax token-plan remains has no model entries")
+        per_model, remaining = [], None
+        for entry in remains:
+            if not isinstance(entry, dict):
+                continue
+            percent = entry.get("current_interval_remaining_percent")
+            status = entry.get("current_interval_status")
+            if status == 2:
+                value = 0.0
+            elif isinstance(percent, (int, float)) and not isinstance(percent, bool):
+                value = max(0.0, min(1.0, percent / 100.0))
+            elif status == 3:
+                value = 1.0
+            else:
+                continue
+            per_model.append({"model": entry.get("model_name"),
+                              "interval_remaining_percent": percent,
+                              "weekly_remaining_percent": entry.get("current_weekly_remaining_percent"),
+                              "interval_status": status,
+                              "weekly_status": entry.get("current_weekly_status")})
+            remaining = value if remaining is None else min(remaining, value)
+        if remaining is None or not per_model:
+            raise ValueError("MiniMax token-plan remains has no interval percent or status")
+        return remaining, "fraction", {"endpoint": "token_plan/remains", "models": per_model}
+    if "available_amount" in data:
+        try:
+            remaining = float(data["available_amount"])
+        except (TypeError, ValueError):
+            raise ValueError(f"MiniMax balance available_amount is not a number: "
+                             f"{data.get('available_amount')!r}")
+        return remaining, "currency", {"endpoint": "account/query_balance",
+                                       "cash_balance": data.get("cash_balance"),
+                                       "voucher_balance": data.get("voucher_balance"),
+                                       "credit_balance": data.get("credit_balance"),
+                                       "owed_amount": data.get("owed_amount")}
+    raise ValueError("MiniMax quota payload has neither model_remains nor available_amount")
+
+
+def minimax_quota(key=None):
+    """Live MiniMax quota for Pi's key → {"remaining", "unit", ...} or {"error"}.
+
+    The key is Pi's own credential (minimax_key_from_pi); it is sent only
+    as a Bearer header to the quota endpoint and never logged. `key` is a
+    test seam only.
+    """
+    key = key if key is not None else minimax_key_from_pi()
+    if not key:
+        return {"error": "no MiniMax credential (pi auth.json has no minimax-cn key)"}
+    if key.startswith("sk-api-"):
+        url = f"{MINIMAX_QUOTA_BASE_URL}/account/query_balance"
+    else:
+        url = f"{MINIMAX_QUOTA_BASE_URL}/v1/token_plan/remains"
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}",
+                                                   "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=MINIMAX_QUOTA_TIMEOUT) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        return {"error": f"MiniMax quota request failed: HTTP {exc.code}"}
+    except Exception as exc:  # noqa: BLE001 - network failure is a probe error, not a crash
+        return {"error": f"MiniMax quota request failed: {type(exc).__name__}: {str(exc)[:200]}"}
+    try:
+        remaining, unit, detail = minimax_quota_from_payload(data)
+    except ValueError as exc:
+        return {"error": f"MiniMax quota payload unusable: {exc}"}
+    return {"remaining": remaining, "unit": unit, "source": "minimax token-plan remains"
+            if detail["endpoint"] == "token_plan/remains" else "minimax account balance",
+            **detail}
 
 
 def hermes_bin(policy):
@@ -4870,8 +4987,14 @@ def custom_backend_quota(cfg):
 # longer receives new runs. Sources reuse the custom-backend vocabulary
 # (env / command / file reading a number or {"remaining": n}); the policy
 # source wins over a custom backend's own quota_source when both exist.
-# Shipped default is enabled=false: the mechanism is present, behaviour is
-# unchanged until slice 2 decides whether to flip it on (M9/M16 pattern).
+# M20 slice 1 (#181) adds built-in readers over live probe state, so
+# real backends need no policy source at all: pi reads the MiniMax
+# token-plan remains (or PAYG balance for sk-api- keys) live in probe_pi(),
+# codex reads local rollout windows, deepseek its account balance, ocgo
+# its local opencode spend. The policy/custom source still wins when one
+# is configured. Shipped default is enabled=false: the mechanism is
+# present, behaviour is unchanged until slice 2 decides whether to flip
+# it on (M9/M16 pattern).
 # No weighted/calibration semantics change: quota rerouting runs after
 # apply_weighted_routing and only swaps the backend, re-planning through
 # route() so model/effort/tier stay backend-correct.
@@ -4970,27 +5093,95 @@ def quota_source_text(source):
     return "none (unknown)"
 
 
-def quota_remaining_for_backend(backend, cfg, custom_backends=()):
+def builtin_quota_remaining(backend, st):
+    """Remaining quota for a built-in backend from live probe state.
+
+    Returns (remaining, error, source_text). (None, None, None) only when
+    the backend has no built-in reader at all. When the reader exists but
+    the state carries no usable reading, source_text is still returned
+    with remaining None (unknown, never zero) so `openswarm quota` can
+    show the backend is wired but has no data here. (None, error, text)
+    when the probe itself failed: the caller records the error and falls
+    back to old behaviour. All numbers come from the provider or local
+    usage state gathered by probe(); nothing here is constructed. Units
+    differ per backend and are named in source_text: pi/codex/ocgo report
+    a 0..1 remaining fraction, deepseek reports its CNY balance.
+    """
+    if not isinstance(st, dict):
+        return None, None, None
+    if backend == "pi":
+        quota = (st.get("pi") or {}).get("quota")
+        text = "builtin pi (MiniMax live quota)"
+        if not isinstance(quota, dict):
+            return None, None, text
+        if quota.get("error"):
+            return None, quota["error"], "builtin pi (MiniMax live quota)"
+        remaining = quota.get("remaining")
+        if isinstance(remaining, (int, float)) and not isinstance(remaining, bool):
+            unit = quota.get("unit") or "fraction"
+            return remaining, None, f"builtin pi (MiniMax {quota.get('source') or 'live quota'}, {unit})"
+        return None, None, text
+    if backend == "codex":
+        text = "builtin codex (local rollout windows, fraction)"
+        used = []
+        for limit in ((st.get("codex") or {}).get("limits") or {}).values():
+            for window in ((limit or {}).get("windows") or {}).values():
+                value = (window or {}).get("used")
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    used.append(value)
+        if not used:
+            return None, None, text
+        return 1.0 - max(used), None, text
+    if backend == "deepseek":
+        text = "builtin deepseek (account balance, CNY)"
+        ds = st.get("deepseek") or {}
+        balance = ds.get("balance")
+        if isinstance(balance, (int, float)) and not isinstance(balance, bool):
+            return balance, None, text
+        if ds.get("error"):
+            return None, ds["error"], text
+        return None, None, text
+    if backend == "ocgo":
+        text = "builtin ocgo (local opencode spend, fraction)"
+        used = []
+        for model in (st.get("ocgo") or {}).get("models") or []:
+            if (model or {}).get("excluded"):
+                continue
+            for value in ((model or {}).get("usage") or {}).values():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    used.append(value)
+        if not used:
+            return None, None, text
+        return 1.0 - max(used), None, text
+    return None, None, None
+
+
+def quota_remaining_for_backend(backend, cfg, custom_backends=(), st=None):
     """Remaining quota for one backend: (remaining, error).
 
     Policy routing.quota.sources wins; otherwise a custom backend's own
-    quota_source. (None, None) when no source is configured anywhere — the
-    backend's quota is unknown, not zero.
+    quota_source; otherwise a built-in reader over live probe state (M20
+    slice 1, #181) when `st` is given. (None, None) when no source is
+    configured anywhere — the backend's quota is unknown, not zero.
     """
     if backend in cfg["sources"]:
         return quota_remaining_from_source(cfg["sources"][backend])
     for entry in custom_backends or ():
         if entry["id"] == backend:
             return quota_remaining_from_source(custom_backend_source(entry))
+    if st is not None:
+        remaining, error, _text = builtin_quota_remaining(backend, st)
+        return remaining, error
     return None, None
 
 
-def quota_probe_row(backend, cfg, custom_backends=()):
+def quota_probe_row(backend, cfg, custom_backends=(), st=None):
     """One `openswarm quota` row: {backend, source, remaining, status, detail}.
 
     status is "ok" (remaining above threshold), "low" (at or below it),
     "unknown" (no source configured), or "error" (the read itself failed).
-    Read-only: touches only the configured source, never state.json.
+    Read-only: touches only the configured source (or the live probe state
+    for built-in backends), never state.json.
     """
     source = cfg["sources"].get(backend)
     if source is None:
@@ -4998,6 +5189,23 @@ def quota_probe_row(backend, cfg, custom_backends=()):
             if entry["id"] == backend and entry["quota_source"] != "none":
                 source = custom_backend_source(entry)
                 break
+    if source is None and st is not None:
+        remaining, error, builtin_text = builtin_quota_remaining(backend, st)
+        if builtin_text is not None:
+            if error is not None:
+                return {"backend": backend, "source": builtin_text, "remaining": None,
+                        "status": "error", "detail": error}
+            if remaining is None:
+                return {"backend": backend, "source": builtin_text, "remaining": None,
+                        "status": "unknown",
+                        "detail": "probe state has no usable quota reading for this backend"}
+            if remaining <= cfg["threshold"]:
+                return {"backend": backend, "source": builtin_text, "remaining": remaining,
+                        "status": "low",
+                        "detail": f"remaining {remaining} is at or below threshold {cfg['threshold']}"}
+            return {"backend": backend, "source": builtin_text, "remaining": remaining,
+                    "status": "ok",
+                    "detail": f"remaining {remaining} is above threshold {cfg['threshold']}"}
     if source is None:
         return {"backend": backend, "source": "none (unknown)", "remaining": None,
                 "status": "unknown",
@@ -5042,7 +5250,7 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
     tried = []
     while True:
         backend = current["backend"]
-        remaining, error = quota_remaining_for_backend(backend, cfg, custom_backends)
+        remaining, error = quota_remaining_for_backend(backend, cfg, custom_backends, st)
         if error is not None:
             errors[backend] = error
             if not tried:
@@ -5088,19 +5296,32 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
 
 
 def cmd_quota(args, policy, custom_backends=None):
-    """Read-only quota probe (M17 slice 1, #169): remaining quota per backend.
+    """Read-only quota probe (M17 slice 1, #169; M20 slice 1, #181): remaining quota per backend.
 
-    Never routes, dispatches, or writes state. Exit 1 when any configured
-    source fails to read; 0 otherwise (unknown sources are not failures).
+    Never routes, dispatches, or writes state. Built-in backends (pi,
+    codex, deepseek, ocgo) read from a fresh in-memory probe — probe_state()
+    builds it without saving — so the rows are live readings, not policy
+    configuration. Exit 1 when a configured source (policy or custom
+    backend) fails to read; a built-in live read that fails is reported
+    per-row as status "error" without failing the command (it is a
+    best-effort live read, like probe_deepseek's balance errors in state).
+    Unknown sources are not failures.
     """
     cfg = quota_config(policy)
     if custom_backends is None:
         custom_backends = load_custom_backends(policy, explicit=getattr(args, "backends_file", None))
+    fixed = envvar("STATE_FILE")
+    if fixed:  # offline mode: judge from the saved state, like get_state()
+        st = jload(fixed)
+        if not st:
+            sys.exit(f"openswarm: cannot read OPENSWARM_STATE_FILE={fixed}")
+    else:
+        st = probe_state(policy)
     order = list((policy.get("routing") or {}).get("default_order") or [])
     for backend in list(PLANNERS) + list(cfg["sources"]) + [entry["id"] for entry in custom_backends]:
         if backend not in order:
             order.append(backend)
-    rows = [quota_probe_row(backend, cfg, custom_backends) for backend in order]
+    rows = [quota_probe_row(backend, cfg, custom_backends, st) for backend in order]
     if getattr(args, "json", False):
         print(json.dumps({"quota_routing_enabled": cfg["enabled"], "threshold": cfg["threshold"],
                           "backends": rows}, indent=2, ensure_ascii=False))
@@ -5110,7 +5331,10 @@ def cmd_quota(args, policy, custom_backends=None):
         for row in rows:
             remaining = "unknown" if row["remaining"] is None else str(row["remaining"])
             print(f"{row['backend']:<12} {remaining:<10} {row['status']:<7} {row['source']}  {row['detail']}")
-    if any(row["status"] == "error" for row in rows):
+    if any(row["status"] == "error" for row in rows
+           if row["backend"] in cfg["sources"]
+           or any(entry["id"] == row["backend"] and entry["quota_source"] != "none"
+                  for entry in custom_backends)):
         sys.exit(1)
 
 
