@@ -85,7 +85,12 @@
     "adaptive_margin_min_samples": 8,
     "calibration_gate": true,
     "calibration_gate_diff": 0.2,
-    "calibration_gate_min_samples": 8
+    "calibration_gate_min_samples": 8,
+    "quota": {
+      "enabled": false,
+      "threshold": 0,
+      "sources": {}
+    }
   },
   "codex": {
     "default_model": "gpt-6-luna",
