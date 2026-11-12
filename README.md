@@ -274,6 +274,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm report --advice-accuracy` | Advice calibration table by (backend, card type): quoted vs observed pass rates. | `openswarm report --advice-accuracy [--json] [--fleet]` |
 | `openswarm report --weighted-eval` | Weighted-routing counterfactual replay by (backend, card type): diverted share and expected vs actual pass rate. | `openswarm report --weighted-eval [--json] [--fleet]` |
 | `openswarm report --gate-eval` | Calibration-gate flip counterfactual replay by (backend, card type): intercepted diversion share and expected pass-rate change. | `openswarm report --gate-eval [--json] [--fleet]` |
+| `openswarm report --quota-eval` | Quota-aware flip counterfactual replay by (default backend, card type): rerouted/refused share and expected pass-rate change. | `openswarm report --quota-eval [--json] [--fleet]` |
 | `openswarm retro` | Run the weekly retrospective: pull, ingest, backfill, weights, proposals, report. | `openswarm retro --days 7 --repos acme/project` |
 | `openswarm regress run` | Run the regression card suite on a backend, a lane, or a routing mode. | `openswarm regress run --backend codex --cards card-a,card-b --label nightly --parallel 2` |
 | `openswarm regress compare` | Compare two regression result files card by card. | `openswarm regress compare before.json after.json` |
@@ -521,6 +522,22 @@ output or `--fleet` to read the merged fleet ledger. The command is read-only an
 shipped default, or the ledger; the gate bar it replays comes from policy (`routing.calibration_gate_diff`,
 default 0.20; `routing.calibration_gate_min_samples`, default 8) and the margin from
 `routing.advice_margin` (default 0.10).
+
+`openswarm report --quota-eval` (M19, #177) replays recorded quota decisions the same way to decide whether
+quota-aware routing's shipped default should flip: for each decision carrying a `quota_routing` record it
+replays the live reroute rule from the dispatch-time `quota_before` snapshot and the threshold recorded
+alongside it (a backend at or below the threshold no longer receives new runs), and reports one row per
+(default backend, card type) with the rerouted/refused/stayed shares and the expected pass-rate change (Δ).
+A rerouted run is credited with the default backend's prefix observed rate under quota-off and the target
+backend's prefix rate under quota-on; a refused run takes the default's prefix rate under quota-off and 0
+under quota-on, because it never dispatches. Batch/fleet decision records carry no outcome, so they enter
+the shares but not the pass rates, and entries with no usable quota snapshot (quota was off at dispatch, or
+a batch card blocked by a dependency) are counted as unreplayable, never guessed. The replay verdict is
+cross-checked against the recorded live verdict (`rerouted`/`all_exhausted`/stayed, target included) and
+mismatches are listed in `--json`, so the replay can be verified against the ledger instead of trusted.
+Add `--json` for machine-readable output or `--fleet` to read the merged fleet ledger. The command is
+read-only and never changes routing, the shipped default, or the ledger; a record without its own threshold
+replays under `routing.quota.threshold` from policy (default 0).
 
 Run the weekly fleet retrospective in one command:
 

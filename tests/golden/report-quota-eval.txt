@@ -1,0 +1,9 @@
+quota eval (ledger: LEDGER; default threshold: 0)
+replay in ledger order from each decision's recorded quota_before snapshot and threshold (the live rule: a backend at or below the threshold no longer receives new runs); rerouted = the default pick was exhausted and a fallback with remaining above the threshold (or unknown remaining) was available; refused = every recorded backend was at or below the threshold; stayed = the default pick had remaining above the threshold, unknown remaining, or an explicit --backend; unknown = the snapshot does not cover the default pick, so the record cannot say what quota-on would have done. Expected pass rates are over scored runs only: stayed runs keep their observed outcome, rerouted runs take the default backend's prefix observed rate under quota-off and the target's prefix rate under quota-on, refused runs take the default's prefix rate under quota-off and 0 under quota-on (they never dispatch); batch/fleet decision records carry no outcome, so they enter the shares but not the pass rates; small-n = n < 8, deltas indicative only
+backend    card_type    decisions rerouted refused stayed    n  actual exp-off  exp-on  delta  flag
+------------------------------------------------------------------------------------------------------
+low        fix                  4        2       1      1    4    0.50    0.16    0.50  +0.34  small-n
+replayable decisions: 4 across 1 groups; rerouted: 2 (0.50 of decided); refused: 1 (0.25 of decided); stayed: 1 (0.25 of decided); unknown: 0; scored runs: 4
+expected pass rate: quota off 0.16 vs quota on 0.50 (delta +0.34)
+replay vs recorded: 4/4 match
+unreplayable entries (no usable quota snapshot): 8
