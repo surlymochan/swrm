@@ -11395,10 +11395,13 @@ def cmd_fleet(args, policy=None):
             raise ValueError("fleet exec requires openswarm arguments after --")
         # M7 slice 2 (#124): a forwarded `run` is a fleet dispatch, so it
         # goes through weighted routing at the controller like a batch card.
+        # M18 slice 1 (#173): quota-aware rerouting rides the same call.
         # Any other forwarded command is untouched. With routing.weighted
-        # false this returns the command unchanged with no info, so
-        # forwarding stays byte-identical and no ledger entry is written.
+        # false and routing.quota disabled this returns the command unchanged
+        # with no info, so forwarding stays byte-identical and no ledger
+        # entry is written.
         weighted_info = None
+        quota_info = None
         eff_decision = None
         eff_command = command
         entry_id = None
@@ -11416,13 +11419,34 @@ def cmd_fleet(args, policy=None):
                                  "evalid can only replay a claimed acceptance command")
             if policy is None:
                 policy = load_policy()
-            eff_command, weighted_info, eff_decision = fleet_weighted_route(command, policy)
-            if weighted_info is not None:
+            eff_command, weighted_info, eff_decision, quota_info = fleet_weighted_route(command, policy)
+            if weighted_info is not None or quota_info is not None:
                 entry_id = f"fleet-{host['name']}-{uuid.uuid4().hex[:8]}"
+            if quota_info is not None and quota_info.get("all_exhausted"):
+                # M18 slice 1 (#173): every routable backend is at or below
+                # threshold — refuse to dispatch and fail loudly, mirroring
+                # the single-run quota_exhausted branch. The refusal itself
+                # is recorded in the controller ledger.
+                try:
+                    append_ledger({"id": entry_id, "run_id": None, "ts": NOW(),
+                                   "title": f"fleet {host['name']} quota exhausted",
+                                   "status": "unroutable", "host": host["name"],
+                                   "backend": eff_decision.get("backend") if eff_decision else parsed.backend,
+                                   "model": eff_decision.get("model") if eff_decision else parsed.model,
+                                   "card_type": parsed.card_type, "scope": parsed.scope,
+                                   "fleet_routing_decision": True, "weighted_routing": weighted_info,
+                                   "quota_routing": quota_info, "error_class": "quota_exhausted",
+                                   "summary": quota_info["reason"][:300], "seconds": None})
+                except OSError as error:
+                    print(f"openswarm: warning: could not record quota refusal for fleet "
+                          f"{host['name']} in ledger: {error}", file=sys.stderr)
+                raise ValueError(quota_info["reason"])
+            if quota_info is not None and (quota_info.get("rerouted") or quota_info.get("quota_error")):
+                print(f"quota: {quota_info['reason']}", file=sys.stderr)
         rc, out, err = host_run(host, host_openswarm(host, eff_command), timeout=args.timeout)
         sys.stdout.buffer.write(out)
         sys.stderr.buffer.write(err)
-        if weighted_info is not None and rc not in (124, 127):
+        if (weighted_info is not None or quota_info is not None) and rc not in (124, 127):
             # A transport failure (124 timeout / 127 unavailable) means the
             # command never ran, so there is no dispatch to record; a dry
             # run likewise dispatches nothing.
@@ -11436,7 +11460,7 @@ def cmd_fleet(args, policy=None):
                                               parsed.card_type if parsed else None,
                                               parsed.scope if parsed else None,
                                               weighted_info, eff_decision,
-                                              run_id=fleet_exec_run_id(out))
+                                              run_id=fleet_exec_run_id(out), quota_info=quota_info)
         if parsed is not None and parsed.verify_evalid and rc not in (124, 127):
             # M13 slice 2 (#153): copy the remote run's claim-vs-evidence
             # verdict into the controller ledger, like batch does per card.
@@ -11660,34 +11684,48 @@ batch_provider_slot_available(): a batch backend may legitimately be None
 
 
 def batch_weighted_route(spec, policy, custom_backends=None):
-    """Effective (backend, model, weighted_info, decision) for one batch card
-    (M7 slice 1, #122), reusing apply_weighted_routing() — the same decision
-    path single runs use (M6, #114).
+    """Effective (backend, model, weighted_info, decision, quota_info) for one batch card
+    (M7 slice 1, #122; M18 slice 1, #173 adds quota-aware rerouting after weighted),
+    reusing apply_weighted_routing() — the same decision path single runs use (M6, #114) —
+    then apply_quota_routing() (M17 slice 1, #169) on the weighted pick, so a card whose
+    default backend is at or below routing.quota.threshold reroutes to a backend with
+    remaining quota, re-planned through route() so model/effort/tier stay backend-correct.
 
-    Returns weighted_info None and decision None when routing.weighted is
-    false, without calling route()/get_state() at all, so record-only batches
-    dispatch byte-identically to before.
+    Returns weighted_info None and decision None when routing.weighted is false, and
+    quota_info None when routing.quota is disabled, without calling route()/get_state()
+    at all for the disabled half, so record-only batches dispatch byte-identically to
+    before when both are off.
 
     The batch-level backend in spec is the *default pick*, not an explicit
     --backend: it comes from the creation-time route() unless the user passed
     --backend (spec["backend_explicit"]). Only a user-explicit backend wins
-    over weighted routing; a routed default is re-derived live per card and
+    over weighted and quota routing; a routed default is re-derived live per card and
     may be rerouted. Specs written before backend_explicit existed are
     treated conservatively: a present backend counts as explicit, so an old
     queued batch never reroutes. A state/probe failure falls back to the
     spec backend (never strands the card); an invalid routing config
-    (ValueError, e.g. a bad advice_margin) fails loudly like a single run.
+    (ValueError, e.g. a bad advice_margin or quota block) fails loudly like a single run.
+    When every routable backend is at or below threshold, quota_info carries
+    all_exhausted and the caller must not dispatch the card.
     """
     backend, model = spec.get("backend"), spec.get("model")
     routing = policy.get("routing") or {}
-    if not routing.get("weighted", False):
-        return backend, model, None, None
+    quota = quota_config(policy)
+    weighted_on = bool(routing.get("weighted", False))
+    if not weighted_on and not quota["enabled"]:
+        return backend, model, None, None, None
     explicit = spec.get("backend_explicit")
     if explicit is None:
         explicit = bool(backend)
     if explicit:
-        return backend, model, {"applied": False,
-                                "reason": "explicit --backend wins over weighted routing"}, None
+        weighted_info = ({"applied": False,
+                          "reason": "explicit --backend wins over weighted routing"}
+                         if weighted_on else None)
+        quota_info = ({"enabled": True, "threshold": quota["threshold"], "applied": False,
+                       "quota_before": {},
+                       "reason": "explicit --backend wins over quota routing"}
+                      if quota["enabled"] else None)
+        return backend, model, weighted_info, None, quota_info
     try:
         if custom_backends is None:
             custom_backends = load_custom_backends(policy, explicit=spec.get("backends_file"))
@@ -11696,36 +11734,58 @@ def batch_weighted_route(spec, policy, custom_backends=None):
         if model:
             profile["model"] = model
         decision = route(profile, st, policy, custom_backends=custom_backends)
-        new_decision, info = apply_weighted_routing(profile, spec.get("card_type"), st, policy,
-                                                    decision, custom_backends=custom_backends)
+        if weighted_on:
+            new_decision, weighted_info = apply_weighted_routing(profile, spec.get("card_type"), st, policy,
+                                                                 decision, custom_backends=custom_backends)
+        else:
+            new_decision, weighted_info = decision, None
     except (RuntimeError, OSError) as error:
-        return backend, model, {"applied": False,
-                                "reason": f"weighted routing unavailable ({error}); kept the default pick"}, None
+        weighted_info = ({"applied": False,
+                          "reason": f"weighted routing unavailable ({error}); kept the default pick"}
+                         if weighted_on else None)
+        quota_info = ({"enabled": True, "threshold": quota["threshold"], "applied": False,
+                       "quota_before": {},
+                       "reason": f"quota routing unavailable ({error}); kept the default pick"}
+                      if quota["enabled"] else None)
+        return backend, model, weighted_info, None, quota_info
     if not new_decision.get("ok"):
-        return backend, model, info, None
-    return new_decision.get("backend"), new_decision.get("model"), info, new_decision
+        quota_info = ({"enabled": True, "threshold": quota["threshold"], "applied": False,
+                       "quota_before": {},
+                       "reason": "no routable default pick; quota not checked, kept the spec backend"}
+                      if quota["enabled"] else None)
+        return backend, model, weighted_info, None, quota_info
+    if quota["enabled"]:
+        new_decision, quota_info = apply_quota_routing(profile, st, policy, new_decision,
+                                                       custom_backends=custom_backends)
+    else:
+        quota_info = None
+    return new_decision.get("backend"), new_decision.get("model"), weighted_info, new_decision, quota_info
 
 
-def batch_record_routing_decision(summary, row, card_type, weighted_info, decision):
+def batch_record_routing_decision(summary, row, card_type, weighted_info, decision, quota_info=None,
+                                  status="dispatched"):
     """Ledger entry for one batch card's weighted-routing decision (M7 slice 1,
-    #122).
+    #122; M18 slice 1, #173 adds the quota-routing decision to the same entry).
 
     Mirrors batch_record_blocked: the controller ledger is where batch
     decisions are read (a remote run writes its own ledger on the executor
     host), so the per-card decision — routed_by_advice with both pass rates
     and sample counts, the same six fields M6 slice 3 established for single
-    runs — is recorded here under the batch-card id, joined to the run by
-    run_id. The entry is flagged batch_routing_decision so
-    compute_routing_weights() and ledger backfill-pass skip it: it is a
-    decision record, not a run outcome, and must not inflate run counts or
-    pass rates. A ledger write failure must not fail the batch, so it is
-    reported and the batch summary (which always records the decision)
-    stays authoritative.
+    runs, plus the quota_routing record (quota_before with both remainings,
+    the reason) M17 slice 1 established for single runs — is recorded here
+    under the batch-card id, joined to the run by run_id. The entry is
+    flagged batch_routing_decision so compute_routing_weights() and ledger
+    backfill-pass skip it: it is a decision record, not a run outcome, and
+    must not inflate run counts or pass rates. A ledger write failure must
+    not fail the batch, so it is reported and the batch summary (which always
+    records the decision) stays authoritative. `status` is "dispatched" for a
+    card that was dispatched; a quota refusal (all backends exhausted) records
+    "unroutable" instead, mirroring the single-run quota_exhausted entry.
     """
     try:
         entry = {"id": f"batch-{summary['id']}-{row['card']}", "run_id": row.get("run_id"),
                  "ts": NOW(), "title": f"batch {row['card']} routing decision",
-                 "status": "dispatched", "batch_id": summary["id"], "card": row["card"],
+                 "status": status, "batch_id": summary["id"], "card": row["card"],
                  "backend": row.get("backend"), "model": row.get("model"),
                  "card_type": card_type, "scope": summary.get("scope"),
                  "batch_routing_decision": True, "weighted_routing": weighted_info,
@@ -11737,6 +11797,12 @@ def batch_record_routing_decision(summary, row, card_type, weighted_info, decisi
                           "advice_samples": decision.get("advice_samples"),
                           "actual_pass_rate": decision.get("actual_pass_rate"),
                           "actual_samples": decision.get("actual_samples")})
+        if quota_info is not None:
+            entry["quota_routing"] = quota_info
+            if quota_info.get("rerouted"):
+                entry["quota_rerouted"] = True
+                entry["quota_rerouted_from"] = quota_info.get("from")
+                entry["quota_before"] = quota_info.get("quota_before")
         append_ledger(entry)
     except OSError as error:
         print(f"openswarm: warning: could not record routing decision for {row['card']} in ledger: {error}",
@@ -11818,32 +11884,43 @@ def fleet_run_arg_parser():
 
 
 def fleet_weighted_route(command, policy, custom_backends=None):
-    """Effective (command, weighted_info, decision) for one `fleet exec`
-    forwarded `run` (M7 slice 2, #124), reusing apply_weighted_routing() —
-    the same decision path single runs (M6, #114) and batch cards (M7
-    slice 1, #122) use.
+    """Effective (command, weighted_info, decision, quota_info) for one `fleet exec`
+    forwarded `run` (M7 slice 2, #124; M18 slice 1, #173 adds quota-aware rerouting
+    after weighted), reusing apply_weighted_routing() — the same decision path single
+    runs (M6, #114) and batch cards (M7 slice 1, #122) use — then
+    apply_quota_routing() (M17 slice 1, #169) on the weighted pick.
 
     Returns weighted_info None and decision None when routing.weighted is
-    false, without calling route()/get_state() at all, so record-only
+    false, and quota_info None when routing.quota is disabled, without calling
+    route()/get_state() at all for the disabled half, so record-only
     forwarding stays byte-identical. A user-explicit --backend always wins.
-    A reroute injects --backend/--model right after `run`, so the remote
-    run treats the advised pick as explicit and does not re-route it. The
+    A reroute (weighted or quota) injects --backend/--model right after `run`, so the
+    remote run treats the advised pick as explicit and does not re-route it. The
     returned decision is the live default pick when nothing rerouted (None
     only when it is unroutable), so the caller can record the effective
     backend/model either way. A state/probe failure falls back to the
     forwarded command (never strands the dispatch); an invalid routing
-    config (ValueError, e.g. a bad advice_margin) fails loudly like a
-    single run.
+    config (ValueError, e.g. a bad advice_margin or quota block) fails loudly like a
+    single run. When every routable backend is at or below threshold, quota_info
+    carries all_exhausted and the caller must refuse to dispatch.
     """
     if not command or command[0] != "run":
-        return command, None, None
+        return command, None, None, None
     routing = policy.get("routing") or {}
-    if not routing.get("weighted", False):
-        return command, None, None
+    quota = quota_config(policy)
+    weighted_on = bool(routing.get("weighted", False))
+    if not weighted_on and not quota["enabled"]:
+        return command, None, None, None
     parsed, _ = fleet_run_arg_parser().parse_known_args(command[1:])
     if parsed.backend:
-        return command, {"applied": False,
-                         "reason": "explicit --backend wins over weighted routing"}, None
+        weighted_info = ({"applied": False,
+                          "reason": "explicit --backend wins over weighted routing"}
+                         if weighted_on else None)
+        quota_info = ({"enabled": True, "threshold": quota["threshold"], "applied": False,
+                       "quota_before": {},
+                       "reason": "explicit --backend wins over quota routing"}
+                      if quota["enabled"] else None)
+        return command, weighted_info, None, quota_info
     try:
         if custom_backends is None:
             custom_backends = load_custom_backends(policy, explicit=parsed.backends_file)
@@ -11852,32 +11929,55 @@ def fleet_weighted_route(command, policy, custom_backends=None):
         profile["read_only"] = (profile.get("type") in READ_ONLY_CARD_TYPES
                                 or parsed.card_type in READ_ONLY_CARD_TYPES)
         decision = route(profile, st, policy, custom_backends=custom_backends)
-        new_decision, info = apply_weighted_routing(profile, parsed.card_type, st, policy,
-                                                    decision, custom_backends=custom_backends)
+        if weighted_on:
+            new_decision, info = apply_weighted_routing(profile, parsed.card_type, st, policy,
+                                                        decision, custom_backends=custom_backends)
+        else:
+            new_decision, info = decision, None
     except (RuntimeError, OSError) as error:
-        return command, {"applied": False,
-                         "reason": f"weighted routing unavailable ({error}); kept the default pick"}, None
+        weighted_info = ({"applied": False,
+                          "reason": f"weighted routing unavailable ({error}); kept the default pick"}
+                         if weighted_on else None)
+        quota_info = ({"enabled": True, "threshold": quota["threshold"], "applied": False,
+                       "quota_before": {},
+                       "reason": f"quota routing unavailable ({error}); kept the default pick"}
+                      if quota["enabled"] else None)
+        return command, weighted_info, None, quota_info
     if not new_decision.get("ok"):
-        return command, info, None
-    if not new_decision.get("routed_by_advice"):
-        return command, info, new_decision
+        quota_info = ({"enabled": True, "threshold": quota["threshold"], "applied": False,
+                       "quota_before": {},
+                       "reason": "no routable default pick; quota not checked, kept the forwarded command"}
+                      if quota["enabled"] else None)
+        return command, info, None, quota_info
+    if quota["enabled"]:
+        new_decision, quota_info = apply_quota_routing(profile, st, policy, new_decision,
+                                                       custom_backends=custom_backends)
+    else:
+        quota_info = None
+    if quota_info is not None and quota_info.get("all_exhausted"):
+        return command, info, new_decision, quota_info
+    if not new_decision.get("routed_by_advice") and not (quota_info and quota_info.get("rerouted")):
+        return command, info, new_decision, quota_info
     injected = ["--backend", new_decision["backend"]]
     if new_decision.get("model"):
         injected += ["--model", new_decision["model"]]
-    return ["run", *injected, *command[1:]], info, new_decision
+    return ["run", *injected, *command[1:]], info, new_decision, quota_info
 
 
 def fleet_record_routing_decision(host, entry_id, backend, model, card_type, scope,
-                                  weighted_info, decision, run_id=None):
+                                  weighted_info, decision, run_id=None, quota_info=None):
     """Ledger entry for one `fleet exec` run's weighted-routing decision
-    (M7 slice 2, #124).
+    (M7 slice 2, #124; M18 slice 1, #173 adds the quota-routing decision
+    to the same entry).
 
     Mirrors batch_record_routing_decision: the controller ledger is where
     fleet dispatch decisions are read (the remote run writes its own ledger
     on the executor host), so the decision — routed_by_advice with both pass
     rates and sample counts, the same six fields M6 slice 3 established for
-    single runs — is recorded here, joined to the remote run by run_id when
-    the reply carried one. The entry is flagged fleet_routing_decision so
+    single runs, plus the quota_routing record (quota_before with both
+    remainings, the reason) M17 slice 1 established for single runs — is
+    recorded here, joined to the remote run by run_id when the reply carried
+    one. The entry is flagged fleet_routing_decision so
     compute_routing_weights() and ledger backfill-pass skip it: it is a
     decision record, not a run outcome, and must not inflate run counts or
     pass rates. A ledger write failure must not fail the exec, so it is
@@ -11898,6 +11998,12 @@ def fleet_record_routing_decision(host, entry_id, backend, model, card_type, sco
                           "advice_samples": decision.get("advice_samples"),
                           "actual_pass_rate": decision.get("actual_pass_rate"),
                           "actual_samples": decision.get("actual_samples")})
+        if quota_info is not None:
+            entry["quota_routing"] = quota_info
+            if quota_info.get("rerouted"):
+                entry["quota_rerouted"] = True
+                entry["quota_rerouted_from"] = quota_info.get("from")
+                entry["quota_before"] = quota_info.get("quota_before")
         append_ledger(entry)
     except OSError as error:
         print(f"openswarm: warning: could not record routing decision for fleet {host} in ledger: {error}",
@@ -12423,7 +12529,24 @@ def execute_batch(spec, summary):
                     # decision path as single runs. With routing.weighted
                     # false this returns the spec backend/model with no info
                     # and touches nothing, so dispatch stays byte-identical.
-                    eff_backend, eff_model, weighted_info, eff_decision = batch_weighted_route(spec, policy)
+                    # M18 slice 1 (#173): quota-aware rerouting rides the
+                    # same call, after weighted routing.
+                    eff_backend, eff_model, weighted_info, eff_decision, quota_info = batch_weighted_route(spec, policy)
+                    if quota_info is not None and (quota_info.get("rerouted") or quota_info.get("quota_error")):
+                        print(f"quota: {quota_info['reason']}", file=sys.stderr)
+                    if quota_info is not None and quota_info.get("all_exhausted"):
+                        # Every routable backend is at or below threshold:
+                        # fail this card loudly and dispatch nothing. The
+                        # card is finished/failed, so its M4 dependents
+                        # block on the next pass like any other failure.
+                        row["backend"] = eff_backend
+                        row["model"] = eff_model
+                        batch_change(summary, row, "finished", status="failed",
+                                     summary=quota_info["reason"])
+                        batch_record_routing_decision(summary, row, spec.get("card_type"),
+                                                      weighted_info, eff_decision, quota_info,
+                                                      status="unroutable")
+                        continue
                     lock_path = os.path.join(DATA, "fleet-provider-concurrency.lock")
                     with open(lock_path, "a") as lock:
                         _flock(lock, LOCK_EX)
@@ -12436,10 +12559,15 @@ def execute_batch(spec, summary):
                             row["base"] = base or spec["base"]
                             if stacked_on:
                                 row["stacked_on"] = stacked_on
-                            if weighted_info is not None:
+                            if weighted_info is not None or quota_info is not None:
                                 row["backend"] = eff_backend
                                 row["model"] = eff_model
-                                row["weighted_routing"] = weighted_info
+                                if weighted_info is not None:
+                                    row["weighted_routing"] = weighted_info
+                                if quota_info is not None:
+                                    row["quota_routing"] = quota_info
+                                    if quota_info.get("rerouted"):
+                                        row["quota_rerouted_from"] = quota_info.get("from")
                                 if eff_decision is not None and eff_decision.get("routed_by_advice"):
                                     row["routed_by_advice"] = True
                                     row["routed_from"] = eff_decision.get("routed_from")
@@ -12448,7 +12576,7 @@ def execute_batch(spec, summary):
                                     row["actual_pass_rate"] = eff_decision.get("actual_pass_rate")
                                     row["actual_samples"] = eff_decision.get("actual_samples")
                                 batch_record_routing_decision(summary, row, spec.get("card_type"),
-                                                            weighted_info, eff_decision)
+                                                            weighted_info, eff_decision, quota_info)
                             batch_change(summary, row, "started", status="running")
                             count += 1
                         except (OSError, ValueError, RuntimeError, KeyError) as e:
