@@ -7,8 +7,8 @@ keeps the default pick and records gated_by_calibration with the diff and
 sample count in the info dict — the ledger's `weighted_routing` record on
 every path (run, batch, fleet, route). Groups below the sample bar are never
 gated, a group whose calibration recovers is followed again with no manual
-reset, an explicit --backend always wins, and with the switch off (the
-shipped default) every decision is byte-identical to today's behaviour.
+reset, an explicit --backend always wins, and with the switch off every decision
+is byte-identical to the pre-M16 behaviour.
 Run: python3 -m unittest discover -s tests   (or: python3 tests/test_calibration_gate.py)
 """
 import copy
@@ -116,10 +116,10 @@ class CalibrationGateTests(unittest.TestCase):
         return rows
 
     def test_switch_off_is_byte_identical(self):
-        """Gate switch off (shipped default): decisions, info dict and
+        """Gate switch off (explicitly disabled): decisions, info dict and
         decision object are exactly the static ones — no ledger read, no
         new field anywhere."""
-        policy = weighted_policy(weighted=True)  # calibration_gate absent -> off
+        policy = weighted_policy(weighted=True, calibration_gate=False)  # switch off: explicit, no longer the shipped default (M16, #163)
         st = scenario()
         decision = self.seed(policy, st)
         self.assertEqual(xs.calibration_gate_settings(policy)["enabled"], False)

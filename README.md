@@ -494,7 +494,7 @@ negative and never exceeds the cap. When a diversion uses an adaptive margin, th
 `--backend` always wins.
 
 `routing.calibration_gate` (M15, #160) stops following a miscalibrated advice group instead of merely raising
-its margin. It is off by default (`false`): with it off, every decision is byte-identical to today's behaviour.
+its margin. It is on by default (`true`, M16, #163): with it off, every decision is byte-identical to the pre-M16 behaviour.
 With it on, an advised group is gated when the same M8 calibration table flags it miscalibrated — `|advised -
 actual|` over `routing.calibration_gate_diff` (default 0.20) with at least `routing.calibration_gate_min_samples`
 (default 8) scored runs. A gated group never diverts the run: the decision keeps the default pick, and the
