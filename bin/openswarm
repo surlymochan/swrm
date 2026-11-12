@@ -11151,6 +11151,48 @@ def host_run(host, command, timeout=60, input=None):
         return 127, b"", b"transport executable unavailable"
 
 
+def host_stream(host, command, timeout=None):
+    """Run a long-lived command on a host and relay its output as it arrives.
+
+    host_run() buffers and discards stdout on timeout, which silently kills long
+    watchers (`fleet exec <host> -- watch`) that a Monitor depends on. Here every
+    chunk is forwarded immediately; timeout=None means no limit. stdin is not
+    forwarded. Returns the exit code (124 on timeout, 127 if unavailable)."""
+    if host["kind"] == "local":
+        argv = ["sh", "-c", command]
+    elif host["kind"] == "ssh":
+        argv = ["ssh", host["ssh"], "--", command]
+    else:
+        argv = ["instabox", "ssh", host["box"], "--", command]
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError:
+        sys.stderr.buffer.write(b"transport executable unavailable")
+        sys.stderr.buffer.flush()
+        return 127
+
+    def pump(src, dst):
+        for chunk in iter(lambda: src.readline(), b""):
+            dst.write(chunk)
+            dst.flush()
+
+    threads = [threading.Thread(target=pump, args=(proc.stdout, sys.stdout.buffer), daemon=True),
+               threading.Thread(target=pump, args=(proc.stderr, sys.stderr.buffer), daemon=True)]
+    for t in threads:
+        t.start()
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        rc = 124
+        sys.stderr.buffer.write(b"transport timed out")
+        sys.stderr.buffer.flush()
+    for t in threads:
+        t.join(timeout=5)
+    return rc
+
+
 LEDGER_MAX_LINE_BYTES = 64 * 1024
 LEDGER_MAX_HOST_LINES = 100_000
 
@@ -11996,6 +12038,12 @@ def cmd_fleet(args, policy=None):
                 raise ValueError(quota_info["reason"])
             if quota_info is not None and (quota_info.get("rerouted") or quota_info.get("quota_error")):
                 print(f"quota: {quota_info['reason']}", file=sys.stderr)
+        if command[0] == "watch":
+            # A watcher is long-lived and its lines are the product: stream them and
+            # do not apply the 300s buffered-command timeout unless one was requested.
+            raise SystemExit(host_stream(host, host_openswarm(host, eff_command), timeout=args.timeout))
+        if args.timeout is None:
+            args.timeout = 300
         rc, out, err = host_run(host, host_openswarm(host, eff_command), timeout=args.timeout)
         sys.stdout.buffer.write(out)
         sys.stderr.buffer.write(err)
@@ -16227,7 +16275,8 @@ def main():
                     help="explicitly reap runs judged dead (M11 semantics: mark finished/exited, one ledger line per reap; "
                          "zombie/alive/unknown runs are reported as skipped, never reaped). Default is read-only.")
     fp = fleet_sub.add_parser("exec")
-    fp.add_argument("--timeout", type=float, default=300)
+    fp.add_argument("--timeout", type=float, default=None,
+                    help="seconds; default 300, none for `watch`")
     fp.add_argument("host")
     fp.add_argument("args", nargs=argparse.REMAINDER)
     fp = fleet_sub.add_parser("ledger", help="collect ledgers from fleet hosts")
