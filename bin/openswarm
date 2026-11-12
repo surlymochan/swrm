@@ -4442,57 +4442,347 @@ def _quota_remaining_number(value, where):
     return value
 
 
-def custom_backend_quota(cfg):
-    """Check a custom backend's quota source. Returns (available, why)."""
-    source = cfg["quota_source"]
-    if source == "none":
-        return True, None
-    if source == "env":
-        var = cfg["quota_env_var"]
+def quota_remaining_from_source(source):
+    """Read one quota source. Returns (remaining, error).
+
+    `source` is a normalized dict: {"source": "env", "var": ...},
+    {"source": "command", "command": [...]}, {"source": "file", "file": ...},
+    or {"source": "none"}. `remaining` is a number, or None when the source
+    reports no usable quota ("none"); `error` is a string when the read
+    itself failed, else None. A numeric remaining may be <= 0 (exhausted) —
+    that is a successful read, not an error. Error strings keep
+    custom_backend_quota's wording, so existing callers see no change.
+    """
+    kind = source["source"]
+    if kind == "none":
+        return None, None
+    if kind == "env":
+        var = source["var"]
         raw = os.environ.get(var)
         if raw is None:
-            return False, f"quota env var {var} is not set"
+            return None, f"quota env var {var} is not set"
         try:
             remaining = _quota_remaining_number(float(raw), var)
         except ValueError:
-            return False, f"quota env var {var} is not a number: {raw!r}"
-        if remaining <= 0:
-            return False, f"quota exhausted ({var} remaining is {remaining})"
-        return True, None
-    if source == "command":
+            return None, f"quota env var {var} is not a number: {raw!r}"
+        return remaining, None
+    if kind == "command":
         try:
-            proc = subprocess.run(cfg["quota_command"], capture_output=True, text=True, timeout=10)
+            proc = subprocess.run(source["command"], capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.TimeoutExpired) as exc:
-            return False, f"quota command failed to run: {exc}"
+            return None, f"quota command failed to run: {exc}"
         if proc.returncode != 0:
-            return False, f"quota command exited {proc.returncode}: {(proc.stderr or '').strip()[:200]}"
+            return None, f"quota command exited {proc.returncode}: {(proc.stderr or '').strip()[:200]}"
         try:
             remaining = _quota_remaining_number(json.loads(proc.stdout), "quota command output")
         except ValueError:
             try:
                 remaining = _quota_remaining_number(float(proc.stdout.strip()), "quota command output")
             except ValueError:
-                return False, f"quota command output is not a number or {{\"remaining\": n}}: {proc.stdout.strip()[:200]!r}"
-        if remaining <= 0:
-            return False, f"quota exhausted (quota command remaining is {remaining})"
-        return True, None
-    if source == "file":
+                return None, (f"quota command output is not a number or {{\"remaining\": n}}: "
+                              f"{proc.stdout.strip()[:200]!r}")
+        return remaining, None
+    if kind == "file":
         try:
-            with open(os.path.expanduser(cfg["quota_file"]), encoding="utf-8") as fh:
+            with open(os.path.expanduser(source["file"]), encoding="utf-8") as fh:
                 raw = fh.read()
         except OSError as exc:
-            return False, f"quota file unreadable: {exc}"
+            return None, f"quota file unreadable: {exc}"
         try:
-            remaining = _quota_remaining_number(json.loads(raw), cfg["quota_file"])
+            remaining = _quota_remaining_number(json.loads(raw), source["file"])
         except ValueError:
             try:
-                remaining = _quota_remaining_number(float(raw.strip()), cfg["quota_file"])
+                remaining = _quota_remaining_number(float(raw.strip()), source["file"])
             except ValueError:
-                return False, f"quota file is not a number or {{\"remaining\": n}}: {raw.strip()[:200]!r}"
-        if remaining <= 0:
-            return False, f"quota exhausted ({cfg['quota_file']} remaining is {remaining})"
+                return None, (f"quota file is not a number or {{\"remaining\": n}}: "
+                              f"{raw.strip()[:200]!r}")
+        return remaining, None
+    return None, f"unknown quota_source {kind!r}"
+
+
+def quota_exhausted_reason(source, remaining):
+    """The 'quota exhausted ...' reason for a source that read <= 0."""
+    kind = source["source"]
+    if kind == "env":
+        return f"quota exhausted ({source['var']} remaining is {remaining})"
+    if kind == "command":
+        return f"quota exhausted (quota command remaining is {remaining})"
+    if kind == "file":
+        return f"quota exhausted ({source['file']} remaining is {remaining})"
+    return f"quota exhausted (remaining is {remaining})"
+
+
+def custom_backend_source(cfg):
+    """A custom backend's quota config as a normalized quota source dict."""
+    source = {"source": cfg["quota_source"]}
+    field = CUSTOM_BACKEND_QUOTA_FIELDS.get(cfg["quota_source"])
+    if field:
+        key = {"quota_env_var": "var", "quota_command": "command", "quota_file": "file"}[field]
+        source[key] = cfg[field]
+    return source
+
+
+def custom_backend_quota(cfg):
+    """Check a custom backend's quota source. Returns (available, why)."""
+    source = custom_backend_source(cfg)
+    remaining, error = quota_remaining_from_source(source)
+    if error is not None:
+        return False, error
+    if remaining is None:
         return True, None
-    return False, f"unknown quota_source {source!r}"
+    if remaining <= 0:
+        return False, quota_exhausted_reason(source, remaining)
+    return True, None
+
+
+# ---------------------------------------------------------------- quota-aware routing (M17 slice 1, #169)
+# The quota-aware sell line, finally wired into routing: a backend whose
+# configured remaining quota is at or below routing.quota.threshold no
+# longer receives new runs. Sources reuse the custom-backend vocabulary
+# (env / command / file reading a number or {"remaining": n}); the policy
+# source wins over a custom backend's own quota_source when both exist.
+# Shipped default is enabled=false: the mechanism is present, behaviour is
+# unchanged until slice 2 decides whether to flip it on (M9/M16 pattern).
+# No weighted/calibration semantics change: quota rerouting runs after
+# apply_weighted_routing and only swaps the backend, re-planning through
+# route() so model/effort/tier stay backend-correct.
+#
+# Policy shape (policy.json, routing.quota):
+#   {"enabled": false, "threshold": 0,
+#    "sources": {"codex": {"source": "env", "var": "OPENSWARM_QUOTA_CODEX"},
+#                "ocgo":  {"source": "file", "file": "~/quota-ocgo.json"}}}
+# A backend with no source anywhere reads as unknown: it is never claimed
+# exhausted, and it is only taken as a reroute target when no known-good
+# backend is available. A failed read is never a silent downgrade: the run
+# keeps the default pick (old behaviour) and the failure is recorded in the
+# ledger's quota_routing entry and printed to stderr.
+
+
+QUOTA_SOURCE_FIELDS = {"env": "var", "command": "command", "file": "file"}
+
+
+def normalize_quota_source(raw, where):
+    """Validate one policy quota source dict → normalized {"source", ...}.
+
+    Raises ValueError with the location and the fix; a bad config must
+    refuse to start, never silently route without quota data.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where}: quota source must be an object with 'source', "
+                         f"got {type(raw).__name__}; fix the entry or remove it")
+    unknown = sorted(set(raw) - {"source", "var", "command", "file"})
+    if unknown:
+        raise ValueError(f"{where}: unknown field(s) {', '.join(unknown)}; allowed fields are "
+                         f"source, var, command, file")
+    kind = raw.get("source")
+    if kind not in ("none", "env", "command", "file"):
+        raise ValueError(f"{where}: 'source' must be one of none, env, command, file, "
+                         f"got {kind!r}; set \"source\": \"none\" when the backend reports "
+                         f"no usable quota")
+    out = {"source": kind}
+    if kind == "none":
+        return out
+    field = QUOTA_SOURCE_FIELDS[kind]
+    value = raw.get(field)
+    if kind == "command":
+        ok = isinstance(value, list) and bool(value) and all(
+            isinstance(tok, str) and tok for tok in value)
+    else:
+        ok = isinstance(value, str) and bool(value)
+    if not ok:
+        raise ValueError(f"{where}: 'source' {kind!r} requires '{field}' "
+                         f"(env var name / argv list / file path); add it or set "
+                         f"\"source\": \"none\"")
+    out[field] = value
+    return out
+
+
+def quota_config(policy):
+    """Validate routing.quota → {"enabled", "threshold", "sources"}.
+
+    Missing section means disabled with threshold 0 and no sources. Any
+    invalid value raises ValueError: a quota config that cannot be read
+    must fail loudly, never route on a misread threshold.
+    """
+    raw = (policy.get("routing") or {}).get("quota") or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"routing.quota must be an object with 'enabled', 'threshold' and "
+                         f"'sources', got {type(raw).__name__}; fix policy.json or remove the block")
+    unknown = sorted(set(raw) - {"enabled", "threshold", "sources"})
+    if unknown:
+        raise ValueError(f"routing.quota: unknown field(s) {', '.join(unknown)}; allowed fields are "
+                         f"enabled, threshold, sources")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"routing.quota.enabled must be a boolean, got {enabled!r}")
+    threshold = raw.get("threshold", 0)
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        raise ValueError(f"routing.quota.threshold must be a number >= 0, got {threshold!r}")
+    if threshold < 0:
+        raise ValueError(f"routing.quota.threshold must be a number >= 0, got {threshold!r}")
+    sources = raw.get("sources") or {}
+    if not isinstance(sources, dict):
+        raise ValueError(f"routing.quota.sources must be an object of backend id to quota source, "
+                         f"got {type(sources).__name__}")
+    return {"enabled": enabled, "threshold": threshold,
+            "sources": {backend: normalize_quota_source(src, f"routing.quota.sources[{backend!r}]")
+                        for backend, src in sources.items()}}
+
+
+def quota_source_text(source):
+    """Human-readable source, e.g. 'env FOO', 'command foo --bar', 'file ~/x.json'."""
+    kind = source["source"]
+    if kind == "env":
+        return f"env {source['var']}"
+    if kind == "command":
+        return "command " + " ".join(source["command"])
+    if kind == "file":
+        return f"file {source['file']}"
+    return "none (unknown)"
+
+
+def quota_remaining_for_backend(backend, cfg, custom_backends=()):
+    """Remaining quota for one backend: (remaining, error).
+
+    Policy routing.quota.sources wins; otherwise a custom backend's own
+    quota_source. (None, None) when no source is configured anywhere — the
+    backend's quota is unknown, not zero.
+    """
+    if backend in cfg["sources"]:
+        return quota_remaining_from_source(cfg["sources"][backend])
+    for entry in custom_backends or ():
+        if entry["id"] == backend:
+            return quota_remaining_from_source(custom_backend_source(entry))
+    return None, None
+
+
+def quota_probe_row(backend, cfg, custom_backends=()):
+    """One `openswarm quota` row: {backend, source, remaining, status, detail}.
+
+    status is "ok" (remaining above threshold), "low" (at or below it),
+    "unknown" (no source configured), or "error" (the read itself failed).
+    Read-only: touches only the configured source, never state.json.
+    """
+    source = cfg["sources"].get(backend)
+    if source is None:
+        for entry in custom_backends or ():
+            if entry["id"] == backend and entry["quota_source"] != "none":
+                source = custom_backend_source(entry)
+                break
+    if source is None:
+        return {"backend": backend, "source": "none (unknown)", "remaining": None,
+                "status": "unknown",
+                "detail": "no quota source configured; routing cannot judge this backend"}
+    remaining, error = quota_remaining_from_source(source)
+    if error is not None:
+        return {"backend": backend, "source": quota_source_text(source), "remaining": None,
+                "status": "error", "detail": error}
+    if remaining is None:
+        return {"backend": backend, "source": quota_source_text(source), "remaining": None,
+                "status": "unknown", "detail": "source reports no usable quota"}
+    if remaining <= cfg["threshold"]:
+        return {"backend": backend, "source": quota_source_text(source), "remaining": remaining,
+                "status": "low",
+                "detail": f"remaining {remaining} is at or below threshold {cfg['threshold']}"}
+    return {"backend": backend, "source": quota_source_text(source), "remaining": remaining,
+            "status": "ok", "detail": f"remaining {remaining} is above threshold {cfg['threshold']}"}
+
+
+def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
+    """Quota-aware reroute for `openswarm run`. Returns (decision, info).
+
+    info is None when routing.quota.enabled is false (shipped default: the
+    mechanism exists, behaviour is unchanged). Otherwise info is the ledger
+    record: threshold, quota_before {backend: remaining}, reroute from/to +
+    reason, or quota_error when a read failed. The reroute re-plans through
+    route() with the spent backend excluded, so the new backend's model,
+    effort and tier are its own — never the old backend's values carried
+    over. Explicit --backend always wins; a failed read keeps the default
+    pick (old behaviour) on the record instead of silently downgrading.
+    """
+    cfg = quota_config(policy)
+    if not cfg["enabled"]:
+        return decision, None
+    threshold = cfg["threshold"]
+    base = {"enabled": True, "threshold": threshold}
+    if profile.get("backend"):
+        return decision, {**base, "applied": False, "quota_before": {},
+                          "reason": "explicit --backend wins over quota routing"}
+    checked, errors = {}, {}
+    current = decision
+    tried = []
+    while True:
+        backend = current["backend"]
+        remaining, error = quota_remaining_for_backend(backend, cfg, custom_backends)
+        if error is not None:
+            errors[backend] = error
+            if not tried:
+                return decision, {**base, "applied": False, "quota_before": checked,
+                                  "quota_error": errors,
+                                  "reason": (f"quota read failed for {backend!r}: {error}; "
+                                             f"kept the default pick (old behaviour)")}
+            tried.append(backend)
+            nxt = route(profile, st, policy, custom_backends=custom_backends, exclude=tuple(tried))
+            if not nxt.get("ok"):
+                return decision, {**base, "applied": False, "quota_before": checked,
+                                  "quota_error": errors,
+                                  "reason": ("no fallback with readable quota above threshold "
+                                             f"{threshold}; kept the default pick")}
+            current = nxt
+            continue
+        checked[backend] = remaining
+        if remaining is None or remaining > threshold:
+            if not tried:
+                return current, {**base, "applied": False, "quota_before": checked,
+                                 "reason": (f"{backend} quota unknown; kept the default pick"
+                                            if remaining is None else
+                                            f"{backend} remaining {remaining} is above threshold {threshold}")}
+            rerouted = dict(current)
+            rerouted["quota_rerouted_from"] = decision["backend"]
+            return rerouted, {**base, "applied": True, "rerouted": True,
+                              "from": decision["backend"], "to": backend,
+                              "quota_before": checked, "quota_error": errors,
+                              "reason": (f"{decision['backend']} remaining "
+                                         f"{checked[decision['backend']]} is at or below threshold "
+                                         f"{threshold}; rerouted to {backend} "
+                                         f"(remaining {'unknown' if remaining is None else remaining})")}
+        tried.append(backend)
+        nxt = route(profile, st, policy, custom_backends=custom_backends, exclude=tuple(tried))
+        if not nxt.get("ok"):
+            return decision, {**base, "applied": False, "all_exhausted": True,
+                              "quota_before": checked, "quota_error": errors,
+                              "skipped": nxt.get("skipped"),
+                              "reason": (f"all routable backends at or below threshold {threshold}: "
+                                         + ", ".join(f"{b} remaining {r}" for b, r in checked.items())
+                                         + "; refusing to dispatch")}
+        current = nxt
+
+
+def cmd_quota(args, policy, custom_backends=None):
+    """Read-only quota probe (M17 slice 1, #169): remaining quota per backend.
+
+    Never routes, dispatches, or writes state. Exit 1 when any configured
+    source fails to read; 0 otherwise (unknown sources are not failures).
+    """
+    cfg = quota_config(policy)
+    if custom_backends is None:
+        custom_backends = load_custom_backends(policy, explicit=getattr(args, "backends_file", None))
+    order = list((policy.get("routing") or {}).get("default_order") or [])
+    for backend in list(PLANNERS) + list(cfg["sources"]) + [entry["id"] for entry in custom_backends]:
+        if backend not in order:
+            order.append(backend)
+    rows = [quota_probe_row(backend, cfg, custom_backends) for backend in order]
+    if getattr(args, "json", False):
+        print(json.dumps({"quota_routing_enabled": cfg["enabled"], "threshold": cfg["threshold"],
+                          "backends": rows}, indent=2, ensure_ascii=False))
+    else:
+        print(f"quota routing: {'enabled' if cfg['enabled'] else 'disabled'} "
+              f"(threshold {cfg['threshold']})")
+        for row in rows:
+            remaining = "unknown" if row["remaining"] is None else str(row["remaining"])
+            print(f"{row['backend']:<12} {remaining:<10} {row['status']:<7} {row['source']}  {row['detail']}")
+    if any(row["status"] == "error" for row in rows):
+        sys.exit(1)
 
 
 def plan_custom_backend(cfg, prof, st, policy, forced, notes):
@@ -6676,6 +6966,34 @@ def cmd_run(args, policy, custom_backends=None):
         routing_fields["advice_samples"] = decision.get("advice_samples")
         routing_fields["actual_pass_rate"] = decision.get("actual_pass_rate")
         routing_fields["actual_samples"] = decision.get("actual_samples")
+    # M17 slice 1 (#169): quota-aware reroute runs after weighted routing
+    # (weighted/calibration semantics untouched) and before dry-run, so a
+    # dry run shows the quota decision too. Invalid quota config raises
+    # ValueError → the main dispatch fails loudly, never silently unguarded.
+    decision, quota_info = apply_quota_routing(prof, st, policy, decision,
+                                               custom_backends=custom_backends)
+    if quota_info is not None:
+        routing_fields["quota_routing"] = quota_info
+        if quota_info.get("rerouted"):
+            print(f"quota: {quota_info['reason']}", file=sys.stderr)
+        elif quota_info.get("quota_error"):
+            print(f"quota: {quota_info['reason']}", file=sys.stderr)
+    if quota_info is not None and quota_info.get("all_exhausted"):
+        # Every routable backend is at or below threshold: fail loudly and
+        # dispatch nothing, mirroring the unroutable branch above.
+        out = {"id": rid, "status": "unroutable", "error_class": "quota_exhausted",
+               "error": quota_info["reason"], "decision": decision, "scope": scope,
+               **routing_fields}
+        set_status(rdir, state="unroutable", scope=scope)
+        append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "unroutable",
+                       "decision": decision, "scope": scope, "error_class": "quota_exhausted",
+                       "summary": quota_info["reason"][:300],
+                       "card_type": card_type, "rework_of": rework_of,
+                       **exec_pass_fields(False, False, bool(args.verify), None),
+                       **routing_fields})
+        jsave(f"{rdir}/result.json", out)
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        sys.exit(2)
     if args.dry_run:
         set_status(rdir, state="dry-run", scope=scope)
         print(json.dumps({"id": rid, "dry_run": True, "decision": decision, "scope": scope,
@@ -14960,7 +15278,7 @@ def main():
     # commands instead of silently falling back to the built-ins, and the
     # custom ids join the --backend choices.
     custom_backends = []
-    if len(sys.argv) > 1 and sys.argv[1] in ("route", "run", "batch"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("route", "run", "batch", "quota"):
         try:
             custom_backends = load_custom_backends(policy=load_policy(),
                                                    explicit=backends_file_from_argv(sys.argv))
@@ -15108,6 +15426,9 @@ def main():
                     help="review task: allow status=done without repo changes or commits")
     sp.add_argument("--executor", help="optional GitHub bus executor routing label")
 
+    sp = sub.add_parser("quota", help="read-only probe: remaining quota per backend (M17, #169)")
+    sp.add_argument("--backends-file", help="custom backends config (JSON); defaults to $OPENSWARM_HOME/backends.json")
+    sp.add_argument("--json", action="store_true", help="print the probe as JSON")
     sp = sub.add_parser("compare", help="run one task in parallel on two executor families")
     add_dispatch_arguments(sp, "task-file", "title", task_file_required=True, title_required=True)
     sp.add_argument("--a", help="first executor backend or BACKEND:MODEL")
@@ -15459,6 +15780,12 @@ def main():
             sys.exit(2)
     elif a.cmd == "report":
         cmd_report(a, policy)
+    elif a.cmd == "quota":
+        try:
+            cmd_quota(a, policy, custom_backends=custom_backends)
+        except ValueError as error:
+            print(f"openswarm: {error}", file=sys.stderr)
+            sys.exit(2)
     elif a.cmd == "retro":
         try:
             cmd_retro(a, policy)

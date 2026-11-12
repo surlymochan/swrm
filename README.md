@@ -241,6 +241,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm watch --from-end` | Resume a watch whose window expired; events already written are skipped. | `openswarm watch <run-id> --from-end` |
 | `openswarm status` | Show plans, quota windows, models, breakers, and recommended concurrency. | `openswarm status --refresh` |
 | `openswarm probe` | Discover models, plans, and quotas into `$OPENSWARM_HOME/state.json`. | `openswarm probe --quiet` |
+| `openswarm quota` | Read-only probe: remaining quota per backend from its configured source. | `openswarm quota --json` |
 | `openswarm runs` | Snapshot recent or active runs. | `openswarm runs --active --json` |
 | `openswarm diagnose` | Classify a failed run (timeout / quota / verify-fail / exec-error / runner-error / unknown) with evidence pointers; read-only. | `openswarm diagnose <run-id>` |
 | `openswarm resume` | Recover live runs, busy lanes and recent results after a planner restart. | `openswarm resume --since-hours 12 --json` |
@@ -766,6 +767,31 @@ by the router with the reason recorded. `quota_file` is read from the
 current directory (use an absolute path if you run from elsewhere); command
 tokens naming a file next to the config resolve against the config
 directory instead.
+
+Quota-aware routing (M17) reuses the same three source kinds for built-in
+backends, configured in policy under `routing.quota`:
+
+```json
+"quota": {
+  "enabled": true,
+  "threshold": 0,
+  "sources": {
+    "codex": {"source": "env", "var": "OPENSWARM_QUOTA_CODEX"},
+    "ocgo": {"source": "file", "file": "~/quota-ocgo.json"}
+  }
+}
+```
+
+When `enabled`, `openswarm run` reroutes off a default backend whose
+remaining quota is at or below `threshold`, to the next backend with
+remaining quota above it; the decision (`quota_before` with both
+remainings, the reason) lands in the ledger and `result.json`, and when
+every routable backend is exhausted the run fails loudly with
+`quota_exhausted` instead of dispatching. An explicit `--backend` always
+wins, and a failed quota read keeps the old behaviour on the record instead
+of silently downgrading. `enabled` ships `false`: the mechanism is present,
+the behaviour is unchanged until it is flipped on. `openswarm quota`
+reports the same readings read-only, without routing or dispatching.
 
 A second shipped example proves the same contract with a different backend
 in all three dimensions — no code changes: [`examples/patch-cli.py`](examples/patch-cli.py)
