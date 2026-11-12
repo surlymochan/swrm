@@ -3265,6 +3265,335 @@ def cmd_gate_eval(args, policy):
     print(gate_eval_text(result, path), end="")
 
 
+# ---------------------------------------------------------------- quota-flip evaluation (M19 slice 1, #177)
+
+def _quota_eval_number(value):
+    """True for a usable quota reading: a finite number, never a bool."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def _quota_eval_prefix_rate(entries, backend, card_type):
+    """Observed pass rate of runs dispatched on `backend`/`card_type`.
+
+    Runs dispatched on that backend only (a rerouted run's outcome belongs
+    to its target, never to the backend it left); decision records carry
+    no outcome and contribute nothing. None when no scored run exists.
+    """
+    outcomes = [routing_outcome(entry) for entry in entries
+                if isinstance(entry, dict) and entry.get("backend") == backend
+                and str(entry.get("card_type") or "-") == card_type]
+    outcomes = [outcome for outcome in outcomes if outcome is not None]
+    if not outcomes:
+        return None
+    return sum(outcomes) / len(outcomes)
+
+
+def compute_quota_eval(entries, default_threshold=0):
+    """Quota-aware flip counterfactual replay, by (default backend, card type).
+
+    The replay is read-only and never re-reads live quota: each decision is
+    replayed from the dispatch-time snapshot the ledger itself recorded
+    (`quota_routing.quota_before` with the `threshold` recorded alongside
+    it), under the same rule `apply_quota_routing` applies live — a backend
+    whose remaining is at or below the threshold no longer receives new
+    runs. The shipped `enabled` switch is ignored (the replay runs as if
+    quota routing were on, as `cmd_gate_eval` ignores the gate's switch);
+    a missing recorded threshold falls back to `default_threshold`, taken
+    from policy by `cmd_quota_eval`.
+
+    For each replayable decision (a `quota_routing` record with a usable
+    `quota_before` snapshot), in ledger order:
+    - default pick: the recorded `from` when the run rerouted, else the
+      entry's own backend, else the first backend in `quota_before`
+      (insertion order is check order — `apply_quota_routing` checks the
+      default pick first — so the first key is the default pick).
+    - verdict: an explicit `--backend` stays by design; a default whose
+      remaining is unknown (null) stays — it is never claimed exhausted;
+      a default above the threshold stays; a default at or below it
+      reroutes to the first other backend in the snapshot with remaining
+      above the threshold (or, failing that, with unknown remaining —
+      the live code takes an unknown backend when no known-good one is
+      available), and refuses when every recorded backend is at or below
+      the threshold. A decision whose snapshot does not cover the default
+      pick (a failed read kept the old behaviour) is "unknown": the record
+      cannot say what quota-on would have done, and it is counted
+      separately, never guessed.
+    - the replay verdict is cross-checked against the recorded live
+      verdict (`rerouted`/`all_exhausted`/stayed, target included);
+      mismatches are listed, so the replay can be verified against the
+      ledger instead of trusted. Batch/fleet decision records carry no
+      outcome: they enter the reroute/refuse shares but not the pass
+      rates, exactly as `compute_gate_eval` treats unscored advice.
+    - expected pass rates are reported over scored runs only, and no
+      per-run counterfactual outcome is invented: a stayed run keeps its
+      observed outcome both ways; a rerouted run is credited with the
+      default backend's prefix observed rate under quota-off and the
+      target backend's prefix observed rate under quota-on (the live
+      view at dispatch time — the strict prefix, as in `compute_gate_eval`);
+      a refused run is credited with the default's prefix rate under
+      quota-off and 0 under quota-on (it never dispatches, so over
+      attempted runs it cannot pass); a missing prefix rate falls back to
+      the run's own observed outcome. A refused run's recorded
+      `exec_pass: false` is the refusal artefact, never an execution
+      result, so it is never used as the run's outcome in either basis.
+    Entries with no `quota_routing` record (quota was off at dispatch, or
+    the entry is not a quota decision — e.g. a batch card blocked by a
+    dependency) are unreplayable and counted separately with their ids;
+    ordinary history still feeds the prefix rates.
+    """
+    if isinstance(default_threshold, bool) or not isinstance(default_threshold, (int, float)) \
+            or not math.isfinite(default_threshold) or default_threshold < 0:
+        raise ValueError("quota_eval_threshold must be a number >= 0")
+    entries = list(entries)
+    groups = {}
+    unreplayable_ids = []
+    all_rerouted_ids = []
+    all_refused_ids = []
+    all_mismatched_ids = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        qr = entry.get("quota_routing")
+        if not isinstance(qr, dict) or not isinstance(qr.get("quota_before"), dict):
+            unreplayable_ids.append(entry.get("id"))
+            continue
+        quota_before = qr["quota_before"]
+        recorded_threshold = qr.get("threshold")
+        if recorded_threshold is None:
+            threshold = default_threshold
+        elif _quota_eval_number(recorded_threshold) and recorded_threshold >= 0:
+            threshold = recorded_threshold
+        else:
+            unreplayable_ids.append(entry.get("id"))
+            continue
+        if any(value is not None and not _quota_eval_number(value)
+               for value in quota_before.values()):
+            unreplayable_ids.append(entry.get("id"))
+            continue
+        reason = qr.get("reason") or ""
+        rerouted_from = entry.get("quota_rerouted_from") or qr.get("from")
+        if rerouted_from:
+            default = str(rerouted_from)
+        elif isinstance(entry.get("backend"), str) and entry["backend"]:
+            default = entry["backend"]
+        elif quota_before:
+            default = str(next(iter(quota_before)))
+        else:
+            unreplayable_ids.append(entry.get("id"))
+            continue
+        card_type = str(entry.get("card_type") or "-")
+        key = (default, card_type)
+        group = groups.setdefault(key, {"decisions": 0, "rerouted": 0, "refused": 0,
+                                        "stayed": 0, "unknown": 0, "outcomes": [],
+                                        "expected_off": [], "expected_on": [],
+                                        "replay_matches": 0, "mismatched_ids": [],
+                                        "rerouted_ids": [], "refused_ids": []})
+        group["decisions"] += 1
+        # Replay verdict from the snapshot, under the live rule.
+        if "explicit --backend wins" in reason:
+            verdict, target = "stayed", None
+        elif default not in quota_before:
+            verdict, target = "unknown", None
+        else:
+            remaining = quota_before[default]
+            if remaining is None or remaining > threshold:
+                verdict, target = "stayed", None
+            else:
+                target = None
+                for candidate, candidate_remaining in quota_before.items():
+                    if candidate == default:
+                        continue
+                    if (_quota_eval_number(candidate_remaining)
+                            and candidate_remaining > threshold):
+                        target = str(candidate)
+                        break
+                if target is None:
+                    for candidate, candidate_remaining in quota_before.items():
+                        if candidate != default and candidate_remaining is None:
+                            target = str(candidate)
+                            break
+                verdict = "rerouted" if target is not None else "refused"
+        recorded = ("refused" if qr.get("all_exhausted")
+                    else "rerouted" if (qr.get("rerouted") or qr.get("applied"))
+                    else "stayed")
+        recorded_target = str(qr["to"]) if recorded == "rerouted" and qr.get("to") else None
+        match = verdict == recorded and (verdict != "rerouted" or target == recorded_target)
+        if match:
+            group["replay_matches"] += 1
+        else:
+            group["mismatched_ids"].append(entry.get("id"))
+            all_mismatched_ids.append(entry.get("id"))
+        group[verdict if verdict in ("rerouted", "refused", "stayed") else "unknown"] += 1
+        if verdict == "rerouted":
+            group["rerouted_ids"].append(entry.get("id"))
+            all_rerouted_ids.append(entry.get("id"))
+        elif verdict == "refused":
+            group["refused_ids"].append(entry.get("id"))
+            all_refused_ids.append(entry.get("id"))
+        outcome = routing_outcome(entry)
+        if outcome is None:
+            continue
+        group["outcomes"].append(outcome)
+        observed = 1.0 if outcome else 0.0
+        prefix = entries[:index]
+        if verdict == "stayed" or verdict == "unknown":
+            group["expected_off"].append(observed)
+            group["expected_on"].append(observed)
+        elif verdict == "rerouted":
+            off = _quota_eval_prefix_rate(prefix, default, card_type)
+            on = _quota_eval_prefix_rate(prefix, target, card_type)
+            group["expected_off"].append(off if off is not None else observed)
+            group["expected_on"].append(on if on is not None else observed)
+        else:  # refused: quota-off would have run on the default pick.
+            off = _quota_eval_prefix_rate(prefix, default, card_type)
+            group["expected_off"].append(off if off is not None else observed)
+            group["expected_on"].append(0.0)
+    rows = []
+    for (backend, card_type), group in sorted(groups.items()):
+        n = len(group["outcomes"])
+        decided = group["rerouted"] + group["refused"] + group["stayed"]
+        actual_rate = round(sum(group["outcomes"]) / n, 6) if n else None
+        exp_off = round(sum(group["expected_off"]) / n, 6) if n else None
+        exp_on = round(sum(group["expected_on"]) / n, 6) if n else None
+        rows.append({
+            "backend": backend,
+            "card_type": card_type,
+            "decisions": group["decisions"],
+            "rerouted": group["rerouted"],
+            "refused": group["refused"],
+            "stayed": group["stayed"],
+            "unknown": group["unknown"],
+            "decided": decided,
+            "rerouted_share": round(group["rerouted"] / decided, 6) if decided else None,
+            "refused_share": round(group["refused"] / decided, 6) if decided else None,
+            "stayed_share": round(group["stayed"] / decided, 6) if decided else None,
+            "rerouted_ids": group["rerouted_ids"],
+            "refused_ids": group["refused_ids"],
+            "n": n,
+            "actual_pass_rate": actual_rate,
+            "expected_pass_rate_quota_off": exp_off,
+            "expected_pass_rate_quota_on": exp_on,
+            "expected_delta": (round(exp_on - exp_off, 6)
+                               if exp_off is not None and exp_on is not None else None),
+            "replay_matches": group["replay_matches"],
+            "mismatched_ids": group["mismatched_ids"],
+            "small_n": bool(0 < n < ADVICE_ACCURACY_FLAG_MIN_SAMPLES),
+        })
+    total_decisions = sum(row["decisions"] for row in rows)
+    total_decided = sum(row["decided"] for row in rows)
+    total_rerouted = sum(row["rerouted"] for row in rows)
+    total_refused = sum(row["refused"] for row in rows)
+    total_stayed = sum(row["stayed"] for row in rows)
+    total_unknown = sum(row["unknown"] for row in rows)
+    total_scored = sum(row["n"] for row in rows)
+    tot_exp_off = (round(sum(sum(group["expected_off"]) for group in groups.values())
+                         / total_scored, 6) if total_scored else None)
+    tot_exp_on = (round(sum(sum(group["expected_on"]) for group in groups.values())
+                        / total_scored, 6) if total_scored else None)
+    tot_actual = (round(sum(sum(group["outcomes"]) for group in groups.values())
+                        / total_scored, 6) if total_scored else None)
+    return {"groups": rows,
+            "default_threshold": default_threshold,
+            "total_replayable": total_decisions,
+            "total_decided": total_decided,
+            "total_rerouted": total_rerouted,
+            "total_refused": total_refused,
+            "total_stayed": total_stayed,
+            "total_unknown": total_unknown,
+            "rerouted_share": (round(total_rerouted / total_decided, 6)
+                               if total_decided else None),
+            "refused_share": (round(total_refused / total_decided, 6)
+                              if total_decided else None),
+            "stayed_share": (round(total_stayed / total_decided, 6)
+                             if total_decided else None),
+            "rerouted_ids": all_rerouted_ids,
+            "refused_ids": all_refused_ids,
+            "total_scored": total_scored,
+            "actual_pass_rate": tot_actual,
+            "expected_pass_rate_quota_off": tot_exp_off,
+            "expected_pass_rate_quota_on": tot_exp_on,
+            "expected_delta": (round(tot_exp_on - tot_exp_off, 6)
+                               if tot_exp_off is not None and tot_exp_on is not None else None),
+            "replay_matches": sum(row["replay_matches"] for row in rows),
+            "mismatched_ids": all_mismatched_ids,
+            "unreplayable": len(unreplayable_ids),
+            "unreplayable_ids": unreplayable_ids}
+
+
+def quota_eval_text(result, source):
+    """Text rendering of a `compute_quota_eval` result."""
+    lines = [f"quota eval (ledger: {source}; default threshold: {result['default_threshold']})",
+             "replay in ledger order from each decision's recorded quota_before snapshot and threshold "
+             "(the live rule: a backend at or below the threshold no longer receives new runs); "
+             "rerouted = the default pick was exhausted and a fallback with remaining above the threshold "
+             "(or unknown remaining) was available; refused = every recorded backend was at or below the "
+             "threshold; stayed = the default pick had remaining above the threshold, unknown remaining, "
+             "or an explicit --backend; unknown = the snapshot does not cover the default pick, so the "
+             "record cannot say what quota-on would have done. Expected pass rates are over scored runs "
+             "only: stayed runs keep their observed outcome, rerouted runs take the default backend's "
+             "prefix observed rate under quota-off and the target's prefix rate under quota-on, refused "
+             "runs take the default's prefix rate under quota-off and 0 under quota-on (they never "
+             "dispatch); batch/fleet decision records carry no outcome, so they enter the shares but not "
+             "the pass rates; small-n = n < 8, deltas indicative only"]
+    rows = result["groups"]
+    if not rows:
+        lines.append("no quota history in ledger")
+        return "\n".join(lines) + "\n"
+    lines.append(f"{'backend':<10} {'card_type':<12} {'decisions':>9} {'rerouted':>8} {'refused':>7} "
+                 f"{'stayed':>6} {'n':>4} {'actual':>7} {'exp-off':>7} {'exp-on':>7} {'delta':>6}  flag")
+    lines.append("-" * 102)
+    for row in rows:
+        actual = f"{row['actual_pass_rate']:.2f}" if row["actual_pass_rate"] is not None else "n/a"
+        exp_off = (f"{row['expected_pass_rate_quota_off']:.2f}"
+                   if row["expected_pass_rate_quota_off"] is not None else "n/a")
+        exp_on = (f"{row['expected_pass_rate_quota_on']:.2f}"
+                  if row["expected_pass_rate_quota_on"] is not None else "n/a")
+        delta = (f"{row['expected_delta']:+.2f}"
+                 if row["expected_delta"] is not None else "n/a")
+        if row["n"] == 0:
+            flag = "no scored runs"
+        elif row["small_n"]:
+            flag = "small-n"
+        else:
+            flag = ""
+        lines.append(f"{row['backend']:<10} {row['card_type']:<12} {row['decisions']:>9} "
+                     f"{row['rerouted']:>8} {row['refused']:>7} {row['stayed']:>6} {row['n']:>4} "
+                     f"{actual:>7} {exp_off:>7} {exp_on:>7} {delta:>6}  {flag}")
+    share = lambda value: f"{value:.2f}" if value is not None else "n/a"
+    lines.append(f"replayable decisions: {result['total_replayable']} across {len(rows)} groups; "
+                 f"rerouted: {result['total_rerouted']} ({share(result['rerouted_share'])} of decided); "
+                 f"refused: {result['total_refused']} ({share(result['refused_share'])} of decided); "
+                 f"stayed: {result['total_stayed']} ({share(result['stayed_share'])} of decided); "
+                 f"unknown: {result['total_unknown']}; scored runs: {result['total_scored']}")
+    fmt = lambda value: f"{value:.2f}" if value is not None else "n/a"
+    delta = result["expected_delta"]
+    lines.append(f"expected pass rate: quota off {fmt(result['expected_pass_rate_quota_off'])} "
+                 f"vs quota on {fmt(result['expected_pass_rate_quota_on'])} "
+                 f"(delta {f'{delta:+.2f}' if delta is not None else 'n/a'})")
+    lines.append(f"replay vs recorded: {result['replay_matches']}/{result['total_replayable']} match"
+                 + ("" if not result["mismatched_ids"]
+                    else f"; mismatched: {', '.join(str(run_id) for run_id in result['mismatched_ids'])}"))
+    if result["unreplayable"]:
+        lines.append(f"unreplayable entries (no usable quota snapshot): {result['unreplayable']}")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_quota_eval(args, policy):
+    # The replay is run as if quota routing were on: the shipped `enabled`
+    # switch is ignored, but the fallback threshold comes from policy so a
+    # custom threshold replays under that threshold when a record carries
+    # none of its own.
+    threshold = quota_config(policy)["threshold"]
+    path = fleet_ledger_path() if getattr(args, "fleet", False) else LEDGER
+    result = compute_quota_eval(ledger_entries_from(path),
+                                default_threshold=threshold)
+    if getattr(args, "json", False):
+        print(json.dumps({"ledger": path, **result}, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    print(quota_eval_text(result, path), end="")
+
+
 # ---------------------------------------------------------------- weekly retro
 
 def retro_safe(value, limit=240):
@@ -14317,6 +14646,9 @@ def cmd_report(args, policy):
     if getattr(args, "gate_eval", None):
         cmd_gate_eval(args, policy)
         return
+    if getattr(args, "quota_eval", None):
+        cmd_quota_eval(args, policy)
+        return
     if any(getattr(args, key, None) for key in ("daily", "date", "json")):
         cmd_daily_report(args, policy)
         return
@@ -15640,8 +15972,11 @@ def main():
     sp.add_argument("--gate-eval", action="store_true",
                     help="calibration-gate flip counterfactual replay by (backend, card type) from ledger history "
                          "(M16, #164); with --json, print it as JSON")
+    sp.add_argument("--quota-eval", action="store_true",
+                    help="quota-aware flip counterfactual replay by (default backend, card type) from ledger history "
+                         "(M19, #177); with --json, print it as JSON")
     sp.add_argument("--fleet", action="store_true",
-                    help="with --advice-accuracy, --weighted-eval or --gate-eval, read the merged fleet ledger")
+                    help="with --advice-accuracy, --weighted-eval, --gate-eval or --quota-eval, read the merged fleet ledger")
 
     sp = sub.add_parser("retro", help="run the weekly fleet retrospective")
     sp.add_argument("--days", type=int, default=7, help="include runs from the last N days")
