@@ -202,6 +202,18 @@ class MinimaxQuotaHttp(unittest.TestCase):
 
 
 class ProbePi(unittest.TestCase):
+    def setUp(self):
+        # plan_pi() requires a pi binary; macOS CI has no `pi` on PATH and
+        # pi_bin() skips bin/pi-isolated on darwin, so plan_pi() would bail
+        # with "no working pi binary" there. These tests exercise quota
+        # logic, not pi discovery, so point pi discovery at the in-repo
+        # isolated launcher (the exact path require_isolation expects).
+        self._pi_bin_patch = mock.patch.object(xs, "pi_bin", return_value=PI_ISOLATED)
+        self._pi_bin_patch.start()
+
+    def tearDown(self):
+        self._pi_bin_patch.stop()
+
     def test_probe_pi_carries_live_quota(self):
         with mock.patch.object(urllib.request, "urlopen",
                                return_value=FakeResponse(copy.deepcopy(REMAINS_PAYLOAD))):
@@ -340,6 +352,19 @@ class BuiltinQuotaReaders(unittest.TestCase):
 
 
 class BuiltinQuotaRouting(unittest.TestCase):
+    def setUp(self):
+        # route() -> plan_pi() requires a pi binary; macOS CI has no `pi`
+        # on PATH and pi_bin() skips bin/pi-isolated on darwin, so routing
+        # to pi would bail with "no working pi binary" there. These tests
+        # exercise quota routing, not pi discovery, so point pi discovery
+        # at the in-repo isolated launcher (the exact path
+        # require_isolation expects).
+        self._pi_bin_patch = mock.patch.object(xs, "pi_bin", return_value=PI_ISOLATED)
+        self._pi_bin_patch.start()
+
+    def tearDown(self):
+        self._pi_bin_patch.stop()
+
     def decide(self, policy, st, prof=None):
         prof = prof or {"type": "impl", "difficulty": 3}
         decision = xs.route(prof, st, policy)
