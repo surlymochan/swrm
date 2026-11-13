@@ -3320,10 +3320,19 @@ def compute_quota_eval(entries, default_threshold=0):
       above the threshold (or, failing that, with unknown remaining —
       the live code takes an unknown backend when no known-good one is
       available), and refuses when every recorded backend is at or below
-      the threshold. A decision whose snapshot does not cover the default
-      pick (a failed read kept the old behaviour) is "unknown": the record
-      cannot say what quota-on would have done, and it is counted
-      separately, never guessed.
+      the threshold. M22 slice 1 (#189): a run whose live record stayed
+      but whose `quota_routing.planner_vetoed` carries a hard window-limit
+      planner veto (quota_veto) is re-attributed as a reroute from the
+      first such vetoed backend to the backend that actually ran — the
+      planner read the same quota state, the vetoed backend was
+      exhausted, and the run only completed because the veto moved it
+      off that default. The recorded verdict is re-attributed the same
+      way for the cross-check. A live quota reroute on the record wins
+      over the veto rule, so one run is never two reroutes. A decision
+      whose snapshot does not cover the default pick (a failed read kept
+      the old behaviour) is "unknown": the record cannot say what
+      quota-on would have done, and it is counted separately, never
+      guessed.
     - the replay verdict is cross-checked against the recorded live
       verdict (`rerouted`/`all_exhausted`/stayed, target included);
       mismatches are listed, so the replay can be verified against the
@@ -3378,7 +3387,39 @@ def compute_quota_eval(entries, default_threshold=0):
             continue
         reason = qr.get("reason") or ""
         rerouted_from = entry.get("quota_rerouted_from") or qr.get("from")
-        if rerouted_from:
+        # M22 slice 1 (#189): planner-veto rescue. When the live record
+        # stayed (no quota reroute fired, because route() had already
+        # moved off the vetoed backend) but the record carries a hard
+        # window-limit planner veto (planner_vetoed entry with quota_veto),
+        # the run is re-attributed as a reroute from the first such
+        # vetoed backend to the backend that actually ran: the planner
+        # read the same quota state the quota router reads, the vetoed
+        # backend was exhausted, and the run only completed because the
+        # veto moved it off that default. Only hard-window vetoes count;
+        # other planner vetoes (no binary, breakers, soft spill) never
+        # re-attribute a run. A live quota reroute already on the record
+        # wins over the veto rule, so one run is never counted as two
+        # reroutes. Judgement note: the veto applies in both the
+        # quota-on and quota-off counterfactuals (it is planner logic,
+        # not the quota switch), so this rule attributes the rescue to
+        # the quota-aware system as a whole — the combined
+        # planner-veto + quota-stay that kept the run off the exhausted
+        # backend — rather than to the quota switch alone. That is the
+        # #188 acceptance-② reading; if the main round rules otherwise,
+        # this block is the single place to change.
+        veto_default = veto_target = None
+        vetoed = qr.get("planner_vetoed")
+        if (not qr.get("rerouted") and not qr.get("applied")
+                and isinstance(vetoed, dict)
+                and isinstance(entry.get("backend"), str) and entry["backend"]):
+            for vetoed_backend, record in vetoed.items():
+                if (isinstance(record, dict) and record.get("quota_veto")
+                        and str(vetoed_backend) != entry["backend"]):
+                    veto_default, veto_target = str(vetoed_backend), entry["backend"]
+                    break
+        if veto_default is not None:
+            default = veto_default
+        elif rerouted_from:
             default = str(rerouted_from)
         elif isinstance(entry.get("backend"), str) and entry["backend"]:
             default = entry["backend"]
@@ -3398,6 +3439,8 @@ def compute_quota_eval(entries, default_threshold=0):
         # Replay verdict from the snapshot, under the live rule.
         if "explicit --backend wins" in reason:
             verdict, target = "stayed", None
+        elif veto_default is not None:
+            verdict, target = "rerouted", veto_target
         elif default not in quota_before:
             verdict, target = "unknown", None
         else:
@@ -3423,6 +3466,12 @@ def compute_quota_eval(entries, default_threshold=0):
                     else "rerouted" if (qr.get("rerouted") or qr.get("applied"))
                     else "stayed")
         recorded_target = str(qr["to"]) if recorded == "rerouted" and qr.get("to") else None
+        if veto_default is not None:
+            # The live record says "stayed" (the quota switch did not
+            # fire); the M22 rule re-attributes it as a reroute, so the
+            # cross-check compares the replay against the re-attributed
+            # record, not against the pre-M22 stayed label.
+            recorded, recorded_target = "rerouted", veto_target
         match = verdict == recorded and (verdict != "rerouted" or target == recorded_target)
         if match:
             group["replay_matches"] += 1
@@ -3534,7 +3583,9 @@ def quota_eval_text(result, source):
              "rerouted = the default pick was exhausted and a fallback with remaining above the threshold "
              "(or unknown remaining) was available; refused = every recorded backend was at or below the "
              "threshold; stayed = the default pick had remaining above the threshold, unknown remaining, "
-             "or an explicit --backend; unknown = the snapshot does not cover the default pick, so the "
+             "or an explicit --backend; planner-veto reroute (M22 #189) = the live record stayed but the "
+             "planner had already vetoed the default on a hard window limit, so the run is re-attributed "
+             "as a reroute from the vetoed backend to the backend that ran; unknown = the snapshot does not cover the default pick, so the "
              "record cannot say what quota-on would have done. Expected pass rates are over scored runs "
              "only: stayed runs keep their observed outcome, rerouted runs take the default backend's "
              "prefix observed rate under quota-off and the target's prefix rate under quota-on, refused "
@@ -5225,6 +5276,52 @@ def quota_probe_row(backend, cfg, custom_backends=(), st=None):
             "status": "ok", "detail": f"remaining {remaining} is above threshold {cfg['threshold']}"}
 
 
+_VETO_HARD_RE = re.compile(r"at (\d+(?:\.\d+)?)% >= hard (\d+(?:\.\d+)?)%")
+
+
+def planner_vetoes(decision):
+    """Planner vetoes carried from route() into the quota record (M22 slice 1, #189).
+
+    route() tries backends in order and records each planner refusal in
+    decision["skipped"] (generic reason) plus decision["skipped_details"]
+    (the verbatim notes the planner appended, e.g. plan_codex's
+    "codex limit primary at 100% >= hard 95%"). This turns that handoff
+    into a quota-record field: {backend: {status "skipped", reason, used,
+    window_hard, quota_veto}}.
+
+    used / window_hard are read off the planner's own note (percentages
+    converted to 0..1 fractions) and are None when the note carries no
+    such numbers — never invented. quota_veto is true only for a hard
+    window-limit veto (worst window used >= window_hard): the planner
+    read the same quota state the quota router reads, and the backend
+    was refused for quota exhaustion. Any other veto (no binary,
+    breakers, soft spill, unknown backend) is recorded with its reason
+    and quota_veto false, so the replay never mistakes it for a rescue.
+    Decisions built without route() (synthetic / old callers) simply
+    yield {} — the record then looks exactly like today.
+    """
+    skipped = decision.get("skipped") or {}
+    details = decision.get("skipped_details") or {}
+    vetoed = {}
+    for backend, why in skipped.items():
+        notes = [str(note) for note in (details.get(backend) or [])]
+        reason = notes[0] if notes else str(why)
+        used = window_hard = None
+        quota_veto = False
+        for note in notes:
+            match = _VETO_HARD_RE.search(note)
+            if match:
+                used = float(match.group(1)) / 100.0
+                window_hard = float(match.group(2)) / 100.0
+                quota_veto = True
+                reason = note
+                break
+        vetoed[str(backend)] = {"status": "skipped", "reason": reason,
+                                 "used": used, "window_hard": window_hard,
+                                 "quota_veto": quota_veto}
+    return vetoed
+
+
 def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
     """Quota-aware reroute for `openswarm run`. Returns (decision, info).
 
@@ -5236,12 +5333,26 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
     effort and tier are its own — never the old backend's values carried
     over. Explicit --backend always wins; a failed read keeps the default
     pick (old behaviour) on the record instead of silently downgrading.
+
+    M22 slice 1 (#189): backends the planner already vetoed before quota
+    routing ran are recorded in info["planner_vetoed"] (see
+    planner_vetoes()): skipped + the verbatim veto reason, with used /
+    window_hard read off the planner's note when present. quota_before
+    itself stays numeric-only — only backends quota routing actually
+    checked get a remaining there — so the replay's snapshot shape is
+    unchanged. The veto record is what lets the replay attribute a
+    planner-veto rescue (see compute_quota_eval).
     """
     cfg = quota_config(policy)
     if not cfg["enabled"]:
         return decision, None
     threshold = cfg["threshold"]
     base = {"enabled": True, "threshold": threshold}
+    vetoed = planner_vetoes(decision)
+    if vetoed:
+        base["planner_vetoed"] = vetoed
+    veto_note = ("; planner vetoed " + ", ".join(f"{b} ({v['reason']})" for b, v in vetoed.items())
+                 if vetoed else "")
     if profile.get("backend"):
         return decision, {**base, "applied": False, "quota_before": {},
                           "reason": "explicit --backend wins over quota routing"}
@@ -5271,9 +5382,10 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
         if remaining is None or remaining > threshold:
             if not tried:
                 return current, {**base, "applied": False, "quota_before": checked,
-                                 "reason": (f"{backend} quota unknown; kept the default pick"
-                                            if remaining is None else
-                                            f"{backend} remaining {remaining} is above threshold {threshold}")}
+                                 "reason": ((f"{backend} quota unknown; kept the default pick"
+                                             if remaining is None else
+                                             f"{backend} remaining {remaining} is above threshold {threshold}")
+                                            + veto_note)}
             rerouted = dict(current)
             rerouted["quota_rerouted_from"] = decision["backend"]
             return rerouted, {**base, "applied": True, "rerouted": True,
@@ -5459,12 +5571,15 @@ def route(prof, st, policy, exclude=(), custom_backends=()):
                 notes.append("context exceeds codex window: prefer 1M-context backends")
         order = [b for b in order if b not in exclude]
         skipped = {}
+        skipped_details = {}
         for b in order:
             planner = planners.get(b)
             if planner is None:
                 skipped[b] = (f"unknown backend '{b}': not a built-in backend and no custom "
                               f"backend with that id is configured (see backends.json)")
+                skipped_details[b] = []
                 continue
+            mark = len(notes)
             d, why = planner(p, st, policy, bool(p.get("backend")), notes)
             if d:
                 if p.get("model"):
@@ -5474,9 +5589,15 @@ def route(prof, st, policy, exclude=(), custom_backends=()):
                         d["opencode_model"] = f"{'opencode-go' if b == 'ocgo' else 'deepseek'}/{p['model']}"
                 if p.get("effort"):
                     d["effort"] = p["effort"]
-                return d, order, skipped
+                return d, order, skipped, skipped_details
             skipped[b] = why
-        return None, order, skipped
+            # The planner's own veto detail (e.g. plan_codex's
+            # "codex limit primary at 100% >= hard 95%") is appended to
+            # the shared notes list; keep the slice this planner added so
+            # apply_quota_routing() can record the veto verbatim instead
+            # of only the generic `why` (M22 slice 1, #189).
+            skipped_details[b] = list(notes[mark:])
+        return None, order, skipped, skipped_details
 
     notes = []
     plan_prof = prof
@@ -5486,12 +5607,12 @@ def route(prof, st, policy, exclude=(), custom_backends=()):
         # against the implementer's family instead of a per-tier proxy. The
         # planners see the family/model as private profile keys; the caller's
         # profile is never mutated.
-        proxy_d, _, _ = attempt({**prof, "type": "impl"}, [])
+        proxy_d, _, _, _ = attempt({**prof, "type": "impl"}, [])
         if proxy_d:
             proxy = {"backend": proxy_d["backend"], "model": proxy_d.get("model"),
                      "family": compare_backend_family(proxy_d["backend"], proxy_d.get("model"), policy, st)}
             plan_prof = {**prof, "_impl_family": proxy["family"], "_impl_model": proxy["model"]}
-    d, order, skipped = attempt(plan_prof, notes)
+    d, order, skipped, skipped_details = attempt(plan_prof, notes)
     if d and proxy:
         fam = compare_backend_family(d["backend"], d.get("model"), policy, st)
         if fam == proxy["family"] and d.get("model") == proxy["model"] and d["backend"] == "ocgo":
@@ -5499,10 +5620,10 @@ def route(prof, st, policy, exclude=(), custom_backends=()):
             # excluded and the pool restricted to the implementer's family,
             # which lands on a sibling model (see ocgo_pick's degraded path).
             retry_notes = []
-            d2, order2, skipped2 = attempt({**plan_prof, "_exclude_model": proxy["model"],
+            d2, order2, skipped2, skipped_details2 = attempt({**plan_prof, "_exclude_model": proxy["model"],
                                             "_same_family_only": proxy["family"]}, retry_notes)
             if d2 and d2["backend"] == "ocgo" and d2.get("model") != proxy["model"]:
-                d, order, skipped, notes = d2, order2, skipped2, retry_notes
+                d, order, skipped, skipped_details, notes = d2, order2, skipped2, skipped_details2, retry_notes
                 fam = compare_backend_family(d["backend"], d.get("model"), policy, st)
         if fam == proxy["family"] and "degraded" not in d:
             # A review that stays in the implementer's family is degraded by
@@ -5515,8 +5636,10 @@ def route(prof, st, policy, exclude=(), custom_backends=()):
         mode, why_c = claude_mode(st, policy)
         return {"ok": True, **d, "fallbacks": [x for x in order if x != d["backend"]],
                 "claude_review": mode, "reasons": list(dict.fromkeys(notes + [why_c])), "skipped": skipped,
+                "skipped_details": skipped_details,
                 "concurrency": concurrency(st, policy), "profile": prof}
-    return {"ok": False, "reasons": list(dict.fromkeys(notes)), "skipped": skipped, "profile": prof}
+    return {"ok": False, "reasons": list(dict.fromkeys(notes)), "skipped": skipped,
+            "skipped_details": skipped_details, "profile": prof}
 
 
 # ---------------------------------------------------------------- execution
