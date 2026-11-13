@@ -39,6 +39,7 @@ import argparse
 import base64
 import concurrent.futures
 import contextlib
+import copy
 import datetime as dt
 import glob
 import fnmatch
@@ -122,6 +123,11 @@ DATA = envvar("HOME", f"{HOME}/.claude/openswarm")
 STATE = f"{DATA}/state.json"
 LEDGER = f"{DATA}/ledger.jsonl"
 CLAUDE_Q = f"{DATA}/quota-claude.json"
+# Synced codex quota snapshot (M23 slice 1, #193): `openswarm quota sync`
+# pulls the latest rate_limits lines from gocc (read-only SSH) into this
+# cache, so the probe can read real codex quota on a host with no local
+# codex sessions. Never written back to gocc.
+CODEX_SNAPSHOT = f"{DATA}/quota-codex-snapshot.json"
 BREAKERS = f"{DATA}/breakers.json"
 RUNS = f"{DATA}/runs"
 WORKTREES = f"{DATA}/worktrees"
@@ -1838,14 +1844,123 @@ def codex_models(binary, policy):
     return models, source + (" + account model/list" if visible is not None else " (account availability unverified)")
 
 
-def codex_limits(policy):
-    """Latest rate_limits per limit_id from recent rollouts (newest first). Only lines containing a
-    "rate_limits" payload are parsed; conversation content is ignored. Disable with local_sources.codex_sessions."""
+def parse_rate_limits_lines(lines, found=None):
+    """Newest rate_limits payload per limit_id from raw rollout JSONL lines.
+
+    Only lines containing a "rate_limits" payload are parsed; conversation
+    content is ignored. The newest event per limit_id wins (by timestamp);
+    a dateless line never replaces a timestamped entry. Merges into `found`
+    (or a new dict) and returns it, in the codex_limits() shape:
+    {limit_id: {"name", "windows", "observed_at", "age_minutes", "credits",
+    "reached"}}.
+    """
+    found = {} if found is None else found
+    for line in lines:
+        if '"rate_limits"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        rl = (ev.get("payload") or {}).get("rate_limits")
+        if not rl:
+            continue
+        lid = rl.get("limit_id") or "codex"
+        ts = to_epoch(ev.get("timestamp"))
+        prev_ts = to_epoch(found[lid]["observed_at"]) if lid in found else None
+        if prev_ts is not None and (ts is None or prev_ts >= ts):
+            continue
+        wins = {}
+        for k in ("primary", "secondary"):
+            w = rl.get(k)
+            if w:
+                name = "five_hour" if w.get("window_minutes") == 300 else (
+                    "seven_day" if w.get("window_minutes") == 10080 else f"w{w.get('window_minutes')}")
+                wins[name] = window_stats(w.get("used_percent"), w.get("window_minutes"), w.get("resets_at"))
+        found[lid] = {"name": rl.get("limit_name"), "windows": wins, "observed_at": iso(ts),
+                      "age_minutes": round((NOW() - ts) / 60, 1) if ts else None,
+                      "credits": rl.get("credits"), "reached": rl.get("rate_limit_reached_type")}
+    return found
+
+
+def codex_snapshot_max_age_minutes(policy):
+    """Staleness threshold for a synced codex snapshot, in minutes.
+
+    Env OPENSWARM_QUOTA_SNAPSHOT_MAX_AGE_MINUTES wins, then
+    routing.quota.snapshot_max_age_minutes, then 60. Any configured value
+    must be a number > 0 — a quota threshold that cannot be read fails
+    loudly, like quota_config().
+    """
+    env = envvar("QUOTA_SNAPSHOT_MAX_AGE_MINUTES")
+    if env is not None:
+        try:
+            value = float(env)
+        except (TypeError, ValueError):
+            raise ValueError("OPENSWARM_QUOTA_SNAPSHOT_MAX_AGE_MINUTES must be a number > 0, "
+                             f"got {env!r}")
+        if value <= 0:
+            raise ValueError("OPENSWARM_QUOTA_SNAPSHOT_MAX_AGE_MINUTES must be a number > 0, "
+                             f"got {env!r}")
+        return value
+    raw = ((policy.get("routing") or {}).get("quota") or {}).get("snapshot_max_age_minutes", 60)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+        raise ValueError(f"routing.quota.snapshot_max_age_minutes must be a number > 0, got {raw!r}")
+    return raw
+
+
+def load_codex_snapshot():
+    """Synced codex snapshot from the local cache, or None when absent /
+    unreadable / malformed. The cache is only ever written by
+    `openswarm quota sync`; a bad file reads as no snapshot, never as
+    invented quota.
+    """
+    raw = jload(CODEX_SNAPSHOT)
+    if not isinstance(raw, dict) or not isinstance(raw.get("limits"), dict):
+        return None
+    if not isinstance(raw.get("synced_at"), (int, float)):
+        return None
+    return raw
+
+
+def codex_snapshot_status(policy, snapshot=None):
+    """Snapshot provenance + age, or None when no snapshot is cached.
+
+    {"source_host", "source", "synced_at", "synced_at_iso", "age_minutes",
+    "stale", "stale_threshold_minutes"} — stale is age strictly greater
+    than the threshold (exactly at the threshold still counts as fresh).
+    """
+    if snapshot is None:
+        snapshot = load_codex_snapshot()
+    if snapshot is None:
+        return None
+    threshold = codex_snapshot_max_age_minutes(policy)
+    synced_at = snapshot["synced_at"]
+    age = (NOW() - synced_at) / 60
+    return {"source_host": snapshot.get("source_host") or "gocc",
+            "source": snapshot.get("source") or "gocc:~/.codex/sessions",
+            "synced_at": synced_at,
+            "synced_at_iso": snapshot.get("synced_at_iso") or iso(synced_at),
+            "age_minutes": round(age, 1),
+            "stale": age > threshold,
+            "stale_threshold_minutes": threshold}
+
+
+def _codex_limits(policy):
+    """(limits, origin): origin is 'local' | 'snapshot' | 'snapshot-stale' | 'none'.
+
+    Local sessions win when they carry any rate_limits line; otherwise a
+    fresh synced snapshot (see `openswarm quota sync`) supplies the limits;
+    a stale snapshot supplies nothing — the caller must treat codex quota
+    as unknown, never as the stale reading. Disable with
+    local_sources.codex_sessions.
+    """
     if not source_enabled(policy, "codex_sessions"):
-        return {}
+        return {}, "none"
     files = glob.glob(f"{HOME}/.codex/sessions/*/*/*/rollout-*.jsonl")
     files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
-    found, newest_ts = {}, None
+    found = {}
     for f in files[:40]:
         try:
             size = os.path.getsize(f)
@@ -1854,41 +1969,110 @@ def codex_limits(policy):
                 lines = fh.read().decode("utf-8", "ignore").splitlines()
         except Exception:
             continue
-        for line in reversed(lines):
-            if '"rate_limits"' not in line:
-                continue
-            try:
-                ev = json.loads(line)
-            except Exception:
-                continue
-            rl = (ev.get("payload") or {}).get("rate_limits")
-            if not rl:
-                continue
-            lid = rl.get("limit_id") or "codex"
-            if lid in found:
-                continue
-            ts = to_epoch(ev.get("timestamp"))
-            newest_ts = max(newest_ts or 0, ts or 0)
-            wins = {}
-            for k in ("primary", "secondary"):
-                w = rl.get(k)
-                if w:
-                    name = "five_hour" if w.get("window_minutes") == 300 else (
-                        "seven_day" if w.get("window_minutes") == 10080 else f"w{w.get('window_minutes')}")
-                    wins[name] = window_stats(w.get("used_percent"), w.get("window_minutes"), w.get("resets_at"))
-            found[lid] = {"name": rl.get("limit_name"), "windows": wins, "observed_at": iso(ts),
-                          "age_minutes": round((NOW() - ts) / 60, 1) if ts else None,
-                          "credits": rl.get("credits"), "reached": rl.get("rate_limit_reached_type")}
+        parse_rate_limits_lines(lines, found)
         if "codex" in found and len(found) >= 2:
             break
-    return found
+    if found:
+        return found, "local"
+    snapshot = load_codex_snapshot()
+    if snapshot is None:
+        return {}, "none"
+    status = codex_snapshot_status(policy, snapshot)
+    if status["stale"]:
+        return {}, "snapshot-stale"
+    limits = copy.deepcopy(snapshot.get("limits") or {})
+    now = NOW()
+    for entry in limits.values():
+        if isinstance(entry, dict):
+            ts = to_epoch(entry.get("observed_at"))
+            entry["age_minutes"] = round((now - ts) / 60, 1) if ts else None
+    return limits, "snapshot"
+
+
+def codex_limits(policy):
+    """Latest rate_limits per limit_id from recent rollouts (newest first). Only lines containing a
+    "rate_limits" payload are parsed; conversation content is ignored. Disable with local_sources.codex_sessions."""
+    return _codex_limits(policy)[0]
+
+
+# ---------------------------------------------------------------- codex quota sync (M23 slice 1, #193)
+
+# Read-only on the remote side: list the newest rollout files, tail each
+# one's last 400 KB (same bound codex_limits() uses locally) and grep the
+# rate_limits lines. No writes, no credential reads, no redirects.
+GOCC_RATE_LIMITS_CMD = (
+    "for f in $(ls -t ~/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -10); do "
+    "tail -c 400000 \"$f\" 2>/dev/null | grep '\"rate_limits\"'; done"
+)
+
+
+def fetch_gocc_rate_limits(host, runner=None):
+    """Pull raw rate_limits lines from <host> over the existing SSH config.
+
+    Returns (lines, error): lines are the verbatim rate_limits lines,
+    error is None on success. Transport failures come back as error, never
+    as an exception — the caller decides whether to fail loudly.
+    """
+    runner = runner or (lambda cmd: sh(cmd, timeout=120))
+    rc, out, err = runner(["ssh", "-F", f"{HOME}/.ssh/config", host, GOCC_RATE_LIMITS_CMD])
+    if rc != 0:
+        detail = (err or out or "no output").strip()
+        return [], f"ssh to {host} failed (exit {rc}): {detail}"
+    return [line for line in out.splitlines() if '"rate_limits"' in line], None
+
+
+def cmd_quota_sync(args, policy, runner=None):
+    """`openswarm quota sync` (M23 slice 1, #193): pull the latest codex
+    rate_limits lines from gocc into the local probe cache.
+
+    The cache ({DATA}/quota-codex-snapshot.json) stores the lines verbatim
+    plus the parsed limits, the source host and the sync timestamp, so
+    `openswarm quota` and quota routing can read real codex quota on a
+    host with no local codex sessions. Nothing is written back to gocc,
+    and a failed or empty pull leaves the previous cache untouched.
+    """
+    if not source_enabled(policy, "codex_sessions"):
+        print("openswarm: quota sync refused: local_sources.codex_sessions is disabled; "
+              "the probe would ignore the snapshot", file=sys.stderr)
+        sys.exit(1)
+    host = getattr(args, "host", None) or envvar("QUOTA_SYNC_HOST") or "gocc"
+    lines, error = fetch_gocc_rate_limits(host, runner=runner)
+    if error is not None:
+        print(f"openswarm: quota sync failed: {error}", file=sys.stderr)
+        sys.exit(1)
+    limits = parse_rate_limits_lines(lines)
+    if not limits:
+        print(f"openswarm: quota sync failed: no rate_limits lines found on {host} "
+              f"(~/.codex/sessions); cache untouched", file=sys.stderr)
+        sys.exit(1)
+    now = NOW()
+    snapshot = {"version": 1, "source_host": host, "source": f"{host}:~/.codex/sessions",
+                "synced_at": now, "synced_at_iso": iso(now),
+                "raw_lines": lines, "limits": limits}
+    jsave(CODEX_SNAPSHOT, snapshot)
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": True, "synced_lines": len(lines), "snapshot": snapshot},
+                         indent=2, ensure_ascii=False))
+        return
+    print(f"quota sync: {len(lines)} rate_limits line(s) from {host} -> {CODEX_SNAPSHOT}")
+    for lid, entry in limits.items():
+        wins = ", ".join(f"{name} used {w.get('used')} resets {w.get('resets_at_local')}"
+                         for name, w in (entry.get("windows") or {}).items() if w)
+        print(f"  {lid}: {wins or 'no windows'} (observed {entry.get('observed_at')})")
+    print(f"snapshot age: 0.0 min (synced {snapshot['synced_at_iso']})")
 
 
 def probe_codex(policy):
     binary, version = find_codex(policy)
     models, source = codex_models(binary, policy)
-    return {"binary": binary, "version": version, "plan": codex_plan(policy), "models": models,
-            "models_source": source, "limits": codex_limits(policy), "config_model": codex_config_model()}
+    limits, origin = _codex_limits(policy)
+    out = {"binary": binary, "version": version, "plan": codex_plan(policy), "models": models,
+           "models_source": source, "limits": limits, "limits_source": origin,
+           "config_model": codex_config_model()}
+    snapshot = codex_snapshot_status(policy)
+    if snapshot is not None:
+        out["limits_snapshot"] = snapshot
+    return out
 
 
 def codex_config_model():
@@ -5101,7 +5285,8 @@ def normalize_quota_source(raw, where):
 
 
 def quota_config(policy):
-    """Validate routing.quota → {"enabled", "threshold", "sources"}.
+    """Validate routing.quota → {"enabled", "threshold", "sources",
+    "snapshot_max_age_minutes"}.
 
     Missing section means disabled with threshold 0 and no sources. Any
     invalid value raises ValueError: a quota config that cannot be read
@@ -5109,12 +5294,13 @@ def quota_config(policy):
     """
     raw = (policy.get("routing") or {}).get("quota") or {}
     if not isinstance(raw, dict):
-        raise ValueError(f"routing.quota must be an object with 'enabled', 'threshold' and "
-                         f"'sources', got {type(raw).__name__}; fix policy.json or remove the block")
-    unknown = sorted(set(raw) - {"enabled", "threshold", "sources"})
+        raise ValueError(f"routing.quota must be an object with 'enabled', 'threshold', "
+                         f"'sources' and 'snapshot_max_age_minutes', got {type(raw).__name__}; "
+                         f"fix policy.json or remove the block")
+    unknown = sorted(set(raw) - {"enabled", "threshold", "sources", "snapshot_max_age_minutes"})
     if unknown:
         raise ValueError(f"routing.quota: unknown field(s) {', '.join(unknown)}; allowed fields are "
-                         f"enabled, threshold, sources")
+                         f"enabled, threshold, sources, snapshot_max_age_minutes")
     enabled = raw.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError(f"routing.quota.enabled must be a boolean, got {enabled!r}")
@@ -5129,7 +5315,8 @@ def quota_config(policy):
                          f"got {type(sources).__name__}")
     return {"enabled": enabled, "threshold": threshold,
             "sources": {backend: normalize_quota_source(src, f"routing.quota.sources[{backend!r}]")
-                        for backend, src in sources.items()}}
+                        for backend, src in sources.items()},
+            "snapshot_max_age_minutes": codex_snapshot_max_age_minutes(policy)}
 
 
 def quota_source_text(source):
@@ -5173,16 +5360,26 @@ def builtin_quota_remaining(backend, st):
             return remaining, None, f"builtin pi (MiniMax {quota.get('source') or 'live quota'}, {unit})"
         return None, None, text
     if backend == "codex":
-        text = "builtin codex (local rollout windows, fraction)"
+        cx = st.get("codex") or {}
+        snapshot = cx.get("limits_snapshot") if isinstance(cx.get("limits_snapshot"), dict) else None
         used = []
-        for limit in ((st.get("codex") or {}).get("limits") or {}).values():
+        for limit in (cx.get("limits") or {}).values():
             for window in ((limit or {}).get("windows") or {}).values():
                 value = (window or {}).get("used")
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     used.append(value)
-        if not used:
-            return None, None, text
-        return 1.0 - max(used), None, text
+        if used:
+            if cx.get("limits_source") == "snapshot" and snapshot is not None:
+                text = (f"builtin codex (synced snapshot from {snapshot['source_host']}, "
+                        f"age {snapshot['age_minutes']} min, fraction)")
+            else:
+                text = "builtin codex (local rollout windows, fraction)"
+            return 1.0 - max(used), None, text
+        if snapshot is not None and snapshot.get("stale"):
+            return None, None, (f"builtin codex (synced snapshot from {snapshot['source_host']} is stale: "
+                                f"age {snapshot['age_minutes']} min > "
+                                f"{snapshot['stale_threshold_minutes']} min; treated as unknown)")
+        return None, None, "builtin codex (local rollout windows, fraction)"
     if backend == "deepseek":
         text = "builtin deepseek (account balance, CNY)"
         ds = st.get("deepseek") or {}
@@ -5226,6 +5423,19 @@ def quota_remaining_for_backend(backend, cfg, custom_backends=(), st=None):
     return None, None
 
 
+def codex_snapshot_stale_detail(st, backend):
+    """Stale-snapshot detail for the codex quota row, or None when not
+    applicable (other backends, no snapshot, or a fresh snapshot)."""
+    if backend != "codex" or not isinstance(st, dict):
+        return None
+    snapshot = (st.get("codex") or {}).get("limits_snapshot")
+    if not isinstance(snapshot, dict) or not snapshot.get("stale"):
+        return None
+    return (f"synced snapshot from {snapshot.get('source_host') or 'gocc'} is stale "
+            f"(age {snapshot.get('age_minutes')} min > "
+            f"{snapshot.get('stale_threshold_minutes')} min); codex quota treated as unknown")
+
+
 def quota_probe_row(backend, cfg, custom_backends=(), st=None):
     """One `openswarm quota` row: {backend, source, remaining, status, detail}.
 
@@ -5249,7 +5459,8 @@ def quota_probe_row(backend, cfg, custom_backends=(), st=None):
             if remaining is None:
                 return {"backend": backend, "source": builtin_text, "remaining": None,
                         "status": "unknown",
-                        "detail": "probe state has no usable quota reading for this backend"}
+                        "detail": (codex_snapshot_stale_detail(st, backend)
+                                   or "probe state has no usable quota reading for this backend")}
             if remaining <= cfg["threshold"]:
                 return {"backend": backend, "source": builtin_text, "remaining": remaining,
                         "status": "low",
@@ -5348,6 +5559,17 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
         return decision, None
     threshold = cfg["threshold"]
     base = {"enabled": True, "threshold": threshold}
+    # M23 slice 1 (#193): when the codex reading came from (or was blocked
+    # by) a synced snapshot, the record carries its provenance — source
+    # host, sync time, age and staleness — so a later replay can tell a
+    # fresh snapshot reading from a stale one that fell back to unknown.
+    snapshot = (st.get("codex") or {}).get("limits_snapshot") if isinstance(st, dict) else None
+    if isinstance(snapshot, dict):
+        base["quota_snapshot"] = {"source_host": snapshot.get("source_host"),
+                                  "synced_at": snapshot.get("synced_at"),
+                                  "synced_at_iso": snapshot.get("synced_at_iso"),
+                                  "age_minutes": snapshot.get("age_minutes"),
+                                  "stale": snapshot.get("stale")}
     vetoed = planner_vetoes(decision)
     if vetoed:
         base["planner_vetoed"] = vetoed
@@ -16284,6 +16506,11 @@ def main():
     sp = sub.add_parser("quota", help="read-only probe: remaining quota per backend (M17, #169)")
     sp.add_argument("--backends-file", help="custom backends config (JSON); defaults to $OPENSWARM_HOME/backends.json")
     sp.add_argument("--json", action="store_true", help="print the probe as JSON")
+    quota_sub = sp.add_subparsers(dest="quota_cmd")
+    sq = quota_sub.add_parser("sync", help="pull latest codex rate_limits from gocc (read-only SSH) "
+                               "into the local probe cache (M23, #193)")
+    sq.add_argument("--host", default=None, help="SSH host to pull from (default: gocc, or OPENSWARM_QUOTA_SYNC_HOST)")
+    sq.add_argument("--json", action="store_true", help="print the sync result as JSON")
     sp = sub.add_parser("compare", help="run one task in parallel on two executor families")
     add_dispatch_arguments(sp, "task-file", "title", task_file_required=True, title_required=True)
     sp.add_argument("--a", help="first executor backend or BACKEND:MODEL")
@@ -16641,7 +16868,10 @@ def main():
         cmd_report(a, policy)
     elif a.cmd == "quota":
         try:
-            cmd_quota(a, policy, custom_backends=custom_backends)
+            if getattr(a, "quota_cmd", None) == "sync":
+                cmd_quota_sync(a, policy)
+            else:
+                cmd_quota(a, policy, custom_backends=custom_backends)
         except ValueError as error:
             print(f"openswarm: {error}", file=sys.stderr)
             sys.exit(2)
