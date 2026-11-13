@@ -130,6 +130,9 @@ def load_policy():
         local = dict(local)
         local.setdefault("recommended_concurrency", local["concurrency"])
         local["concurrency"] = {}
+    elif isinstance(local.get("concurrency"), dict) and local["concurrency"]:
+        print("openswarm: warning: policy.local.json concurrency is deprecated; fleet topology limits are authoritative",
+              file=sys.stderr)
     return deep_merge(base, local)
 
 
@@ -8534,7 +8537,7 @@ def batch_launch(spec, row):
 
 
 def batch_provider_slot_available(spec, row):
-    caps = spec.get("concurrency") or {}
+    caps = fleet_topology_concurrency()
     if not isinstance(caps, dict) or not caps or not spec.get("backend"):
         return True
     hosts = fleet_config()
@@ -8543,38 +8546,64 @@ def batch_provider_slot_available(spec, row):
     if target_host["kind"] == "instabox" and states.get(target_host.get("box"), "").lower() not in (
             "running", "ready", "active"):
         return False
-    try:
-        target_snapshot = host_json(target_host, ["fleet", "_snapshot"], timeout=20)
-    except RuntimeError:
+    snapshots = {}
+    def fetch(name, host):
+        if host["kind"] == "instabox" and states.get(host.get("box"), "").lower() not in (
+                "running", "ready", "active"):
+            return name, None, "host down"
+        try:
+            return name, host_json(host, ["fleet", "_snapshot"], timeout=20), None
+        except RuntimeError as error:
+            return name, None, str(error)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(hosts))) as pool:
+        futures = [pool.submit(fetch, name, host) for name, host in hosts.items()]
+        for future in concurrent.futures.as_completed(futures):
+            name, snapshot, error = future.result()
+            if snapshot is not None:
+                snapshots[name] = snapshot
+            elif name == row["host"]:
+                return False
+            else:
+                batch_fleet_gate_warning(name, error)
+    target_snapshot = snapshots.get(row["host"])
+    if target_snapshot is None:
         return False
     provider = ((target_snapshot.get("providers") or {}).get(spec["backend"])) or spec.get("provider")
     keys = concurrency_keys(spec["backend"], provider)
     limits = provider_concurrency_limits({"concurrency": caps}, keys)
     if not limits:
         return True
-    snapshots = {row["host"]: target_snapshot}
-    for name, host in hosts.items():
-        if name == row["host"]:
-            continue
-        if host["kind"] == "instabox" and states.get(host.get("box"), "").lower() not in (
-                "running", "ready", "active"):
-            continue
-        try:
-            snapshots[name] = host_json(host, ["fleet", "_snapshot"], timeout=20)
-        except RuntimeError:
-            # An unreachable host may still hold a slot; fail closed for configured fleet-wide caps.
-            return False
+    # Queued work has not claimed a local slot. Back off a host once its local queue is full.
+    for name, snapshot in snapshots.items():
+        if sum(run.get("state") == "queued" for run in snapshot.get("active_runs") or []) >= 2:
+            if name == row["host"]:
+                return False
     counts = {key: 0 for key in limits}
     for snapshot in snapshots.values():
         for run in snapshot.get("active_runs") or []:
-            if run.get("state") not in ("queued", "routing", "running", "finalizing", "verifying"):
+            if run.get("state") not in ("routing", "running", "finalizing", "verifying"):
                 continue
             provider = run.get("provider") or (snapshot.get("providers") or {}).get(run.get("backend"))
             run_keys = run.get("concurrency_keys") or concurrency_keys(run.get("backend"), provider)
             for key in counts:
                 if key in run_keys:
                     counts[key] += 1
-    return all(counts[key] < cap for key, cap in limits.items())
+    reserve = caps.get("review_reserve", 2)
+    review = spec.get("card_type") == "review"
+    return all(counts[key] < (cap if review else max(0, cap - reserve)) for key, cap in limits.items())
+
+
+def fleet_topology_concurrency():
+    """Single source of fleet-wide batch limits, maintained with the fleet topology."""
+    return {"codex": 13, "total": 29, "minimax-cn": 26, "pi": 26, "review_reserve": 2}
+
+
+def batch_fleet_gate_warning(host, error):
+    path = os.path.join(DATA, "events-all.log")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    event = {"ts": NOW(), "kind": "fleet_gate_host_unreachable", "host": host, "error": short(error, 300)}
+    with open(path, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
 def execute_batch(spec, summary):

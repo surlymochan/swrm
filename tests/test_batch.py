@@ -93,6 +93,61 @@ class FakeFleetFixture:
 
 
 class BatchTests(FakeFleetFixture, unittest.TestCase):
+    def test_review_slot_ignores_queued_work_on_other_host(self):
+        snapshots = {
+            "local": {"providers": {"codex": "codex"}, "active_runs": []},
+            "b1": {"providers": {"codex": "codex"}, "active_runs": [{"state": "queued"} for _ in range(30)]},
+            "b2": {"providers": {"codex": "codex"}, "active_runs": [
+                {"state": "running", "backend": "codex", "provider": "codex"} for _ in range(6)]},
+        }
+        with mock.patch.object(xs, "fleet_topology_concurrency", return_value={"codex": 13, "total": 29}), \
+                mock.patch.object(xs, "instabox_states", return_value={"b1-box": "Running", "b2-box": "Running"}), \
+                mock.patch.object(xs, "host_json", side_effect=lambda host, *a, **k: snapshots[host["name"]]):
+            self.assertTrue(xs.batch_provider_slot_available({"backend": "codex", "card_type": "review"},
+                                                              {"host": "b2"}))
+
+    def test_unreachable_snapshot_warns_and_counts_other_hosts(self):
+        snapshots = {"local": {"providers": {"codex": "codex"}, "active_runs": []},
+                     "b1": {"providers": {"codex": "codex"}, "active_runs": []},
+                     "b2": {"providers": {"codex": "codex"}, "active_runs": [
+                         {"state": "running", "backend": "codex", "provider": "codex"}]}}
+        def snapshot(host, *args, **kwargs):
+            if host["name"] == "local":
+                raise RuntimeError("snapshot unavailable")
+            return snapshots[host["name"]]
+        with mock.patch.object(xs, "fleet_topology_concurrency", return_value={"codex": 13, "total": 29}), \
+                mock.patch.object(xs, "instabox_states", return_value={"b1-box": "Running", "b2-box": "Running"}), \
+                mock.patch.object(xs, "host_json", side_effect=snapshot):
+            self.assertTrue(xs.batch_provider_slot_available({"backend": "codex", "card_type": "fix"},
+                                                              {"host": "b1"}))
+        event = json.loads((self.data / "events-all.log").read_text().splitlines()[-1])
+        self.assertEqual((event["kind"], event["host"]), ("fleet_gate_host_unreachable", "local"))
+
+    def test_total_cap_reserves_two_slots_for_review(self):
+        snapshots = {name: {"providers": {"codex": "codex"}, "active_runs": []} for name in self.hosts}
+        for name in ("b1", "b2"):
+            snapshots[name]["active_runs"] = [{"state": "running", "backend": "codex", "provider": "codex"}
+                                               for _ in range(13)]
+        snapshots["local"]["active_runs"] = [{"state": "running", "backend": "codex", "provider": "codex"}]
+        with mock.patch.object(xs, "fleet_topology_concurrency", return_value={"total": 29}), \
+                mock.patch.object(xs, "instabox_states", return_value={"b1-box": "Running", "b2-box": "Running"}), \
+                mock.patch.object(xs, "host_json", side_effect=lambda host, *a, **k: snapshots[host["name"]]):
+            self.assertFalse(xs.batch_provider_slot_available({"backend": "codex", "card_type": "fix"},
+                                                               {"host": "b1"}))
+            self.assertTrue(xs.batch_provider_slot_available({"backend": "codex", "card_type": "review"},
+                                                              {"host": "b1"}))
+
+    def test_host_with_two_queued_runs_is_not_selected(self):
+        snapshots = {"local": {"providers": {"pi": "pi"}, "active_runs": []},
+                     "b1": {"providers": {"pi": "pi"}, "active_runs": [{"state": "queued"},
+                                                                            {"state": "queued"}]},
+                     "b2": {"providers": {"pi": "pi"}, "active_runs": []}}
+        with mock.patch.object(xs, "fleet_topology_concurrency", return_value={"total": 29}), \
+                mock.patch.object(xs, "instabox_states", return_value={"b1-box": "Running", "b2-box": "Running"}), \
+                mock.patch.object(xs, "host_json", side_effect=lambda host, *a, **k: snapshots[host["name"]]):
+            self.assertFalse(xs.batch_provider_slot_available({"backend": "pi", "card_type": "fix"},
+                                                               {"host": "b1"}))
+
     def test_batch_launch_passes_path_hints_to_remote_run(self):
         card = self.cards / "one.md"
         card.write_text("Update src/widget.py")
@@ -178,7 +233,8 @@ class BatchTests(FakeFleetFixture, unittest.TestCase):
         (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"pi": 1}}))
         (self.cards / "one.md").write_text("first card")
         (self.cards / "two.md").write_text("second card")
-        rc, summary, _ = self.run_batch()
+        with mock.patch.object(xs, "fleet_topology_concurrency", return_value={"pi": 3, "total": 3}):
+            rc, summary, _ = self.run_batch()
         self.assertEqual(rc, 0)
         self.assertEqual([row["host"] for row in summary["cards"]], ["b1", "b2"])
         starts, finishes = [], []
@@ -197,7 +253,8 @@ class BatchTests(FakeFleetFixture, unittest.TestCase):
         (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"total": 1}}))
         (self.cards / "one.md").write_text("first card")
         (self.cards / "two.md").write_text("second card")
-        rc, summary, _ = self.run_batch()
+        with mock.patch.object(xs, "fleet_topology_concurrency", return_value={"total": 3}):
+            rc, summary, _ = self.run_batch()
         self.assertEqual(rc, 0)
         starts, finishes = [], []
         for name in ("b1", "b2"):
