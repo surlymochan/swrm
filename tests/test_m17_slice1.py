@@ -134,7 +134,8 @@ class QuotaSourceReading(unittest.TestCase):
     def test_quota_config_validation(self):
         base = {"routing": {}}
         cfg = xs.quota_config(base)
-        self.assertEqual(cfg, {"enabled": False, "threshold": 0, "sources": {}})
+        self.assertEqual(cfg, {"enabled": False, "threshold": 0, "sources": {},
+                               "snapshot_max_age_minutes": 60})  # M23 #193 default
         with self.assertRaises(ValueError):
             xs.quota_config({"routing": {"quota": {"enabled": True, "threshold": -1}}})
         with self.assertRaises(ValueError):
@@ -145,6 +146,10 @@ class QuotaSourceReading(unittest.TestCase):
                                                    "sources": {"codex": {"source": "env"}}}}})
         with self.assertRaises(ValueError):
             xs.quota_config({"routing": {"quota": {"enabled": False, "typo": 1}}})
+        with self.assertRaises(ValueError):
+            xs.quota_config({"routing": {"quota": {"snapshot_max_age_minutes": 0}}})
+        self.assertEqual(xs.quota_config(
+            {"routing": {"quota": {"snapshot_max_age_minutes": 45}}})["snapshot_max_age_minutes"], 45)
 
     def test_custom_backend_quota_keeps_old_semantics(self):
         # The refactor must not change (available, why) for custom backends.
