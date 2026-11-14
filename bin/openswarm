@@ -2367,14 +2367,16 @@ def compute_routing_weights(entries, min_samples=8):
     for entry in entries:
         if not isinstance(entry, dict) or not entry.get("backend"):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate"):
             # M7 slice 1 (#122) / slice 2 (#124): a batch or fleet
             # routing-decision record is not a run outcome — it must not
             # inflate run counts or pass rates. A fleet-health reap record
             # (M12 slice 2, #148) is likewise an action log, not an outcome.
             # A batch verify-evalid record (M13 slice 1, #151) is likewise
             # a verification record, not a second run outcome. A fleet
-            # verify-evalid record (M13 slice 2, #153) is the same.
+            # verify-evalid record (M13 slice 2, #153) is the same. A
+            # fleet health-gate record (M25 slice 2, #204) is a dispatch
+            # decision, not a run outcome.
             continue
         key = (entry.get("backend"), entry.get("model"), entry.get("card_type"))
         groups.setdefault(key, []).append(entry)
@@ -2533,7 +2535,7 @@ def compute_adaptive_margins(entries, policy):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -2914,7 +2916,7 @@ def compute_advice_accuracy(entries):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -3032,7 +3034,7 @@ def compute_weighted_eval(entries, margin=0.10, plan_ok=None):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -3220,7 +3222,7 @@ def compute_gate_eval(entries, margin=0.10,
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -5656,11 +5658,13 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
 #
 # Policy shape (policy.json, routing.health_gate):
 #   {"enabled": false, "timeout_seconds": 10, "on_unknown": "allow"}
-# Fleet exec forwarding is untouched: the gate only runs in cmd_run's
-# single-dispatch path (initial pick + fallback re-route) and in
-# execute_batch's per-card dispatch (M25 slice 1, #202, via
-# batch_health_gate). The auto-rework escalation pick is not gated in this
-# slice (known gap, see README).
+# Fleet exec forwarding (M25 slice 2, #204) gates a forwarded `run` on its
+# effective backend at the controller, via fleet_health_gate, before any
+# host exec attempt; the gate only runs in cmd_run's single-dispatch path
+# (initial pick + fallback re-route), in execute_batch's per-card dispatch
+# (M25 slice 1, #202, via batch_health_gate), and in cmd_fleet's exec
+# branch. The auto-rework escalation pick is not gated in this slice
+# (known gap, see README).
 
 HEALTH_GATE_DEFAULT_TIMEOUT_SECONDS = 10
 HEALTH_GATE_TIMEOUT_MIN_SECONDS = 1
@@ -12594,7 +12598,7 @@ def cmd_ledger_backfill_pass(args):
                 continue
             if not isinstance(entry, dict):
                 continue
-            if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid"):
+            if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate"):
                 # M7 slice 1 (#122) / slice 2 (#124): a batch or fleet
                 # routing-decision record is not a run outcome — backfill
                 # must not stamp exec_pass on it. Same for a fleet-health
@@ -12901,6 +12905,35 @@ def cmd_fleet(args, policy=None):
                 raise ValueError(quota_info["reason"])
             if quota_info is not None and (quota_info.get("rerouted") or quota_info.get("quota_error")):
                 print(f"quota: {quota_info['reason']}", file=sys.stderr)
+            # M25 slice 2 (#204): fleet health gate on the effective
+            # backend (the weighted/quota-routed pick when routing chose
+            # one, else the forwarded explicit --backend — so an explicit
+            # --backend is gated exactly like a routed pick). A blocked
+            # run is never forwarded: no exec attempt on any host, ledger
+            # blocked/health-gate, exit 2 like the quota refusal above.
+            # When the gate is off (shipped default) fleet_health_gate
+            # returns (None, False) without reading probe state, so
+            # forwarding stays byte-identical. The probe reads the
+            # controller's state; the remote run's own M24 gate is the
+            # executor-side check. The gate flags are NOT forwarded to
+            # the remote run. A dry run is gated like a single run (M24
+            # shows the gate decision on dry runs too): a blocked dry run
+            # is refused and recorded, an allowed dry run dispatches
+            # nothing so no `dispatched` ledger record is written for it.
+            if eff_decision is not None:
+                eff_backend, eff_model = eff_decision.get("backend"), eff_decision.get("model")
+            else:
+                eff_backend, eff_model = parsed.backend, parsed.model
+            gate_record, gate_blocked = fleet_health_gate(
+                args, policy, eff_backend, backends_file=parsed.backends_file)
+            if gate_record is not None and (gate_blocked or not parsed.dry_run):
+                gate_entry_id = f"fleet-{host['name']}-{uuid.uuid4().hex[:8]}"
+                fleet_record_health_gate(host["name"], gate_entry_id, eff_backend, eff_model,
+                                         parsed.card_type, parsed.scope, gate_record, gate_blocked)
+            if gate_blocked:
+                error = health_gate_error(gate_record)
+                print(error, file=sys.stderr)
+                raise ValueError(error)
         if command[0] == "watch":
             # A watcher is long-lived and its lines are the product: stream them and
             # do not apply the 300s buffered-command timeout unless one was requested.
@@ -13807,6 +13840,92 @@ def batch_block_row_health_gate(summary, row, record):
                  summary=f"blocked by health gate: {record['reason']}")
     batch_record_health_gate_blocked(summary, row, record)
     return record
+
+
+def fleet_health_gate(args, policy, backend, backends_file=None):
+    """(record, blocked) for one `fleet exec` run's effective backend (M25 slice 2, #204).
+
+    Reuses apply_health_gate() — the same decision path single `openswarm run`
+    uses (M24, #198) and batch cards use (M25 slice 1, #202) — on the
+    effective backend: the weighted/quota-routed pick when routing chose
+    one, else the forwarded explicit --backend. Returns (None, False)
+    when the gate is off: probe state is never read, and the custom
+    backends file is never loaded, so a gated-off fleet exec forwards
+    byte-identically to before. Also (None, False) when no backend is
+    selected yet (backend None): the remote run's own M24 gate judges the
+    pick it actually routes to.
+
+    The probe reads the controller's probe state (get_state), the same
+    state fleet_weighted_route already routes on — so for a run forwarded
+    to a remote host the verdict reflects the controller host, not the
+    executor host; the remote run's own gate is the executor-side check.
+    A probe-state read failure degrades to an empty state (verdict
+    unknown, per the configured on_unknown posture) instead of stranding
+    the dispatch; an invalid health_gate config fails loudly like a single
+    run. The gate flags live on the fleet exec invocation (before the
+    host, like --timeout) and are NOT forwarded to the remote run: forcing
+    them on there would override the executor host's own policy with the
+    controller's choice.
+    """
+    if backend is None:
+        return None, False
+    # Flag precedence mirrors apply_health_gate (M24): --health-gate wins
+    # over --no-health-gate when both are passed; --no-health-gate wins
+    # over the policy default. The pre-check below only reads the raw
+    # config (no validation), so an invalid config is ignored while the
+    # gate is off, exactly like batch_health_gate.
+    if getattr(args, "health_gate", False):
+        enabled = True
+    elif getattr(args, "no_health_gate", False):
+        return None, False
+    else:
+        raw = (policy.get("routing") or {}).get("health_gate") or {}
+        enabled = isinstance(raw, dict) and bool(raw.get("enabled"))
+    if not enabled:
+        return None, False
+    try:
+        st = get_state(policy)
+    except (RuntimeError, OSError):
+        st = {}
+    custom_backends = load_custom_backends(policy, explicit=backends_file)
+    return apply_health_gate(backend, st, policy, args, custom_backends=custom_backends, stage="fleet")
+
+
+def fleet_record_health_gate(host, entry_id, backend, model, card_type, scope, record, blocked,
+                             run_id=None):
+    """Ledger entry for one `fleet exec` run's health-gate decision (M25 slice 2, #204).
+
+    Mirrors fleet_record_routing_decision: the controller ledger is where
+    fleet dispatch decisions are read (the remote run writes its own ledger
+    on the executor host), so the gate verdict — healthy/unknown/bypassed
+    (status dispatched) or unhealthy / unknown-with-on_unknown=block
+    (status blocked, blocked_by health-gate, reason + full gate record
+    with per-check evidence pointers) — is recorded here before the
+    forward, so no remote run exists yet to join to (append_ledger
+    normalizes the missing run_id to the entry id, as for the quota
+    refusal); the routing-decision entry, when routing is on, carries
+    the run_id. The entry is flagged
+    fleet_health_gate so compute_routing_weights() and the ledger
+    backfill-pass skip it: it is a decision record, not a run outcome,
+    and must not inflate run counts or pass rates. A ledger write failure
+    must not fail the exec, so it is reported and the forwarded stdout
+    (or the refusal error) stays authoritative.
+    """
+    try:
+        entry = {"id": entry_id, "run_id": run_id, "ts": NOW(),
+                 "title": f"fleet {host} health gate {record['verdict']}",
+                 "status": "blocked" if blocked else "dispatched", "host": host,
+                 "backend": backend, "model": model,
+                 "card_type": card_type, "scope": scope,
+                 "fleet_health_gate": True, "health_gate": record, "seconds": None}
+        if blocked:
+            entry.update({"blocked_by": "health-gate", "blocked_reason": record["reason"],
+                          "error_class": "health_gate_blocked",
+                          "summary": health_gate_error(record)[:300]})
+        append_ledger(entry)
+    except OSError as error:
+        print(f"openswarm: warning: could not record health gate for fleet "
+              f"{host} in ledger: {error}", file=sys.stderr)
 
 
 def batch_save(summary):
@@ -17267,6 +17386,17 @@ def main():
     fp = fleet_sub.add_parser("exec")
     fp.add_argument("--timeout", type=float, default=None,
                     help="seconds; default 300, none for `watch`")
+    fp.add_argument("--health-gate", action="store_true",
+                    help="enable the pre-dispatch backend health gate for a forwarded `run` (M25, #204): "
+                         "probe the run's effective backend before forwarding and refuse an unhealthy "
+                         "one (the run is blocked, no exec attempt on any host, never rerouted); "
+                         "flags go before the host, like --timeout, and are not forwarded to the remote run")
+    fp.add_argument("--no-health-gate", action="store_true",
+                    help="disable the pre-dispatch backend health gate for a forwarded `run` even when "
+                         "routing.health_gate.enabled is true")
+    fp.add_argument("--skip-health-gate", action="store_true",
+                    help="bypass the health gate for a forwarded `run`; the bypass is recorded in the "
+                         "controller ledger (M25, #204)")
     fp.add_argument("host")
     fp.add_argument("args", nargs=argparse.REMAINDER)
     fp = fleet_sub.add_parser("ledger", help="collect ledgers from fleet hosts")
