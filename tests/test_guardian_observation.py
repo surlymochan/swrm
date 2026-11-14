@@ -304,6 +304,25 @@ class GuardianObservationTests(unittest.TestCase):
         self.assertEqual(item["status"], "unhealthy")
         self.assertIn("lane_config_invalid", item["signals"])
 
+    def test_producer_paused_host_and_invalid_config(self):
+        now = time.time()
+        host = {"name": "alpha", "reachable": False, "paused": True, "status": "paused",
+                "health": None}
+        result = guardian.observe({"health": {"hosts": [host]}}, state_dir=str(self.state),
+                                  persist=False, now=now, observed_at=now)
+        item = result["dimensions"]["health"]["hosts"]["items"][0]
+        self.assertEqual(item["status"], "degraded")
+        self.assertNotIn("host_unreachable", item["signals"])
+        host.update(reachable=True, paused=False, status="config invalid",
+                    health={"runs": [], "lanes": [], "lane_config_valid": False,
+                            "lane_config_error": "bad lane file"})
+        result = guardian.observe({"health": {"hosts": [host]}}, state_dir=str(self.state),
+                                  persist=False, now=now, observed_at=now)
+        item = result["dimensions"]["health"]["hosts"]["items"][0]
+        self.assertEqual(item["status"], "unhealthy")
+        self.assertEqual(item["detail"].count("invalid lane config"), 1)
+        self.assertIn("bad lane file", item["detail"])
+
     # unknown inputs ------------------------------------------------------
     def test_stale_quota_is_unknown_and_never_healthy(self):
         quota = self.write("quota.json", quota_payload([quota_row()]))
@@ -879,6 +898,40 @@ class GuardianObservationTests(unittest.TestCase):
             result = guardian.load_snapshot(str(self.state), now=read_time)
             self.assertEqual(result["dimensions"]["health"]["status"], "unknown")
             self.assertEqual(result["dimensions"]["health"]["hosts"]["status"], "unknown")
+
+    def test_readback_refreshes_observed_evidence_and_preserves_it_across_drain(self):
+        now = time.time()
+        health = {"hosts": [{"name": "alpha", "reachable": True, "paused": False,
+                             "status": "reachable", "health": {"runs": [], "lanes": []}}]}
+        guardian.drain(str(self.state), "maintenance", host="alpha")
+        guardian.observe({"health": health}, state_dir=str(self.state), now=now, observed_at=now)
+        self.assertEqual(guardian.load_snapshot(str(self.state), now=now)["dimensions"]
+                         ["health"]["hosts"]["items"][0]["status"], "drained")
+        guardian.undrain(str(self.state))
+        self.assertEqual(guardian.load_snapshot(str(self.state), now=now)["dimensions"]
+                         ["health"]["hosts"]["items"][0]["status"], "healthy")
+        expired = now + observation.DEFAULT_THRESHOLDS["max_age_seconds"] + 1
+        result = guardian.load_snapshot(str(self.state), now=expired)
+        for key in ("dimensions", "observed_dimensions"):
+            item = result[key]["health"]["hosts"]["items"][0]
+            self.assertEqual(item["status"], "unknown")
+            self.assertEqual(item["unconfirmed_status"], "healthy")
+            self.assertEqual(item["evidence"]["reachable"], True)
+        again = observation._reevaluate(result, str(self.state), now=expired + 1)
+        self.assertEqual(again["observed_dimensions"]["health"]["hosts"]["items"][0]
+                         ["unconfirmed_status"], "healthy")
+        self.assertEqual(guardian.load_snapshot(str(self.state), now=expired + 1)
+                         ["dimensions"]["health"]["hosts"]["items"][0]["unconfirmed_status"], "healthy")
+
+    def test_null_observed_dimensions_falls_back_to_dimensions(self):
+        now = time.time()
+        result = guardian.observe({"health": {"hosts": [{"name": "alpha", "reachable": False,
+                                                         "paused": False, "status": "unreachable"}]}},
+                                  state_dir=str(self.state), persist=False, now=now, observed_at=now)
+        result["observed_dimensions"] = None
+        refreshed = observation._reevaluate(result, str(self.state), now=now)
+        self.assertEqual(refreshed["overall"]["status"], "unhealthy")
+        self.assertEqual(refreshed["dimensions"]["health"]["hosts"]["items"][0]["status"], "unhealthy")
 
     # what the guardian must never do -------------------------------------
     def test_guardian_never_shells_out_and_never_reports_capacity(self):

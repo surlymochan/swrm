@@ -292,6 +292,13 @@ current manual drain is applied again. The result carries `reevaluated_at`
 observation). A snapshot written by a newer schema version is refused with a
 clear error rather than misread.
 
+The persisted `observed_dimensions` retain the undrained observation from
+the time it was written, so a later read can restore evidence after a drain
+is lifted. Readback does not rewrite that file: its returned
+`observed_dimensions` are refreshed for the current time before applying the
+drain to `dimensions`. Expired items in both views are `unknown` and retain
+their original status in `unconfirmed_status` along with their evidence.
+
 ## Programmatic use
 
 ```python

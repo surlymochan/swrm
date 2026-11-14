@@ -719,17 +719,17 @@ def _host_items(rows, thresholds):
         paused = bool(row.get("paused"))
         detail = ""
         signals = []
-        if status_text == "unreachable" or reachable is False:
-            status = UNHEALTHY
-            detail = "host is unreachable"
-            signals.append("host_unreachable")
-        elif status_text == "config invalid":
+        if status_text == "config invalid":
             status = UNHEALTHY
             detail = "host reports an invalid lane config"
             signals.append("lane_config_invalid")
         elif paused or status_text == "paused":
             status = DEGRADED
             detail = "host is paused"
+        elif status_text == "unreachable" or reachable is False:
+            status = UNHEALTHY
+            detail = "host is unreachable"
+            signals.append("host_unreachable")
         elif status_text == "reachable" or reachable is True:
             status = HEALTHY
             detail = "host is reachable"
@@ -749,6 +749,9 @@ def _host_items(rows, thresholds):
             # the host's own lanes and runs are part of the host's health
             status = _worst([status] + [fault[0] for fault in faults])
             for _, signal, text in faults:
+                if signal == "lane_config_invalid" and signal in signals:
+                    detail = detail.replace("host reports an invalid lane config", text, 1)
+                    continue
                 signals.append(signal)
                 detail = (detail + "; " if detail else "") + text
         items.append({"name": name, "status": status, "detail": detail, "signals": signals,
@@ -1375,7 +1378,8 @@ def _mark_unconfirmed(blocks, observation):
                 inner["detail"] = (inner.get("detail", "") + "; " if inner.get("detail") else "") + note
         for item in _block_items(block):
             item["unconfirmed"] = True
-            item["unconfirmed_status"] = item.get("status")
+            if "unconfirmed_status" not in item:
+                item["unconfirmed_status"] = item.get("status")
             item["status"] = UNKNOWN
 
 
@@ -1744,7 +1748,10 @@ def _reevaluate(payload, state_dir, now=None, thresholds=None):
         merged.update({key: value for key, value in stored.items() if key in DEFAULT_THRESHOLDS})
     if thresholds:
         merged.update({key: value for key, value in thresholds.items() if key in DEFAULT_THRESHOLDS})
-    dimensions = copy.deepcopy(payload.get("observed_dimensions", payload.get("dimensions")))
+    original = payload.get("observed_dimensions")
+    if not isinstance(original, dict):
+        original = payload.get("dimensions")
+    dimensions = copy.deepcopy(original)
     if not isinstance(dimensions, dict):
         dimensions = {}
     views = (payload.get("coverage") or {}).get("inputs") or []
@@ -1775,12 +1782,14 @@ def _reevaluate(payload, state_dir, now=None, thresholds=None):
     except GuardianError as error:
         drain_error = str(error)
     required = (payload.get("coverage") or {}).get("required") or []
+    observed_dimensions = copy.deepcopy(dimensions)
     assembled = _assemble(dimensions, observations, merged, now, drain_record=drain_record,
                           required=required, drain_error=drain_error)
     result = dict(payload)
     result["overall"] = assembled["overall"]
     result["coverage"] = assembled["coverage"]
     result["dimensions"] = assembled["dimensions"]
+    result["observed_dimensions"] = observed_dimensions
     result["signals"] = assembled["signals"]
     result["manual_drain"] = assembled["manual_drain"]
     result["reevaluated_at"] = now
