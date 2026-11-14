@@ -279,6 +279,75 @@ class GuardianObservationTests(unittest.TestCase):
                                           state_dir=str(self.state), persist=False, now=now, observed_at=now)
                 self.assertEqual(result["dimensions"]["snapshot"]["providers"]["status"], expected)
 
+    def test_quota_count_and_contextual_rate_limit_markers(self):
+        now = time.time()
+        for detail, expected in [("remaining 429 is above threshold 5", "healthy"),
+                                 ("HTTP 429.", "unhealthy"), ("HTTP/429", "unhealthy"),
+                                 ("429 Too Many Requests", "unhealthy")]:
+            status = "ok" if detail.startswith("remaining") else "error"
+            row = quota_row(remaining=429 if status == "ok" else None, status=status, detail=detail)
+            result = guardian.observe({"quota": quota_payload([row])}, state_dir=str(self.state),
+                                      persist=False, now=now, observed_at=now, require_fleet=False)
+            item = result["dimensions"]["quota"]["items"][0]
+            self.assertEqual(item["status"], expected, detail)
+            self.assertEqual("rate_limited" in item["signals"], status == "error", detail)
+
+    def test_nested_run_reason_uses_context_for_429(self):
+        now = time.time()
+        for reason, expected in [("used 429 tokens", False), ("used 1.429 tokens", False),
+                                 ("used 42918 tokens", False), ("used 4290 tokens", False),
+                                 ("HTTP 429.", True), ("HTTP/429", True),
+                                 ("429 Too Many Requests", True)]:
+            payload = {"hosts": [{"name": "a", "reachable": True,
+                                  "health": {"runs": [{"id": "r", "verdict": "alive", "reason": reason}],
+                                             "lanes": []}}]}
+            result = guardian.observe({"health": payload}, state_dir=str(self.state), persist=False,
+                                      now=now, observed_at=now)
+            host = result["dimensions"]["health"]["hosts"]["items"][0]
+            self.assertEqual("rate_limited" in host["signals"], expected, reason)
+
+    def test_pi_builtin_missing_credential_and_configured_errors(self):
+        loader = importlib.machinery.SourceFileLoader("guardian_pi_openswarm", str(BIN / "openswarm"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        with mock.patch.dict(os.environ, {"OPENSWARM_HOME": str(self.root)}, clear=True):
+            loader.exec_module(module)
+            with mock.patch.object(module, "minimax_key_from_pi", return_value=None):
+                missing = module.minimax_quota()
+            now = time.time()
+            snapshot = snapshot_payload(lanes=[lane()])
+            for error, unmetered in [(missing["error"], True),
+                                     ("MiniMax quota request failed: HTTP 401", False),
+                                     ("MiniMax quota request failed: HTTP 429", False),
+                                     ("unsupported endpoint", False)]:
+                state = {"pi": {"quota": {"error": error}}}
+                remaining, detail, source = module.builtin_quota_remaining("pi", state)
+                row = quota_row(backend="pi", remaining=remaining, status="error", detail=detail, source=source)
+                result = guardian.observe({"snapshot": snapshot, "quota": quota_payload([row]), "probe": state},
+                                          state_dir=str(self.state), persist=False, now=now, observed_at=now)
+                quota = result["dimensions"]["quota"]
+                probe = result["dimensions"]["probe"]
+                self.assertEqual(quota["status"], "not-metered" if unmetered else "unhealthy")
+                self.assertEqual("pi" in probe["unobserved"], unmetered)
+                if unmetered:
+                    self.assertEqual(result["overall"]["status"], "unknown")  # probe has no evidence
+                    quota_only = guardian.observe({"snapshot": snapshot, "quota": quota_payload([row])},
+                        state_dir=str(self.state), persist=False, now=now, observed_at=now)
+                    self.assertEqual(quota_only["overall"]["status"], "healthy")
+                    required = guardian.observe({"snapshot": snapshot, "quota": quota_payload([row])},
+                        state_dir=str(self.state), persist=False, now=now, observed_at=now, require=["quota"])
+                    self.assertEqual(required["overall"]["status"], "unknown")
+                    required_probe = guardian.observe({"snapshot": snapshot, "probe": state},
+                        state_dir=str(self.state), persist=False, now=now, observed_at=now, require=["probe"])
+                    self.assertEqual(required_probe["overall"]["status"], "unknown")
+                else:
+                    self.assertEqual(probe["items"][0]["status"], "degraded")
+                    self.assertEqual("rate_limited" in quota["items"][0]["signals"], "429" in error)
+            row["detail"] = missing["error"]
+            row["source"] = "file /configured/quota"
+            result = guardian.observe({"quota": quota_payload([row])}, state_dir=str(self.state),
+                                      persist=False, now=now, observed_at=now, require_fleet=False)
+            self.assertEqual(result["dimensions"]["quota"]["status"], "unhealthy")
+
     def test_corrupt_persisted_structure_reports_guardian_error(self):
         self.state.mkdir()
         (self.state / observation.SNAPSHOT_FILE).write_text(json.dumps({"schema": observation.SCHEMA,

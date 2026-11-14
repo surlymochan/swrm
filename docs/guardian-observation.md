@@ -149,10 +149,11 @@ status.
   quota source at all (source `none (unknown)`) is reported as **not metered**:
   it is listed under `dimensions.quota.unmetered` and never folds into the
   verdict, because an unmetered backend is a known gap, not a missing
-  observation. The built-in DeepSeek balance reader's `no api key` result is
-  also treated as not metered; errors from configured sources remain faults.
-  In the probe cache, an unconfigured DeepSeek is unobserved. A probe with no
-  usable quota evidence remains unknown, including when it is required.
+  observation. The built-in DeepSeek and Pi readers' missing-credential results
+  are also treated as not metered; errors from configured sources remain faults.
+  An all-unmetered quota input is neutral when optional and unknown when
+  required. In the probe cache, unconfigured readers are unobserved. A probe
+  with no usable quota evidence remains unknown, including when required.
 * **Resources** — over the memory/disk/network thresholds below.
 
 ### Freshness and confidence

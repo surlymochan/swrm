@@ -197,12 +197,21 @@ def _rate_limit_marker(text):
     if not text:
         return None
     low = str(text).lower()
-    if re.search(r"(?<![\w/.-])429(?![\w/.-])", low):
+    if (re.search(r"(?<![\w.])(?:http[\s/]+|status(?:\s+code)?[\s:=/]+|"
+                  r"code[\s:=/]+|error[\s:=/]+)429(?!\w|\.\d)", low)
+            or re.search(r"(?<![\w.])429(?!\w|\.\d)\s+too[ -]+many[ -]+requests", low)):
         return "429"
     for marker in RATE_LIMIT_MARKERS:
         if marker in low:
             return marker
     return None
+
+
+def _not_configured(backend, error):
+    """Recognize only the missing-credential results emitted by built-in readers."""
+    return ((backend == "deepseek" and error == "no api key")
+            or (backend == "pi" and error ==
+                "no MiniMax credential (pi auth.json has no minimax-cn key)"))
 
 
 def _quota_marker(text):
@@ -831,11 +840,10 @@ def _quota_items(payload, thresholds):
                 item_status = UNHEALTHY
                 item_detail = "quota exhausted (remaining %g)" % remaining
                 signals.append("quota_exhausted")
-        elif (status == "error" and backend == "deepseek"
-              and source == "builtin deepseek (account balance, CNY)"
-              and detail == "no api key"):
+        elif (status == "error" and source.startswith("builtin %s (" % backend)
+              and _not_configured(backend, detail)):
             item_status = NOT_METERED
-            item_detail = "deepseek is not configured: no api key"
+            item_detail = "%s is not configured: %s" % (backend, detail)
         elif status == "error":
             item_status = UNHEALTHY
             item_detail = detail or "quota source read failed"
@@ -850,7 +858,7 @@ def _quota_items(payload, thresholds):
         else:
             item_status = UNKNOWN
             item_detail = "unrecognised quota status %r" % status
-        marker = _rate_limit_marker(detail) or _rate_limit_marker(source)
+        marker = _rate_limit_marker(detail) if status == "error" else None
         if marker and row.get("stale") is not True:
             item_status = UNHEALTHY
             signals.append("rate_limited")
@@ -932,7 +940,7 @@ def _probe_items(payload, thresholds):
     if isinstance(deepseek, dict):
         error = _short(deepseek.get("error"), 200)
         balance = _num(deepseek.get("balance"))
-        if error == "no api key":
+        if _not_configured("deepseek", error):
             unobserved.append("deepseek")
         elif error:
             items.append({"name": "deepseek", "status": DEGRADED,
@@ -945,9 +953,14 @@ def _probe_items(payload, thresholds):
                           "evidence": {"balance": balance}})
     for backend in ("ocgo", "cursor", "agy", "pi"):
         entry = payload.get(backend)
-        if isinstance(entry, dict) and entry.get("error"):
+        quota = entry.get("quota") if backend == "pi" and isinstance(entry, dict) else None
+        error = (quota.get("error") if isinstance(quota, dict) else None) or (
+            entry.get("error") if isinstance(entry, dict) else None)
+        if _not_configured(backend, error):
+            unobserved.append(backend)
+        elif error:
             items.append({"name": backend, "status": DEGRADED,
-                          "detail": "probe reported an error: %s" % _short(entry.get("error"), 160),
+                          "detail": "probe reported an error: %s" % _short(error, 160),
                           "signals": ["probe_error"], "evidence": {}})
         else:
             unobserved.append(backend)
@@ -1207,6 +1220,8 @@ def _dimensions_for(observation, thresholds):
         block = _dimension(metered, "%d backend(s) reported" % len(metered) if metered
                            else "no metered backend reported a quota", observation, extra=info)
         block["unmetered"] = unmetered
+        if unmetered and not metered and not info.get("truncated"):
+            block["status"] = NOT_METERED
         if unmetered:
             block["detail"] += "; %d backend(s) are not metered" % len(unmetered)
         return {"quota": block}
@@ -1433,7 +1448,8 @@ def _assemble(dimensions, observations, thresholds, now, drain_record=None, requ
              if observation["status"] == "ok" and observation["freshness"] == "fresh"}
     missing_required = _missing_required(required, fresh)
 
-    evaluated = [block["status"] for block in dimensions.values()]
+    evaluated = [UNKNOWN if name in required and block["status"] == NOT_METERED
+                 else block["status"] for name, block in dimensions.items()]
     transient = _fold_statuses(evaluated) if evaluated else UNKNOWN
     reasons = []
     if not dimensions:
