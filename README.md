@@ -253,6 +253,8 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm fleet status` | Show reachability, paused hosts, lanes, and active runs. | `openswarm fleet status --json` |
 | `openswarm fleet health` | Per-run alive/dead/zombie verdicts with evidence pointers (ledger line, pid identity, last activity); read-only by default, `--reap` explicitly reaps dead runs (M11 semantics, one ledger line per reap; zombie/alive/unknown are reported as skipped). | `openswarm fleet health --json` |
 | `openswarm fleet exec` | Run an swrm command on another host; stdout and the exit code are forwarded. | `openswarm fleet exec worker -- lane status` |
+| `openswarm fleet runners` | List registered runners with declared backends, capacity, and live reachability (M26 slice 1, #207). | `openswarm fleet runners --json` |
+| `openswarm fleet dispatch` | Dispatch one task card to a named runner: card + worktree spec go over, the remote backend runs, result/verify/ledger pointers come back into the controller ledger (M26 slice 1, #207). | `openswarm fleet dispatch worker --repo project --task-file ./task.md --backend codex --verify 'pytest -q'` |
 | `openswarm fleet ledger pull` | Merge the host ledgers into one fleet ledger file. | `openswarm fleet ledger pull --hosts worker,sandbox` |
 | `openswarm run --rework-of` | Resume an earlier run's task as a rework, linked in the ledger as `rework_of`. | `openswarm run --rework-of <run-id> --cwd ~/code/myrepo --task-file /tmp/task.md` |
 | `openswarm run --auto-rework` | On host verify failure, dispatch up to 2 automatic reworks (or N with `--auto-rework N`), each with the failure evidence injected, re-verifying after each; on exhaustion escalate once to a stronger backend tier; recorded in `result.auto_rework` and the ledger. | `openswarm run --auto-rework --cwd ~/code/myrepo --verify 'pytest -q' --task-file /tmp/task.md` |
@@ -603,11 +605,19 @@ and an authenticated executor on each host. `repos` maps the same logical repo n
 {"hosts":[
   {"name":"local","kind":"local","repos":{"project":"~/code/project"}},
   {"name":"worker","kind":"ssh","ssh":"worker-alias","openswarm":"~/.local/bin/openswarm",
+   "backends":["codex","pi"],"capacity":2,
    "repos":{"project":"~/work/project"}},
   {"name":"sandbox","kind":"instabox","box":"task-box","openswarm":"~/.local/bin/openswarm",
    "repos":{"project":"~/work/project"}}
 ]}
 ```
+
+Each host may declare `backends` (the backend ids that runner offers) and `capacity` (max concurrent
+runs); both are optional — an undeclared runner is unconstrained. The registry is strictly validated
+(M26 slice 1, #207, same style as custom backends): an unknown field, an unknown backend id, a duplicate
+name/backend, or a non-positive capacity refuses to start with an actionable error naming the file, the
+host, and the fix — never a silent downgrade. A malformed `fleet.json` is likewise refused, never
+silently replaced by the local-only default. See `examples/fleet-runners.json`.
 
 Local hosts use subprocesses; remote commands use `ssh <alias> --` or `instabox ssh <box> --`, with timeouts.
 Without a local repo mapping, the planner uses its current checkout. A missing fleet config defaults to local only.
@@ -621,6 +631,17 @@ openswarm fleet exec --timeout 120 worker -- runs --active --json
 
 Status uses `instabox ls` and never connects to a paused box. Unknown box states also remain uncontacted.
 `fleet exec` forwards stdout, stderr and the exit code; it does not issue a separate wake command.
+`fleet dispatch` (M26 slice 1, #207) is the one-to-one remote dispatch: it validates the runner registry,
+checks the runner offers the requested backend and has a `repos` mapping for `--repo`, preflights
+reachability, refuses at capacity, transfers the task card (and `--backends-file` when given) to the
+runner, runs the remote backend CLI in a worktree at the remote HEAD (or `--base`), then fetches the
+remote `result.json` (status, verify rc, branch/commit) and records a `fleet_remote_dispatch` entry in
+the controller ledger with the remote run id, the remote run dir, and the `_run-info` log pointer. An
+unreachable runner is a loud refusal — the task never falls back to local and never reroutes to another
+backend; the dispatch exit code is the remote run's exit code, and a result that cannot be fetched back
+is recorded as `fetch_error`, never as a pass. The dispatch record is skipped by routing-weight, advice
+and backfill passes, so it never inflates run counts; the remote run's own ledger row remains the
+outcome source of truth and merges in via `fleet ledger pull`.
 A forwarded `run` can request evalid verification with `--verify-evalid` (plus `--evalid-bin` to point at
 the evalid binary on the executor host): the remote run replays the executor's claimed test command in a
 clean clone via `xflow audit`, and `fleet exec` waits for the run to finish, then copies the

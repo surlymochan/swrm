@@ -1,0 +1,1 @@
+{"hosts":[{"kind":"local","name":"local","repos":{"swrm":"~/code/swrm"}},{"backends":["codex","pi"],"capacity":2,"kind":"ssh","name":"gocc","openswarm":"~/work/swrm-m26/bin/openswarm","repos":{"swrm":"/Users/surlymo/work/swrm-m26"},"ssh":"gocc"}]}
