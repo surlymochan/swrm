@@ -98,7 +98,7 @@
     }
   },
   "codex": {
-    "_doc": "Optional, opt-in and strictly time-bounded: `usage_independent_until` is a UTC instant (`YYYY-MM-DDTHH:MM:SSZ`). While it is still in the future the recommended Codex concurrency comes from `concurrency.codex` (the configured backend cap) instead of the observed Codex usage window, and the observed usage window / the remaining quota inferred from it neither exclude Codex nor degrade its effort. At the deadline and after it the default behaviour returns; a missing or malformed value keeps the default behaviour. Real provider limits (429 and provider-error breakers, model availability) and the hard concurrency caps are unaffected.",
+    "_doc": "Optional, opt-in and strictly time-bounded: `usage_independent_until` is a UTC instant (`YYYY-MM-DDTHH:MM:SS[.ffffff]Z`, at most six fractional digits). While it is in the future, recommended Codex concurrency is `concurrency.codex` or one if no valid cap is configured; Codex usage cannot exclude it or change effort, and its quota sources are not invoked for routing. At the deadline and after it the default behaviour returns; a missing or malformed value keeps the default behaviour. Real provider limits (429 and provider-error breakers, model availability) and the hard concurrency caps are unaffected.",
     "default_model": "gpt-6-luna",
     "default_effort": "high",
     "require_default_model": true,

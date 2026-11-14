@@ -4399,13 +4399,13 @@ def resets_left(policy):
 # (`codex.usage_independent_until` in policy.json / policy.local.json).
 # While the window is active the recommended Codex concurrency comes from
 # the configured backend cap (concurrency.codex) instead of the observed
-# Codex usage window, and the observed usage window / the remaining quota
-# inferred from it neither exclude Codex nor degrade its effort. The
+# Codex usage window. Usage and quota, including configured sources,
+# neither exclude Codex nor change its effort. The
 # window is strictly bounded in UTC: before the deadline it is active, at
 # the deadline and after it the default behaviour returns. A missing or
 # malformed setting fails safe to the default behaviour — it never
 # raises and never invents an active window.
-CODEX_USAGE_INDEPENDENT_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$")
+CODEX_USAGE_INDEPENDENT_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?Z$")
 
 
 def codex_usage_independent_until(policy):
@@ -4413,7 +4413,8 @@ def codex_usage_independent_until(policy):
 
     Returns the deadline as epoch seconds, or None when the setting is
     absent, empty, not a string, or not a strict UTC instant
-    ("YYYY-MM-DDTHH:MM:SSZ"). Offsets other than UTC are rejected on
+    ("YYYY-MM-DDTHH:MM:SS[.ffffff]Z"). More than six fractional digits
+    and offsets other than UTC are rejected on
     purpose: the deadline is compared against UTC everywhere.
     """
     raw = (policy.get("codex") or {}).get("usage_independent_until")
@@ -4423,7 +4424,7 @@ def codex_usage_independent_until(policy):
     if not match:
         return None
     try:
-        micros = int((match.group(7) or "").ljust(6, "0")[:6] or 0)
+        micros = int((match.group(7) or "").ljust(6, "0") or 0)
         when = dt.datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)),
                            int(match.group(4)), int(match.group(5)), int(match.group(6)),
                            micros, tzinfo=dt.timezone.utc)
@@ -4449,8 +4450,8 @@ def codex_concurrency_cap(policy):
     """The configured Codex backend cap (policy.concurrency.codex), or None.
 
     Only a positive integer counts. A missing or malformed cap means
-    "no configured cap": the usage-independent window then keeps the
-    default behaviour instead of inventing a capacity.
+    "no configured cap": the usage-independent window then uses one
+    as a conservative recommendation independent of usage.
     """
     configured = policy.get("concurrency") or {}
     if not isinstance(configured, dict):
@@ -5489,15 +5490,10 @@ def builtin_quota_remaining(backend, st):
 def codex_quota_signal_ignored(policy, backend, cfg):
     """True when the Codex quota signal must not exclude Codex.
 
-    While the opt-in usage-independent window is active, the remaining
-    quota inferred from the observed Codex usage windows never excludes
-    Codex. An explicitly configured source (routing.quota.sources.codex)
-    stays authoritative: that is a deliberate reading of a real quota,
-    not a usage inference.
+    While the opt-in usage-independent window is active, no Codex quota
+    source may affect routing, including explicitly configured sources.
     """
-    if backend != "codex" or not codex_usage_independent(policy):
-        return False
-    return backend not in ((cfg or {}).get("sources") or {})
+    return backend == "codex" and codex_usage_independent(policy)
 
 
 def quota_remaining_for_backend(backend, cfg, custom_backends=(), st=None):
@@ -5679,13 +5675,12 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
     tried = []
     while True:
         backend = current["backend"]
-        remaining, error = quota_remaining_for_backend(backend, cfg, custom_backends, st)
         ignored = codex_quota_signal_ignored(policy, backend, cfg)
         if ignored:
-            # Opt-in usage-independent window: the Codex quota inferred
-            # from the observed usage windows is not a reason to exclude
-            # Codex. Unknown, never zero.
+            # Do not invoke any Codex quota source during the active window.
             remaining, error = None, None
+        else:
+            remaining, error = quota_remaining_for_backend(backend, cfg, custom_backends, st)
         if error is not None:
             errors[backend] = error
             if not tried:
@@ -5706,7 +5701,7 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
         if remaining is None or remaining > threshold:
             if not tried:
                 if ignored:
-                    why = (f"{backend} usage-independent window active: inferred quota ignored; "
+                    why = (f"{backend} usage-independent window active: quota ignored; "
                            "kept the default pick")
                 elif remaining is None:
                     why = f"{backend} quota unknown; kept the default pick"
@@ -6334,11 +6329,11 @@ def concurrency(st, policy):
             recommended = {"codex": row["codex"], "ocgo": row["ocgo"]}
             break
     cap = codex_concurrency_cap(policy)
-    if cap is not None and codex_usage_independent(policy):
+    if codex_usage_independent(policy):
         # Opt-in usage-independent window: the recommended Codex
-        # concurrency is the configured backend cap, never a value
-        # derived from the observed Codex usage or quota.
-        recommended["codex"] = cap
+        # concurrency is the configured backend cap (or one if absent),
+        # never a value derived from the observed Codex usage or quota.
+        recommended["codex"] = cap if cap is not None else 1
     return recommended
 
 

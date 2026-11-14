@@ -6,10 +6,9 @@ UTC instant. While it is still in the future:
   * the recommended Codex concurrency comes from the configured backend
     cap (`concurrency.codex`), never from the observed Codex usage or
     quota;
-  * the observed Codex usage window neither excludes Codex nor degrades
+  * the observed Codex usage window neither excludes Codex nor changes
     its effort;
-  * the remaining quota inferred from that usage window never excludes
-    Codex.
+  * no Codex quota source is invoked or affects routing.
 
 Strict boundary: before the deadline the window is active, at the
 deadline and after it the default behaviour returns. A missing or
@@ -32,6 +31,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _load  # noqa: E402
@@ -141,7 +141,9 @@ class SettingParsing(unittest.TestCase):
         malformed = ["", "   ", "not-a-date", "2030-06-01", "2030-06-01 00:00:00",
                      "2030-06-01T00:00:00", "2030-06-01T00:00:00+02:00",
                      "2030-06-01T00:00:00.500+02:00", "2030-13-01T00:00:00Z",
-                     "2030-02-30T00:00:00Z", "2030-06-01T25:00:00Z", 2030, True, [], {}]
+                     "2030-02-30T00:00:00Z", "2030-06-01T25:00:00Z",
+                     "2030-06-01T00:00:00.1234567Z", "2030-06-01T00:00:00.123456789Z",
+                     2030, True, [], {}]
         for value in malformed:
             with self.subTest(value=value):
                 p = policy()
@@ -164,6 +166,13 @@ class SettingParsing(unittest.TestCase):
             self.assertFalse(xs.codex_usage_independent(p))
         with Clock(AFTER):
             self.assertFalse(xs.codex_usage_independent(p))
+
+    def test_fractional_expiry_boundary_is_strict(self):
+        p = policy(deadline="2030-06-01T00:00:00.123456Z")
+        base = dt.datetime(2030, 6, 1, tzinfo=dt.timezone.utc)
+        for micros, active in ((123455, True), (123456, False), (123457, False)):
+            with self.subTest(micros=micros), Clock((base + dt.timedelta(microseconds=micros)).timestamp()):
+                self.assertEqual(xs.codex_usage_independent(p), active)
 
 
 class Recommendation(unittest.TestCase):
@@ -198,13 +207,13 @@ class Recommendation(unittest.TestCase):
             active = xs.concurrency(st, policy())
         self.assertEqual(active["ocgo"], default["ocgo"])
 
-    def test_missing_cap_keeps_the_default_behaviour(self):
-        st = state(codex_used=1.0)
+    def test_missing_cap_uses_usage_independent_fallback(self):
         p = policy()
         p["concurrency"] = dict(p["concurrency"])
         p["concurrency"]["codex"] = 0  # no configured cap
         with Clock(BEFORE):
-            self.assertEqual(xs.concurrency(st, p)["codex"], 1)
+            for used in (0.0, 1.0):
+                self.assertEqual(xs.concurrency(state(codex_used=used), p)["codex"], 1)
 
     def test_route_decision_carries_the_recommendation(self):
         st = state(codex_used=1.0)
@@ -245,6 +254,17 @@ class PlannerBehaviour(unittest.TestCase):
         with Clock(AT):
             decision = xs.route(profile(difficulty=5), st, policy())
         self.assertEqual(decision["effort"], "medium")
+
+    def test_usage_cannot_upgrade_effort_while_active(self):
+        st = state(codex_used=0.0)
+        st["codex"]["limits"]["codex"]["windows"]["five_hour"] = window(0.0, hours_left=0.1)
+        with Clock(BEFORE):
+            default = xs.route(profile(difficulty=3), st, policy(deadline=None))
+            active = xs.route(profile(difficulty=3), st, policy())
+        self.assertEqual(default["backend"], "codex")
+        self.assertEqual(active["backend"], "codex")
+        self.assertEqual(active["effort"], policy()["difficulty_map"]["3"]["effort"])
+        self.assertNotEqual(default["effort"], active["effort"])
 
     def test_breaker_still_excludes_codex_while_active(self):
         saved = xs.breakers
@@ -287,7 +307,7 @@ class PlannerBehaviour(unittest.TestCase):
 
 
 class QuotaFilter(unittest.TestCase):
-    """The inferred remaining quota never excludes Codex while active."""
+    """No Codex quota source excludes Codex while active."""
 
     def quota_policy(self, deadline=DEADLINE, sources=None, threshold=0):
         p = policy(deadline=deadline)
@@ -324,20 +344,35 @@ class QuotaFilter(unittest.TestCase):
         self.assertNotEqual(decision["backend"], "codex")
         self.assertTrue(info["applied"])
 
-    def test_explicit_quota_source_stays_authoritative(self):
-        # A configured source is a deliberate reading of a real quota, not
-        # a usage inference: it still excludes Codex while the window is
-        # active.
+    def test_explicit_quota_source_is_bypassed_until_deadline(self):
         with tempfile.TemporaryDirectory(prefix="openswarm-codex-usage-independent-") as tmp:
             path = os.path.join(tmp, "quota.json")
             with open(path, "w") as fh:
                 json.dump({"remaining": 0}, fh)
             p = self.quota_policy(sources={"codex": {"source": "file", "file": path}})
             st = state(codex_used=0.1)
+            with Clock(BEFORE), mock.patch.object(xs, "quota_remaining_from_source", side_effect=AssertionError("source invoked")):
+                decision, info = self.decide(p, st)
+                self.assertEqual(decision["backend"], "codex")
+                self.assertIsNone(info["quota_before"]["codex"])
+            with Clock(AT):
+                decision, info = self.decide(p, st)
+                self.assertNotEqual(decision["backend"], "codex")
+                self.assertTrue(info["applied"])
+
+    def test_failed_codex_source_is_not_invoked_while_active(self):
+        p = self.quota_policy()
+        st = state(codex_used=0.1)
+        with mock.patch.object(xs, "quota_remaining_for_backend", return_value=(None, "synthetic failure")) as reader:
             with Clock(BEFORE):
                 decision, info = self.decide(p, st)
-        self.assertNotEqual(decision["backend"], "codex")
-        self.assertTrue(info["applied"])
+            reader.assert_not_called()
+            self.assertEqual(decision["backend"], "codex")
+            self.assertNotIn("quota_error", info)
+            with Clock(AT):
+                decision, info = self.decide(p, st)
+            reader.assert_called_once()
+            self.assertEqual(info["quota_error"]["codex"], "synthetic failure")
 
     def test_disabled_quota_routing_is_unchanged(self):
         st = state(codex_used=1.0)
