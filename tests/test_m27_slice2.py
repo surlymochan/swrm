@@ -460,19 +460,31 @@ class M27Slice2Tests(unittest.TestCase):
     def test_cli_poll_dry_run_with_fake_gh(self):
         bindir = os.path.join(self.tmp.name, "bin")
         os.makedirs(bindir)
-        gh = os.path.join(bindir, "gh")
         issues = [event(301, body="fix the flaky test please", number=10,
                         updated="2026-11-15T03:01:00Z")]
         comments = [event(302, kind="comment", body="a follow-up task here", number=10,
                           updated="2026-11-15T03:02:00Z")]
-        with open(gh, "w") as f:
-            f.write("#!/usr/bin/env python3\n"
-                    "import json, sys\n"
-                    "path = sys.argv[2]\n"
-                    f"issues = {json.dumps(issues)}\n"
-                    f"comments = {json.dumps(comments)}\n"
-                    "print(json.dumps(comments if 'issues/comments' in path else issues))\n")
-        os.chmod(gh, os.stat(gh).st_mode | stat.S_IEXEC)
+        script = ("#!/usr/bin/env python3\n"
+                  "import json, sys\n"
+                  "path = sys.argv[2]\n"
+                  f"issues = {json.dumps(issues)}\n"
+                  f"comments = {json.dumps(comments)}\n"
+                  "print(json.dumps(comments if 'issues/comments' in path else issues))\n")
+        if os.name == "nt":
+            # Windows cannot execute an extensionless shebang script:
+            # PATHEXT only resolves .COM/.EXE/.BAT/.CMD (etc.), so the
+            # product's plain ["gh", "api", ...] call never finds it.
+            # Ship the fake as gh.py plus a gh.bat shim instead; the
+            # product side is untouched and still calls plain "gh".
+            with open(os.path.join(bindir, "gh.py"), "w") as f:
+                f.write(script)
+            with open(os.path.join(bindir, "gh.bat"), "w") as f:
+                f.write('@python "%~dp0gh.py" %*\n')
+        else:
+            gh = os.path.join(bindir, "gh")
+            with open(gh, "w") as f:
+                f.write(script)
+            os.chmod(gh, os.stat(gh).st_mode | stat.S_IEXEC)
         env_extra = {"PATH": bindir + os.pathsep + os.environ.get("PATH", "")}
         proc = self._run_cli(["intake", "poll", "--repo", "surlymochan/swrm",
                               "--dry-run", "--json"], env_extra=env_extra)
