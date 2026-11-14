@@ -22,6 +22,7 @@ Subcommands:
   batch            queue task cards across fleet hosts and collect their branches
   verify-remote    verify a fleet run on another host in a temporary worktree
   bus              initialize or inspect a GitHub issue bus repository
+  intake           SuperAgent autonomy layer (M27): policy, ingest, replay, tickets, decisions
   bus-worker       run the reference GitHub issue bus executor
   watch            stream actionable events (progress, risk, stalls) for one or more runs
   runs / report    snapshot of recent runs / compact scheduled check-in
@@ -146,8 +147,11 @@ _AGY_LOGIN_CACHE = {}
 # ---------------------------------------------------------------- utils
 
 def jload(path, default=None):
+    # Explicit UTF-8: json.dump writes ensure_ascii=False, so a locale
+    # default encoding (e.g. cp1252 on Windows) cannot round-trip
+    # non-ASCII content (M27 slice 1: intake state holds Chinese bodies).
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
@@ -156,7 +160,7 @@ def jload(path, default=None):
 def jsave(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.tmp{os.getpid()}"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
 
@@ -17130,6 +17134,624 @@ def append_ledger(entry):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+# ---------------------------------------------------------------- intake: SuperAgent autonomy layer (M27 slice 1, #213)
+#
+# Ports the *domain model* of deepseek-ai/dsh-superagent-prototype (MIT) to
+# swrm, without moving its TypeScript code and without introducing the DSH
+# runtime: Source -> Trigger -> Thread -> Gate (deterministic admission) ->
+# Decision -> Ticket + Mandate (sealed at creation) -> Assignment. The
+# Executor layer is the existing swrm dispatch (batch / fleet / M26 remote
+# runners); slice 1 is shadow-only, so an accepted Trigger creates a Ticket
+# and a sealed Mandate but never an Assignment and never dispatches.
+# Deliberate divergence from dsh: a Ticket is NOT closed on executor
+# self-report; closing still requires swrm verify + evidence (2026-11-07).
+# Slice 2 adds the GitHub Source, Assessment, real dispatch and Channel;
+# slice 3 adds Subscription resume / stop and the attention CLI.
+# Full fusion plan: docs/dsh-superagent-fusion.md.
+
+INTAKE_BOT_HANDLE = "@openswarm"
+INTAKE_OWN_BOT = "openswarm[bot]"
+INTAKE_POLICY_VERSION = 1
+INTAKE_DECISIONS = ("accept", "stop", "ignore", "unavailable")
+INTAKE_STRENGTHS = ("explicit", "inferred")
+INTAKE_ACCEPT_MODES = ("off", "shadow", "on")
+INTAKE_TICKET_STATES = ("open", "ended")
+INTAKE_ASSIGNMENT_STATES = ("pending", "running", "ended")
+
+INTAKE_MONEY_ACTION = re.compile(
+    r"(买入|卖出|购买|出售|付款|付费|支付|转账|转帐|充值|提现|打款|"
+    r"\bbuy\b|\bsell\b|\bpurchase\b|\bpayment\b|\btransfer\b|\bwire\b|"
+    r"\brefund\b|\bwithdraw\b|\bdeposit\b|\bsubscribe\b)", re.IGNORECASE)
+INTAKE_MONEY_CURRENCY = re.compile(
+    r"(\busdt\b|\busdc\b|\bbtc\b|\beth\b|\bsol\b|\busd\b|\bcny\b|[$¥]|美元|人民币)",
+    re.IGNORECASE)
+INTAKE_COMMITMENT = re.compile(
+    r"(对外承诺|承诺.*(?:交付|完成|保证)|代表.*承诺|"
+    r"\bpromise to\b|\bguarantee\b|\bcommit to (?:deliver|ship|complete)\b)",
+    re.IGNORECASE)
+INTAKE_STOP = re.compile(
+    r"(?im)(^|\n)\s*(stop|halt|停止|别做了|取消任务|不要做了)\b|@openswarm\s+stop\b",
+    re.IGNORECASE)
+
+
+def intake_paths(data_dir=None):
+    """Paths for intake state, under $OPENSWARM_HOME by default."""
+    base = data_dir or DATA
+    return {
+        "policy": os.path.join(base, "intake-policy.json"),
+        "ledger": os.path.join(base, "intake-ledger.jsonl"),
+        "state": os.path.join(base, "intake-state.json"),
+    }
+
+
+def default_intake_policy():
+    """Built-in intake policy v1. Distinct from policy.json (quota/routing).
+
+    Admission table (scope x listed x mentioned -> strength), per the fusion
+    plan: a listed author who @-mentions the bot gives an explicit mandate;
+    a listed author who does not mention it, or an unlisted author who does,
+    gives an inferred candidate (Assessment in slice 2 refines it); an
+    unlisted author who does not mention the bot is ignored. Bots never get
+    an explicit mandate.
+    """
+    return {
+        "version": 1,
+        "accept_mode": "shadow",
+        "scopes": ["issue", "pr"],
+        "allowlist": {"users": ["surlymochan"], "bots": []},
+        "admission": {
+            "listed_mentioned": "explicit",
+            "listed_unmentioned": "inferred",
+            "unlisted_mentioned": "inferred",
+            "unlisted_unmentioned": "ignore",
+        },
+        "money_draft_only": True,
+    }
+
+
+def validate_intake_policy(policy):
+    """Strict validation: a malformed intake policy refuses loudly instead
+    of silently admitting (or ignoring) work."""
+    if not isinstance(policy, dict):
+        raise ValueError("intake policy must be a JSON object")
+    version = policy.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        raise ValueError(f"intake policy version must be a positive integer, got {version!r}")
+    mode = policy.get("accept_mode")
+    if mode not in INTAKE_ACCEPT_MODES:
+        raise ValueError(f"intake policy accept_mode must be one of {sorted(INTAKE_ACCEPT_MODES)}, got {mode!r}")
+    scopes = policy.get("scopes")
+    if not isinstance(scopes, list) or not scopes or not all(isinstance(s, str) and s for s in scopes):
+        raise ValueError("intake policy scopes must be a non-empty list of strings")
+    allowlist = policy.get("allowlist")
+    if not isinstance(allowlist, dict):
+        raise ValueError("intake policy allowlist must be an object with users/bots lists")
+    for key in ("users", "bots"):
+        users = allowlist.get(key)
+        if not isinstance(users, list) or not all(isinstance(u, str) and u for u in users):
+            raise ValueError(f"intake policy allowlist.{key} must be a list of non-empty strings")
+    admission = policy.get("admission")
+    if not isinstance(admission, dict):
+        raise ValueError("intake policy admission must be an object")
+    for key in ("listed_mentioned", "listed_unmentioned",
+                "unlisted_mentioned", "unlisted_unmentioned"):
+        value = admission.get(key)
+        if value not in ("explicit", "inferred", "ignore"):
+            raise ValueError(f"intake policy admission.{key} must be explicit|inferred|ignore, got {value!r}")
+    if not isinstance(policy.get("money_draft_only", True), bool):
+        raise ValueError("intake policy money_draft_only must be a boolean")
+    return policy
+
+
+def load_intake_policy(path=None, data_dir=None):
+    """Load the intake policy. Returns (policy, source) where source is
+    'file' when a policy file was read and 'default' when none exists (the
+    built-in v1 policy is used, never a silent empty one)."""
+    target = path or intake_paths(data_dir)["policy"]
+    if os.path.exists(target):
+        try:
+            with open(target, encoding="utf-8") as f:
+                policy = json.load(f)
+        except (OSError, ValueError) as error:
+            raise ValueError(f"cannot read intake policy {target}: {error}")
+        return validate_intake_policy(policy), "file"
+    return default_intake_policy(), "default"
+
+
+def normalize_trigger(raw):
+    """Normalize one raw event into a Trigger. Required fields are enforced;
+    a malformed Trigger is refused instead of guessed at."""
+    if not isinstance(raw, dict):
+        raise ValueError("trigger must be a JSON object")
+    trigger_id = raw.get("id")
+    thread = raw.get("thread") or {}
+    if not isinstance(trigger_id, str) or not trigger_id.strip():
+        raise ValueError("trigger.id must be a non-empty string")
+    if not isinstance(thread, dict):
+        raise ValueError("trigger.thread must be an object")
+    repo = thread.get("repo")
+    kind = thread.get("kind")
+    number = thread.get("number")
+    if not isinstance(repo, str) or not repo.strip():
+        raise ValueError("trigger.thread.repo must be a non-empty string")
+    if kind not in ("issue", "pr"):
+        raise ValueError(f"trigger.thread.kind must be issue|pr, got {kind!r}")
+    if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+        raise ValueError("trigger.thread.number must be a positive integer")
+    author = raw.get("author")
+    if not isinstance(author, str) or not author.strip():
+        raise ValueError("trigger.author must be a non-empty string")
+    body = raw.get("body")
+    if not isinstance(body, str):
+        raise ValueError("trigger.body must be a string")
+    return {
+        "id": trigger_id.strip(),
+        "source": raw.get("source") or "github",
+        "thread": {"repo": repo.strip(), "kind": kind, "number": number},
+        "author": author.strip(),
+        "author_is_bot": bool(raw.get("author_is_bot")),
+        "mentioned_bot": INTAKE_BOT_HANDLE in body.lower(),
+        "body": body,
+        "created_at": raw.get("created_at"),
+    }
+
+
+def intake_thread_key(thread):
+    return f"{thread['repo']}#{thread['number']} ({thread['kind']})"
+
+
+def intake_gate_decide(trigger, policy):
+    """Deterministic admission (Gate). Pure function: Trigger + Policy ->
+    Decision. No I/O, no model calls (Assessment is slice 2).
+
+    Decision values: accept / stop / ignore / unavailable.
+    """
+    validate_intake_policy(policy)
+    trigger = normalize_trigger(trigger)
+    rules = []
+    mode = policy["accept_mode"]
+    if mode == "off":
+        return {"decision": "unavailable", "strength": None,
+                "rules": ["accept-mode-off"],
+                "reason": "intake accept_mode is off; no Trigger is admitted",
+                "draft_only": False, "policy_version": policy["version"],
+                "trigger_id": trigger["id"], "accept_mode": mode}
+    author = trigger["author"]
+    author_lower = author.lower()
+    allow_users = {u.lower() for u in policy["allowlist"]["users"]}
+    allow_bots = {b.lower() for b in policy["allowlist"]["bots"]}
+    if author_lower == INTAKE_OWN_BOT:
+        return {"decision": "ignore", "strength": None,
+                "rules": ["own-bot-message"],
+                "reason": "messages from the intake bot itself are never Triggers",
+                "draft_only": False, "policy_version": policy["version"],
+                "trigger_id": trigger["id"], "accept_mode": mode}
+    if trigger["author_is_bot"] and author_lower not in allow_bots:
+        return {"decision": "ignore", "strength": None,
+                "rules": ["bot-message"],
+                "reason": f"bot author {author} is not on the intake allowlist; bot messages are context only",
+                "draft_only": False, "policy_version": policy["version"],
+                "trigger_id": trigger["id"], "accept_mode": mode}
+    if trigger["thread"]["kind"] not in policy["scopes"]:
+        return {"decision": "ignore", "strength": None,
+                "rules": ["scope-outside"],
+                "reason": f"thread kind {trigger['thread']['kind']} is outside the intake scopes {policy['scopes']}",
+                "draft_only": False, "policy_version": policy["version"],
+                "trigger_id": trigger["id"], "accept_mode": mode}
+    listed = author_lower in allow_users
+    if listed and INTAKE_STOP.search(trigger["body"]):
+        return {"decision": "stop", "strength": None,
+                "rules": ["human-stop"],
+                "reason": f"listed author {author} issued a stop for this thread",
+                "draft_only": False, "policy_version": policy["version"],
+                "trigger_id": trigger["id"], "accept_mode": mode}
+    if trigger["author_is_bot"]:
+        # Allowlisted bot: inferred candidate at most, never explicit.
+        strength, rules = "inferred", ["allowlisted-bot-inferred"]
+    else:
+        key = f"{'listed' if listed else 'unlisted'}_{'mentioned' if trigger['mentioned_bot'] else 'unmentioned'}"
+        outcome = policy["admission"][key]
+        if outcome == "ignore":
+            return {"decision": "ignore", "strength": None,
+                    "rules": [f"admission:{key}:ignore"],
+                    "reason": f"admission table says ignore for {key}",
+                    "draft_only": False, "policy_version": policy["version"],
+                    "trigger_id": trigger["id"], "accept_mode": mode}
+        strength, rules = outcome, [f"admission:{key}:{outcome}"]
+    draft_only = False
+    if INTAKE_MONEY_ACTION.search(trigger["body"]) or INTAKE_MONEY_CURRENCY.search(trigger["body"]):
+        draft_only = True
+        rules = rules + ["money-draft-only"]
+    if INTAKE_COMMITMENT.search(trigger["body"]):
+        draft_only = True
+        rules = rules + ["commitment-draft-only"]
+    reason = (f"admitted as {strength} (allowlisted author)" if listed and not trigger["author_is_bot"]
+              else f"admitted as {strength} (unlisted author, mentioned the bot)" if trigger["mentioned_bot"]
+              else f"admitted as {strength} (allowlisted bot)")
+    if draft_only:
+        reason += "; money/commitment request: draft only, never auto-executed"
+    return {"decision": "accept", "strength": strength, "rules": rules,
+            "reason": reason, "draft_only": draft_only,
+            "policy_version": policy["version"],
+            "trigger_id": trigger["id"], "accept_mode": mode}
+
+
+def intake_ticket_id(trigger_id):
+    return "tkt-" + hashlib.sha1(trigger_id.encode()).hexdigest()[:12]
+
+
+def intake_mandate_id(ticket_id):
+    return "mnd-" + hashlib.sha1(ticket_id.encode()).hexdigest()[:12]
+
+
+def intake_assignment_id(ticket_id, executor):
+    return "asg-" + hashlib.sha1(f"{ticket_id}:{executor}".encode()).hexdigest()[:12]
+
+
+def new_intake_ticket(trigger, decision, now=None):
+    """Create a Ticket for an accepted Trigger. Status open; ended only via
+    transition_intake_ticket (human stop, slice 1) or verify close (later)."""
+    ts = now if now is not None else time.time()
+    ticket_id = intake_ticket_id(trigger["id"])
+    return {
+        "id": ticket_id,
+        "trigger_id": trigger["id"],
+        "thread": dict(trigger["thread"]),
+        "status": "open",
+        "mandate_id": intake_mandate_id(ticket_id),
+        "source_identity": trigger["author"],
+        "created_ts": ts,
+        "ended_ts": None,
+        "history": [{"ts": ts, "from": None, "to": "open",
+                     "reason": f"accepted as {decision['strength']}"}],
+    }
+
+
+def new_intake_mandate(ticket, trigger, decision, now=None):
+    """Seal a Mandate at Ticket creation: policy version, scope, strength,
+    hit rules and source identity are frozen. Scope grows only via a new
+    Ticket (slice 1 enforces this by refusing updates, see below)."""
+    ts = now if now is not None else time.time()
+    return {
+        "id": ticket["mandate_id"],
+        "ticket_id": ticket["id"],
+        "policy_version": decision["policy_version"],
+        "scope": {"thread": intake_thread_key(trigger["thread"]),
+                  "summary": trigger["body"][:120]},
+        "strength": decision["strength"],
+        "rules": list(decision["rules"]),
+        "source_identity": trigger["author"],
+        "created_ts": ts,
+        "_sealed": True,
+    }
+
+
+def intake_update_mandate(mandate, **changes):
+    """Mandates are immutable once sealed: any update attempt is refused.
+    Expanding scope means opening a new Ticket with a new Mandate."""
+    if isinstance(mandate, dict) and mandate.get("_sealed"):
+        raise ValueError(f"mandate {mandate.get('id')} is sealed and immutable; "
+                         "expanding scope requires a new Ticket")
+    updated = dict(mandate or {})
+    updated.update(changes)
+    return updated
+
+
+def transition_intake_ticket(ticket, to_state, reason="", now=None):
+    """Ticket state machine: open -> ended -> open (resume). Anything else
+    is refused. The resume *path* (Subscription fan-out) lands in slice 3;
+    the transition itself is validated here so slice 3 cannot reopen a
+    Ticket that was never open."""
+    allowed = {"open": ("ended",), "ended": ("open",)}
+    current = ticket.get("status")
+    if to_state not in allowed.get(current, ()):
+        raise ValueError(f"ticket {ticket.get('id')}: cannot move {current!r} -> {to_state!r}")
+    ts = now if now is not None else time.time()
+    updated = dict(ticket)
+    updated["status"] = to_state
+    updated["ended_ts"] = ts if to_state == "ended" else None
+    history = list(ticket.get("history") or [])
+    history.append({"ts": ts, "from": current, "to": to_state, "reason": reason})
+    updated["history"] = history
+    return updated
+
+
+def new_intake_assignment(ticket, executor, now=None):
+    """An Assignment binds one Ticket to one Executor instance. Slice 1
+    never creates one (shadow core); the constructor exists so slice 2
+    reuses the same id/state rules instead of inventing new ones."""
+    ts = now if now is not None else time.time()
+    return {
+        "id": intake_assignment_id(ticket["id"], executor),
+        "ticket_id": ticket["id"],
+        "executor": executor,
+        "status": "pending",
+        "created_ts": ts,
+        "history": [{"ts": ts, "from": None, "to": "pending",
+                     "reason": "created"}],
+    }
+
+
+def transition_intake_assignment(assignment, to_state, reason="", now=None):
+    allowed = {"pending": ("running", "ended"), "running": ("ended",)}
+    current = assignment.get("status")
+    if to_state not in allowed.get(current, ()):
+        raise ValueError(f"assignment {assignment.get('id')}: cannot move {current!r} -> {to_state!r}")
+    ts = now if now is not None else time.time()
+    updated = dict(assignment)
+    updated["status"] = to_state
+    history = list(assignment.get("history") or [])
+    history.append({"ts": ts, "from": current, "to": to_state, "reason": reason})
+    updated["history"] = history
+    return updated
+
+
+def load_intake_state(data_dir=None):
+    paths = intake_paths(data_dir)
+    state = jload(paths["state"], None)
+    if state is None:
+        return {"version": 1, "triggers_seen": {}, "tickets": [],
+                "mandates": [], "assignments": [], "cursors": {}}
+    if not isinstance(state, dict):
+        raise ValueError(f"intake state {paths['state']} is not a JSON object")
+    state.setdefault("triggers_seen", {})
+    state.setdefault("tickets", [])
+    state.setdefault("mandates", [])
+    state.setdefault("assignments", [])
+    state.setdefault("cursors", {})
+    return state
+
+
+def save_intake_state(state, data_dir=None):
+    jsave(intake_paths(data_dir)["state"], state)
+
+
+def append_intake_ledger(entry, data_dir=None):
+    """Append one entry to the append-only intake ledger. The ledger is
+    never rewritten in place: entries are only appended, under the same
+    lock file the run ledger uses, and each entry carries a sequence
+    number so a gap is detectable."""
+    paths = intake_paths(data_dir)
+    os.makedirs(os.path.dirname(paths["ledger"]) or ".", exist_ok=True)
+    with open(os.path.join(DATA if data_dir is None else data_dir, "budget.lock"), "a") as lock:
+        _flock(lock, LOCK_EX)
+        seq = 0
+        if os.path.exists(paths["ledger"]):
+            with open(paths["ledger"], encoding="utf-8") as f:
+                seq = sum(1 for line in f if line.strip())
+        record = {"seq": seq + 1, "ts": time.time(), **dict(entry or {})}
+        with open(paths["ledger"], "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return record
+
+
+def intake_ledger_entries(data_dir=None, kind=None):
+    paths = intake_paths(data_dir)
+    if not os.path.exists(paths["ledger"]):
+        return []
+    entries = []
+    with open(paths["ledger"], encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                continue
+    if kind is not None:
+        entries = [e for e in entries if e.get("kind") == kind]
+    return entries
+
+
+def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None):
+    """Ingest one Trigger end to end: dedup -> Gate -> Decision ledger ->
+    Ticket + sealed Mandate on accept (shadow: no Assignment, no dispatch),
+    or end the thread's open Ticket on a human stop. Idempotent: a repeated
+    delivery of the same Trigger id returns the original Ticket and writes
+    only a duplicate_skipped ledger line."""
+    trigger = normalize_trigger(raw_trigger)
+    if policy is None:
+        policy, _source = load_intake_policy(data_dir=data_dir)
+    validate_intake_policy(policy)
+    state = load_intake_state(data_dir)
+    seen = state["triggers_seen"]
+    if trigger["id"] in seen:
+        append_intake_ledger({"kind": "duplicate_skipped", "trigger_id": trigger["id"],
+                              "ticket_id": seen[trigger["id"]],
+                              "reason": "trigger id already ingested; no new Ticket"},
+                             data_dir)
+        return {"duplicate": True, "trigger_id": trigger["id"],
+                "ticket_id": seen[trigger["id"]], "decision": None,
+                "dispatched": False}
+    append_intake_ledger({"kind": "trigger_received", "trigger_id": trigger["id"],
+                          "thread": intake_thread_key(trigger["thread"]),
+                          "author": trigger["author"],
+                          "author_is_bot": trigger["author_is_bot"],
+                          "mentioned_bot": trigger["mentioned_bot"]}, data_dir)
+    decision = intake_gate_decide(trigger, policy)
+    append_intake_ledger({"kind": "decision", "trigger_id": trigger["id"],
+                          "decision": decision["decision"], "strength": decision["strength"],
+                          "rules": decision["rules"], "reason": decision["reason"],
+                          "draft_only": decision["draft_only"],
+                          "policy_version": decision["policy_version"],
+                          "accept_mode": decision["accept_mode"]}, data_dir)
+    result = {"duplicate": False, "trigger_id": trigger["id"],
+              "decision": decision, "ticket_id": None, "mandate_id": None,
+              "dispatched": False,
+              "dispatch_note": "slice 1 shadow core: accept creates a Ticket only, "
+                               "no Assignment and no dispatch"}
+    if decision["decision"] == "accept":
+        ticket = new_intake_ticket(trigger, decision, now=now)
+        mandate = new_intake_mandate(ticket, trigger, decision, now=now)
+        state["tickets"].append(ticket)
+        state["mandates"].append(mandate)
+        seen[trigger["id"]] = ticket["id"]
+        append_intake_ledger({"kind": "ticket_created", "trigger_id": trigger["id"],
+                              "ticket_id": ticket["id"], "thread": intake_thread_key(trigger["thread"]),
+                              "strength": decision["strength"]}, data_dir)
+        append_intake_ledger({"kind": "mandate_sealed", "trigger_id": trigger["id"],
+                              "ticket_id": ticket["id"], "mandate_id": mandate["id"],
+                              "policy_version": mandate["policy_version"],
+                              "scope": mandate["scope"], "strength": mandate["strength"],
+                              "rules": mandate["rules"],
+                              "source_identity": mandate["source_identity"]}, data_dir)
+        result["ticket_id"] = ticket["id"]
+        result["mandate_id"] = mandate["id"]
+    elif decision["decision"] == "stop":
+        thread_key = intake_thread_key(trigger["thread"])
+        target = next((t for t in state["tickets"]
+                       if t["status"] == "open"
+                       and intake_thread_key(t["thread"]) == thread_key), None)
+        if target is not None:
+            ended = transition_intake_ticket(target, "ended",
+                                             reason=f"human stop via {trigger['id']}", now=now)
+            state["tickets"] = [ended if t["id"] == target["id"] else t
+                                for t in state["tickets"]]
+            seen[trigger["id"]] = target["id"]
+            append_intake_ledger({"kind": "ticket_ended", "trigger_id": trigger["id"],
+                                  "ticket_id": target["id"], "thread": thread_key,
+                                  "reason": "human stop"}, data_dir)
+            result["ticket_id"] = target["id"]
+            result["stopped"] = True
+        else:
+            seen[trigger["id"]] = None
+            result["stopped"] = False
+    else:
+        seen[trigger["id"]] = None
+    save_intake_state(state, data_dir)
+    return result
+
+
+def intake_replay(triggers, policy=None, data_dir=None):
+    """Replay a list of raw Triggers through ingest, in order. Returns one
+    result per Trigger. Used by `intake replay` and by the replay fixture
+    test; duplicates inside one replay behave exactly like re-delivery."""
+    if policy is None:
+        policy, _source = load_intake_policy(data_dir=data_dir)
+    return [intake_ingest_trigger(raw, policy=policy, data_dir=data_dir)
+            for raw in (triggers or [])]
+
+
+def cmd_intake_policy(args, data_dir=None):
+    paths = intake_paths(data_dir)
+    if args.init:
+        if os.path.exists(paths["policy"]) and not args.force:
+            raise ValueError(f"intake policy already exists at {paths['policy']}; "
+                             "pass --force to overwrite")
+        jsave(paths["policy"], default_intake_policy())
+        print(json.dumps({"ok": True, "policy": paths["policy"],
+                          "version": INTAKE_POLICY_VERSION,
+                          "accept_mode": "shadow"}, ensure_ascii=False))
+        return
+    policy, source = load_intake_policy(data_dir=data_dir)
+    if args.json:
+        print(json.dumps({"ok": True, "source": source, "path": paths["policy"],
+                          "policy": policy}, indent=2, ensure_ascii=False))
+    else:
+        print(f"intake policy ({source}): {paths['policy']}")
+        print(f"  version={policy['version']} accept_mode={policy['accept_mode']} "
+              f"scopes={','.join(policy['scopes'])}")
+        print(f"  allowlist users={','.join(policy['allowlist']['users']) or '-'} "
+              f"bots={','.join(policy['allowlist']['bots']) or '-'}")
+        for key, value in policy["admission"].items():
+            print(f"  admission {key} -> {value}")
+        print(f"  money_draft_only={policy.get('money_draft_only', True)}")
+
+
+def cmd_intake_ingest(args, data_dir=None):
+    try:
+        with open(args.trigger_file, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"cannot read trigger file {args.trigger_file}: {error}")
+    policy = None
+    if args.policy_file:
+        with open(args.policy_file, encoding="utf-8") as f:
+            policy = validate_intake_policy(json.load(f))
+    result = intake_ingest_trigger(raw, policy=policy, data_dir=data_dir)
+    print(json.dumps({"ok": True, **result}, ensure_ascii=False))
+
+
+def cmd_intake_replay(args, data_dir=None):
+    try:
+        with open(args.fixture, encoding="utf-8") as f:
+            fixture = json.load(f)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"cannot read fixture {args.fixture}: {error}")
+    triggers = fixture.get("triggers") if isinstance(fixture, dict) else fixture
+    if not isinstance(triggers, list):
+        raise ValueError("replay fixture must be a JSON object with a triggers list")
+    policy = None
+    if args.policy_file:
+        with open(args.policy_file, encoding="utf-8") as f:
+            policy = validate_intake_policy(json.load(f))
+    results = intake_replay(triggers, policy=policy, data_dir=data_dir)
+    expected = fixture.get("expected") if isinstance(fixture, dict) else None
+    mismatches = []
+    if args.json:
+        print(json.dumps({"ok": True, "results": results}, indent=2, ensure_ascii=False))
+    else:
+        for result in results:
+            decision = result.get("decision") or {}
+            print(f"{result['trigger_id']}  {decision.get('decision') or 'duplicate':<11} "
+                  f"{str(decision.get('strength')):<9} draft_only={decision.get('draft_only')} "
+                  f"ticket={result.get('ticket_id') or '-'}")
+    if expected and args.check:
+        first_ticket = {}
+        for result in results:
+            want = (expected or {}).get(result["trigger_id"]) or {}
+            if result.get("duplicate"):
+                # A re-delivered Trigger carries no fresh Decision; it must
+                # resolve to the same Ticket the first delivery created.
+                if result["trigger_id"] not in first_ticket:
+                    mismatches.append(f"{result['trigger_id']}: duplicate of a Trigger never ingested in this replay")
+                elif result.get("ticket_id") != first_ticket[result["trigger_id"]]:
+                    mismatches.append(f"{result['trigger_id']}: duplicate resolved to {result.get('ticket_id')!r}, "
+                                      f"expected {first_ticket[result['trigger_id']]!r}")
+                continue
+            first_ticket[result["trigger_id"]] = result.get("ticket_id")
+            got = result.get("decision") or {}
+            for key in ("decision", "strength", "draft_only"):
+                if key in want and want[key] != got.get(key):
+                    mismatches.append(f"{result['trigger_id']}: expected {key}={want[key]!r}, got {got.get(key)!r}")
+        if mismatches:
+            print("replay check FAILED:", file=sys.stderr)
+            for line in mismatches:
+                print(f"  {line}", file=sys.stderr)
+            sys.exit(1)
+        print(f"replay check OK: {len(results)} triggers, all decisions match expected")
+    return results
+
+
+def cmd_intake_tickets(args, data_dir=None):
+    state = load_intake_state(data_dir)
+    tickets = state["tickets"]
+    if args.json:
+        print(json.dumps({"ok": True, "tickets": tickets}, indent=2, ensure_ascii=False))
+        return
+    if not tickets:
+        print("no intake tickets yet")
+        return
+    for ticket in tickets:
+        print(f"{ticket['id']}  {ticket['status']:<6} {intake_thread_key(ticket['thread'])}  "
+              f"trigger={ticket['trigger_id']} mandate={ticket['mandate_id']}")
+
+
+def cmd_intake_decisions(args, data_dir=None):
+    entries = intake_ledger_entries(data_dir, kind="decision")
+    entries = entries[-args.n:] if args.n else entries
+    if args.json:
+        print(json.dumps({"ok": True, "decisions": entries}, indent=2, ensure_ascii=False))
+        return
+    if not entries:
+        print("no intake decisions yet")
+        return
+    for entry in entries:
+        print(f"#{entry.get('seq')} {entry.get('trigger_id')}  {entry.get('decision'):<11} "
+              f"{str(entry.get('strength')):<9} rules={','.join(entry.get('rules') or [])}")
+
+
+
 # ---------------------------------------------------------------- CLI
 
 def profile_from_args(a):
@@ -18469,6 +19091,26 @@ def main():
                            rework_of_help="run id this task reworks")
     sp.add_argument("--once", action="store_true", help="claim at most one queued issue, then exit")
 
+    sp = sub.add_parser("intake", help="SuperAgent autonomy layer (M27, #213): policy, ingest, replay, tickets, decisions")
+    intake_sub = sp.add_subparsers(dest="intake_cmd", required=True)
+    ip = intake_sub.add_parser("policy", help="show or initialize the intake policy ($OPENSWARM_HOME/intake-policy.json)")
+    ip.add_argument("--init", action="store_true", help="write the built-in v1 policy (shadow mode)")
+    ip.add_argument("--force", action="store_true", help="overwrite an existing policy file with --init")
+    ip.add_argument("--json", action="store_true")
+    ip = intake_sub.add_parser("ingest", help="ingest one Trigger JSON through the Gate (shadow: Ticket only, no dispatch)")
+    ip.add_argument("--trigger-file", required=True, help="JSON file with one Trigger object")
+    ip.add_argument("--policy-file", help="intake policy JSON to use instead of $OPENSWARM_HOME/intake-policy.json")
+    ip = intake_sub.add_parser("replay", help="replay a fixture of Triggers through ingest, in order")
+    ip.add_argument("--fixture", required=True, help="JSON file with a triggers list and optional expected decisions")
+    ip.add_argument("--policy-file", help="intake policy JSON to use instead of $OPENSWARM_HOME/intake-policy.json")
+    ip.add_argument("--check", action="store_true", help="compare decisions with the fixture expected map, exit 1 on mismatch")
+    ip.add_argument("--json", action="store_true")
+    ip = intake_sub.add_parser("tickets", help="list intake Tickets from $OPENSWARM_HOME/intake-state.json")
+    ip.add_argument("--json", action="store_true")
+    ip = intake_sub.add_parser("decisions", help="list Gate Decisions from the append-only intake ledger")
+    ip.add_argument("--n", type=int, default=20, help="most recent N decisions (default: 20)")
+    ip.add_argument("--json", action="store_true")
+
     sp = sub.add_parser("lane", help="manage resident executor lanes")
     lane_sub = sp.add_subparsers(dest="lane_cmd", required=True)
     lp = lane_sub.add_parser("up", help="start configured lane supervisors")
@@ -18672,6 +19314,21 @@ def main():
                 cmd_verify_remote(a)
         except (ValueError, RuntimeError) as e:
             print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
+            sys.exit(2)
+    elif a.cmd == "intake":
+        try:
+            if a.intake_cmd == "policy":
+                cmd_intake_policy(a)
+            elif a.intake_cmd == "ingest":
+                cmd_intake_ingest(a)
+            elif a.intake_cmd == "replay":
+                cmd_intake_replay(a)
+            elif a.intake_cmd == "tickets":
+                cmd_intake_tickets(a)
+            elif a.intake_cmd == "decisions":
+                cmd_intake_decisions(a)
+        except (ValueError, OSError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
             sys.exit(2)
     elif a.cmd == "lane":
         try:
