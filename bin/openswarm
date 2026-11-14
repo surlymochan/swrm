@@ -7164,9 +7164,11 @@ def enforced_risk(event, policy, worktree, scope="repo"):
     return warning
 
 
-def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
+def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None, pi_events=False):
     _tmpdir, env = configure_executor_environment(cwd, env)
     try:
+        if pi_events:
+            return _run_pi_proc(cmd, cwd, env, timeout, out_path)
         return _run_proc(cmd, cwd, env, timeout, out_path, abort_re)
     finally:
         cleanup_executor_tmp(cwd)
@@ -7558,6 +7560,222 @@ PI_USAGE_KEYS = ("input", "output", "cacheRead", "cacheWrite")
 PI_TOOLS = "read,bash,edit,write,grep,find,ls"
 
 
+class PiEventCompactor:
+    """Lossless, versioned prefix coding of text snapshots, never event sampling.
+
+    State is only the preceding update's text (at most MAX_EVENT_BYTES). All
+    other fields, including deltas, tool arguments and usage, remain evidence.
+    `restore` accepts both original and compacted streams for offline replay.
+    """
+    MAX_EVENT_BYTES = 4 * 1024 * 1024
+    MARKER = "swrm_pi_compaction"
+
+    def __init__(self):
+        self.previous = {}
+
+    @staticmethod
+    def snapshots(event):
+        if event.get("type") != "message_update":
+            return {}
+        result = {}
+        for path in (("message",), ("assistantMessageEvent", "partial")):
+            message = event
+            for key in path:
+                message = message.get(key) if isinstance(message, dict) else None
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for index, block in enumerate(content):
+                if not isinstance(block, dict):
+                    continue
+                key = {"text": "text", "thinking": "thinking"}.get(block.get("type"))
+                if key and isinstance(block.get(key), str):
+                    result[(*path, "content", index, key)] = block[key]
+        return result
+
+    @staticmethod
+    def put(event, path, value):
+        target = event
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+
+    def encode(self, event):
+        current = self.snapshots(event)
+        if self.MARKER in event:  # Unknown/already encoded input: preserve it.
+            self.previous = {}
+            return event
+        if not current:
+            if event.get("type") in ("message_start", "message_end", "agent_end"):
+                self.previous = {}
+            return event
+        compact = copy.deepcopy(event)
+        paths = []
+        for path, text in current.items():
+            previous = self.previous.get(path, "")
+            prefix = len(previous) if text.startswith(previous) else 0
+            self.put(compact, path, text[prefix:])
+            paths.append({"path": list(path), "prefix": prefix})
+        compact[self.MARKER] = {"version": 1, "snapshots": paths}
+        self.previous = current
+        return compact
+
+    def restore(self, event):
+        restored = copy.deepcopy(event)
+        marker = restored.pop(self.MARKER, None)
+        if marker is not None:
+            if marker.get("version") != 1:
+                raise ValueError("unsupported Pi compaction version")
+            for entry in marker["snapshots"]:
+                path, prefix = tuple(entry["path"]), entry["prefix"]
+                suffix = restored
+                for key in path:
+                    suffix = suffix[key]
+                previous = self.previous.get(path, "")
+                if not isinstance(prefix, int) or not 0 <= prefix <= len(previous):
+                    raise ValueError("missing Pi snapshot prefix; replay from file start")
+                self.put(restored, path, previous[:prefix] + suffix)
+        current = self.snapshots(restored)
+        if current or restored.get("type") in ("message_start", "message_end", "agent_end"):
+            self.previous = current
+        return restored
+
+
+class PiEventWriter:
+    """Incremental pipe adapter; oversized records are retained and fail closed.
+
+    Complete records are flushed immediately. No raw growing stdout file, queue,
+    or whole-log read is needed. A torn final record is retained as raw evidence.
+    """
+    def __init__(self, out, inspect_event):
+        self.out, self.inspect_event = out, inspect_event
+        self.codec = PiEventCompactor()
+        self.pending = bytearray()
+        self.oversized = False
+        self.failure = None
+
+    def record(self, raw):
+        try:
+            event = json.loads(raw)
+        except (ValueError, UnicodeError):
+            self.out.write(raw + b"\n")
+            return
+        if not isinstance(event, dict):
+            self.out.write(raw + b"\n")
+            return
+        self.inspect_event(event)  # Check the original, before prefix coding.
+        compact = self.codec.encode(event)
+        if compact is event:
+            self.out.write(raw + b"\n")
+        else:
+            self.out.write(json.dumps(compact, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8", errors="backslashreplace") + b"\n")
+
+    def feed(self, data):
+        for part in data.splitlines(keepends=True):
+            # JSONL uses LF only: splitlines also recognizes CR; keep it in the
+            # pending record until LF, including CRLF and escaped JSON strings.
+            if self.oversized:
+                self.out.write(part)
+            else:
+                self.pending.extend(part)
+                if len(self.pending) > self.codec.MAX_EVENT_BYTES:
+                    self.out.write(self.pending)
+                    self.pending.clear()
+                    self.oversized = True
+                    self.failure = "pi_event_too_large: retained raw; risk inspection unavailable"
+            if part.endswith(b"\n"):
+                if not self.oversized:
+                    self.record(bytes(self.pending[:-1]))
+                    self.pending.clear()
+                self.oversized = False
+        self.out.flush()
+
+    def finish(self):
+        if self.pending:
+            try:
+                json.loads(self.pending)
+            except (ValueError, UnicodeError):
+                self.failure = self.failure or "pi_stream_incomplete: retained trailing bytes"
+            self.record(bytes(self.pending))
+            self.pending.clear()
+        elif self.oversized:
+            self.out.write(b"\n")
+        if self.failure:
+            self.out.write(json.dumps({"type": "error", "error": self.failure}).encode() + b"\n")
+        self.out.flush()
+
+
+def _run_pi_proc(cmd, cwd, env, timeout, out_path):
+    """One-shot Pi only: inspect original events and append compact JSONL."""
+    rdir = os.path.dirname(out_path)
+    policy = load_policy()
+    status_path = os.path.join(rdir, "status.json")
+    with open(out_path, "wb") as out, open(out_path + ".err", "w") as err:
+        p = subprocess.Popen(_spawnable(cmd), cwd=cwd, env=env, stdout=subprocess.PIPE,
+                             stderr=err, stdin=subprocess.DEVNULL, start_new_session=True)
+        set_status(rdir, executor_pid=p.pid, events=out_path, attempt_started=NOW())
+        blocked = []
+
+        def inspect_event(event):
+            scope = (jload(status_path, {}) or {}).get("scope", "repo")
+            block = enforced_risk(event, policy, cwd, scope=scope)
+            if block and block.get("enforced") is False:
+                out.write(json.dumps({"type": "risk_warning", **block}).encode() + b"\n")
+            elif block:
+                blocked.append(block)
+                set_status(rdir, risk_blocks=blocked, stop_requested=True)
+
+        writer = PiEventWriter(out, inspect_event)
+        end, rc, drain_end, eof = NOW() + timeout, None, None, False
+        try:
+            while True:
+                done = p.poll() is not None
+                status = jload(status_path, {}) or {}
+                if rc is None:
+                    if blocked:
+                        rc = 133
+                    elif writer.failure:
+                        rc = p.returncode if done and p.returncode else 1
+                    elif status.get("stop_requested"):
+                        rc = 130
+                    elif not done and NOW() >= end:
+                        rc = 124
+                    if rc is not None and not done:
+                        kill_tree(p.pid, grace=0.1)
+                        p.wait(timeout=5)
+                        done = True
+                if done and drain_end is None:
+                    drain_end = time.monotonic() + 1
+                if done and eof:
+                    break
+                if eof:
+                    time.sleep(0.05)
+                    continue
+                ready, _, _ = select.select([p.stdout], [], [], 0.05)
+                if ready:
+                    data = os.read(p.stdout.fileno(), 65536)
+                    if not data:
+                        eof = True
+                        continue
+                    writer.feed(data)
+                elif drain_end is not None and time.monotonic() >= drain_end:
+                    writer.failure = writer.failure or "pi_stdout_open_after_exit: stream may be incomplete"
+                    break
+            p.wait(timeout=5)
+        finally:
+            if p.poll() is None:
+                kill_tree(p.pid, grace=0.1)
+                p.wait(timeout=5)
+            p.stdout.close()
+            writer.finish()
+            if writer.failure:
+                err.write(writer.failure + "\n")
+        return 133 if blocked else (rc if rc is not None else (p.returncode or (1 if writer.failure else 0)))
+
+
 def pi_usage(events_path):
     """Sum assistant `message_end` usage from a Pi `--mode json` stream. Returns (usage, final_text, errors)."""
     usage = {k: 0 for k in PI_USAGE_KEYS}
@@ -7567,10 +7785,29 @@ def pi_usage(events_path):
     except OSError:
         return usage, final, errors
     with fh:
-        for line in fh:
+        while True:
+            # A fail-closed writer can retain an arbitrarily large raw record.
+            # Drain it in bounded pieces rather than loading it during usage
+            # extraction. Its official usage/final cannot safely be inferred.
+            limit = PiEventCompactor.MAX_EVENT_BYTES + 4096
+            line = fh.readline(limit)
+            if not line:
+                break
+            if len(line) == limit and not line.endswith("\n"):
+                while line and not line.endswith("\n"):
+                    line = fh.readline(limit)
+                errors.append("pi_event_too_large: retained raw; usage/final may be incomplete")
+                continue
             try:
                 ev = json.loads(line)
             except Exception:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            if ev.get("type") == "error":
+                error = str(ev.get("error") or ev.get("message") or "Pi error")[:500]
+                if error not in errors:
+                    errors.append(error)
                 continue
             if ev.get("type") != "message_end":
                 continue
@@ -7583,8 +7820,9 @@ def pi_usage(events_path):
                     usage[k] += int(u.get(k) or 0)
                 except (TypeError, ValueError):
                     pass
-            if m.get("stopReason") == "error" or m.get("errorMessage"):
-                errors.append(str(m.get("errorMessage") or "error")[:500])
+            reason = m.get("stopReason")
+            if reason in ("error", "aborted", "cancelled", "canceled") or m.get("errorMessage"):
+                errors.append(str(m.get("errorMessage") or reason or "error")[:500])
             text = "".join(b.get("text", "") for b in m.get("content") or [] if isinstance(b, dict) and b.get("type") == "text")
             if text.strip():
                 final = text
@@ -7617,12 +7855,13 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
     if d.get("_resume_session"):
         cmd.append("--continue")
     cmd += ["--tools", PI_TOOLS, prompt]
-    rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
+    rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp, pi_events=True)
     usage, text, errors = pi_usage(evp)
     final = extract_json(text) if isinstance(text, str) else None
     try:
         with open(evp + ".err", errors="ignore") as errf:
-            err_tail = errf.read()[-3000:]
+            errf.seek(max(0, os.path.getsize(evp + ".err") - 3000))
+            err_tail = errf.read(3000)
     except OSError:
         err_tail = ""
     if errors and rc == 0:
@@ -15607,6 +15846,13 @@ def summarize_event(o):
         if message.get("role") == "assistant":
             return "msg", "".join(b.get("text", "") for b in message.get("content") or []
                                    if isinstance(b, dict) and b.get("type") == "text")
+    if t == "message_update" and (o.get("swrm_pi_compaction") or {}).get("version") == 1:
+        # The adapter stores new text in place; no replay state is needed for a
+        # watcher starting at a saved byte cursor. Never display thinking.
+        message = o.get("message") or (o.get("assistantMessageEvent") or {}).get("partial") or {}
+        text = "".join(b.get("text", "") for b in message.get("content") or []
+                       if isinstance(b, dict) and b.get("type") == "text")
+        return ("msg", text) if text else (None, None)
     if t == "tool_execution_start":
         args = o.get("args") or {}
         return "cmd", args.get("command") or f"{o.get('toolName', 'tool')}"
