@@ -5656,9 +5656,11 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
 #
 # Policy shape (policy.json, routing.health_gate):
 #   {"enabled": false, "timeout_seconds": 10, "on_unknown": "allow"}
-# Batch/fleet paths are untouched: the gate only runs in cmd_run's
-# single-dispatch path (initial pick + fallback re-route). The auto-rework
-# escalation pick is not gated in this slice (known gap, see README).
+# Fleet exec forwarding is untouched: the gate only runs in cmd_run's
+# single-dispatch path (initial pick + fallback re-route) and in
+# execute_batch's per-card dispatch (M25 slice 1, #202, via
+# batch_health_gate). The auto-rework escalation pick is not gated in this
+# slice (known gap, see README).
 
 HEALTH_GATE_DEFAULT_TIMEOUT_SECONDS = 10
 HEALTH_GATE_TIMEOUT_MIN_SECONDS = 1
@@ -13722,6 +13724,91 @@ def batch_record_blocked(summary, row, dep, reason):
               file=sys.stderr)
 
 
+def batch_health_gate(spec, policy, backend):
+    """(record, blocked) for one batch card's effective backend (M25 slice 1, #202).
+
+    Reuses apply_health_gate() — the same decision path single `openswarm run`
+    uses (M24, #198) — on the per-card effective backend (after weighted +
+    quota routing, so an explicit --backend is gated exactly like a routed
+    pick). Returns (None, False) when the gate is off: probe state is never
+    read, so a gated-off batch dispatches byte-identically to before. Also
+    (None, False) when no backend is selected yet (backend None): the remote
+    run's own M24 gate judges the pick it actually routes to.
+
+    The probe reads the controller's probe state (get_state), the same state
+    batch_weighted_route already routes on — so for a card dispatched to a
+    remote host the verdict reflects the controller host, not the executor
+    host; the remote run's own gate is the executor-side check. A probe-state
+    read failure degrades to an empty state (verdict unknown, per the
+    configured on_unknown posture) instead of stranding the card; an invalid
+    health_gate config fails loudly like a single run. The gate flags live on
+    the batch spec, so a resumed or detached batch gates exactly like the
+    batch that created it.
+    """
+    # Flag precedence mirrors apply_health_gate (M24): --health-gate wins
+    # over --no-health-gate when both are passed; --no-health-gate wins
+    # over the policy default.
+    if spec.get("health_gate"):
+        enabled = True
+    elif spec.get("no_health_gate"):
+        return None, False
+    else:
+        raw = (policy.get("routing") or {}).get("health_gate") or {}
+        enabled = isinstance(raw, dict) and bool(raw.get("enabled"))
+    if not enabled:
+        return None, False
+    if backend is None:
+        return None, False
+    args = argparse.Namespace(health_gate=bool(spec.get("health_gate")),
+                              no_health_gate=False,
+                              skip_health_gate=bool(spec.get("skip_health_gate")))
+    try:
+        st = get_state(policy)
+    except (RuntimeError, OSError):
+        st = {}
+    custom_backends = load_custom_backends(policy, explicit=spec.get("backends_file"))
+    return apply_health_gate(backend, st, policy, args, custom_backends=custom_backends, stage="batch")
+
+
+def batch_record_health_gate_blocked(summary, row, record):
+    """Ledger entry for a card the batch health gate refused (M25 slice 1, #202).
+
+    Mirrors batch_record_blocked: the controller ledger is where batch
+    decisions are read, so the refusal — status blocked, blocked_by
+    health-gate, the reason, and the full gate record with per-check
+    evidence pointers — is recorded here under the batch-card id. A ledger
+    write failure must not fail the batch, so it is reported and the batch
+    summary (which always records the block) stays authoritative.
+    """
+    try:
+        append_ledger({"id": f"batch-{summary['id']}-{row['card']}", "ts": NOW(),
+                       "title": f"batch {row['card']} blocked by health gate",
+                       "status": "blocked", "batch_id": summary["id"], "card": row["card"],
+                       "blocked_by": "health-gate", "blocked_reason": record["reason"],
+                       "health_gate": record, "scope": summary.get("scope")})
+    except OSError as error:
+        print(f"openswarm: warning: could not record health-gate block for {row['card']} in ledger: {error}",
+              file=sys.stderr)
+
+
+def batch_block_row_health_gate(summary, row, record):
+    """Mark a queued row blocked by the batch health gate (M25 slice 1, #202).
+
+    Records the block in the batch summary and in the ledger, and returns
+    the record. Callers must not dispatch the row afterwards. The row keeps
+    the gate record so summary.json carries the reason and evidence
+    pointers. A blocked card blocks its M4 dependents like any other
+    non-done dependency.
+    """
+    row["blocked_by"] = "health-gate"
+    row["blocked_reason"] = record["reason"]
+    row["health_gate"] = record
+    batch_change(summary, row, "finished", status="blocked",
+                 summary=f"blocked by health gate: {record['reason']}")
+    batch_record_health_gate_blocked(summary, row, record)
+    return record
+
+
 def batch_save(summary):
     directory = os.path.join(DATA, "batches", summary["id"])
     jsave(os.path.join(directory, "summary.json"), summary)
@@ -14009,6 +14096,28 @@ def execute_batch(spec, summary):
                                                       weighted_info, eff_decision, quota_info,
                                                       status="unroutable")
                         continue
+                    # M25 slice 1 (#202): batch health gate on the
+                    # effective backend (after weighted + quota routing,
+                    # so an explicit --backend is gated exactly like a
+                    # routed pick). A blocked card is never dispatched:
+                    # no exec attempt, ledger blocked/health-gate, and
+                    # its M4 dependents block like any other non-done
+                    # dependency. Other cards in the batch are
+                    # unaffected. When the gate is off (shipped
+                    # default) batch_health_gate returns (None, False)
+                    # without reading probe state, so dispatch stays
+                    # byte-identical. The probe reads the controller's
+                    # state; the remote run's own M24 gate is the
+                    # executor-side check. The gate flags are NOT
+                    # forwarded to the remote run: forcing them on
+                    # there would override the executor host's own
+                    # policy with the controller's choice.
+                    gate_record, gate_blocked = batch_health_gate(spec, policy, eff_backend)
+                    if gate_record is not None:
+                        row["health_gate"] = gate_record
+                        if gate_blocked:
+                            batch_block_row_health_gate(summary, row, gate_record)
+                            continue
                     lock_path = os.path.join(DATA, "fleet-provider-concurrency.lock")
                     with open(lock_path, "a") as lock:
                         _flock(lock, LOCK_EX)
@@ -14144,6 +14253,12 @@ def cmd_batch(args, policy):
             # it — the remote run's fail-fast is the unavailability guard).
             "verify_evalid": verify_evalid, "evalid_bin": getattr(args, "evalid_bin", None),
             "scope": getattr(args, "scope", "repo"),
+            # M25 slice 1 (#202): health-gate flags ride on the spec so a
+            # resumed or detached batch gates exactly like the batch that
+            # created it; getattr defaults keep pre-M25 specs working.
+            "health_gate": bool(getattr(args, "health_gate", False)),
+            "no_health_gate": bool(getattr(args, "no_health_gate", False)),
+            "skip_health_gate": bool(getattr(args, "skip_health_gate", False)),
             "budget_minutes": args.budget_minutes or round(policy["run"]["timeout_seconds"] / 60),
             "poll_seconds": args.poll_seconds}
     summary = {"id": bid, "repo": args.repo, "base": base, "scope": getattr(args, "scope", "repo"),
@@ -17194,6 +17309,16 @@ def main():
     sp.add_argument("--evalid-bin", help="evalid binary forwarded to each run: path to xflow, or to a "
                                          "bin/xflow.js checkout (run via node); overrides EVALID_BIN, xflow on "
                                          "PATH, and the sibling ../evalid checkout on the executor host")
+    sp.add_argument("--health-gate", action="store_true",
+                    help="enable the pre-dispatch backend health gate for this batch (M25, #202): "
+                         "probe each card's selected backend before dispatch and refuse an unhealthy "
+                         "one (the card is blocked, no exec attempt, never rerouted)")
+    sp.add_argument("--no-health-gate", action="store_true",
+                    help="disable the pre-dispatch backend health gate for this batch even when "
+                         "routing.health_gate.enabled is true")
+    sp.add_argument("--skip-health-gate", action="store_true",
+                    help="bypass the health gate for this batch; the bypass is recorded on each "
+                         "card's summary row (M25, #202)")
     sp.add_argument("--base")
     sp.add_argument("--scope", choices=("repo", "host"), default="repo", help="task scope (repo by default; host for authorized host operations)")
     sp.add_argument("--detach", action="store_true")
