@@ -12,8 +12,10 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 BIN = HERE.parent / "bin"
@@ -63,6 +65,25 @@ def health_payload(hosts=None, runs=None, lanes=None):
 
 def resource_payload(hosts):
     return {"hosts": hosts}
+
+
+#: A child process that dies in the middle of writing a snapshot: it writes
+#: half a document into the scratch file and then hangs, so the parent can
+#: kill it while the write is in flight.
+CRASH_WRITER = """
+import sys, time
+sys.path.insert(0, %(bin)r)
+from guardian import observation
+
+def half_written(payload, stream, **kwargs):
+    stream.write('{"schema": "swrm.guardian.health", "schema_ver')
+    stream.flush()
+    time.sleep(120)
+
+observation.json.dump = half_written
+observation._atomic_write_json(sys.argv[1], {"schema": observation.SCHEMA,
+                                             "schema_version": observation.SCHEMA_VERSION})
+"""
 
 
 class GuardianObservationTests(unittest.TestCase):
@@ -222,6 +243,67 @@ class GuardianObservationTests(unittest.TestCase):
         self.assertEqual(block["status"], "healthy")
         self.assertEqual([item["backend"] for item in block["unmetered"]], ["cursor"])
 
+    # host-scoped fleet health --------------------------------------------
+    def test_host_scoped_health_catches_a_crashed_lane_nested_under_a_host(self):
+        # `openswarm fleet health --json` nests each host's own lanes and
+        # runs under the host row, so a crash only shows up there.
+        health = self.write("health.json", {"hosts": [{
+            "name": "alpha", "reachable": True, "paused": False, "status": "reachable",
+            "health": {"runs": [], "summary": {"alive": 0, "dead": 0, "zombie": 0, "unknown": 0},
+                       "lane_config_valid": True,
+                       "lanes": [{"name": "L1", "state": "crashed", "backend": "codex",
+                                  "provider": "vendor", "last_error": "runner exited"}]}}]})
+        result = self.observe(health=health)
+        hosts = result["dimensions"]["health"]["hosts"]
+        item = hosts["items"][0]
+        self.assertEqual(item["status"], "unhealthy")
+        self.assertIn("lane_crashed", item["signals"])
+        self.assertEqual(result["overall"]["status"], "unhealthy")
+        # the nested lane is visible on its own, tagged with its host
+        lanes = result["dimensions"]["health"]["lanes"]
+        self.assertEqual(lanes["items"][0]["status"], "unhealthy")
+        self.assertEqual(lanes["items"][0]["host"], "alpha")
+        self.assertIn("lane_crashed", [signal["kind"] for signal in result["signals"]])
+
+    def test_host_scoped_health_catches_a_dead_run_nested_under_a_host(self):
+        health = self.write("health.json", {"hosts": [{
+            "name": "alpha", "reachable": True, "paused": False, "status": "reachable",
+            "health": {"runs": [{"id": "run-1", "verdict": "dead",
+                                 "reason": "runner process gone (pid_identity=gone)"}],
+                       "lanes": [], "summary": {"alive": 0, "dead": 1, "zombie": 0, "unknown": 0},
+                       "lane_config_valid": True}}]})
+        result = self.observe(health=health)
+        item = result["dimensions"]["health"]["hosts"]["items"][0]
+        self.assertEqual(item["status"], "unhealthy")
+        self.assertIn("run_dead", item["signals"])
+        runs = result["dimensions"]["health"]["runs"]
+        self.assertEqual(runs["items"][0]["status"], "unhealthy")
+        self.assertEqual(runs["items"][0]["host"], "alpha")
+        self.assertEqual(result["overall"]["status"], "unhealthy")
+
+    def test_host_scoped_health_catches_a_rate_limit_nested_under_a_host(self):
+        health = self.write("health.json", {"hosts": [{
+            "name": "alpha", "reachable": True, "paused": False, "status": "reachable",
+            "health": {"runs": [{"id": "run-1", "verdict": "alive",
+                                 "reason": "HTTP 429 Too Many Requests"}],
+                       "lanes": [], "summary": {"alive": 1, "dead": 0, "zombie": 0, "unknown": 0},
+                       "lane_config_valid": True}}]})
+        result = self.observe(health=health)
+        item = result["dimensions"]["health"]["hosts"]["items"][0]
+        self.assertEqual(item["status"], "unhealthy")
+        self.assertIn("rate_limited", item["signals"])
+        self.assertEqual(result["overall"]["status"], "unhealthy")
+
+    def test_host_scoped_health_reports_an_invalid_lane_config(self):
+        health = self.write("health.json", {"hosts": [{
+            "name": "alpha", "reachable": True, "paused": False, "status": "reachable",
+            "health": {"runs": [], "lanes": [], "lane_config_valid": False,
+                       "lane_config_error": "lane file is not valid JSON"}}]})
+        result = self.observe(health=health)
+        item = result["dimensions"]["health"]["hosts"]["items"][0]
+        self.assertEqual(item["status"], "unhealthy")
+        self.assertIn("lane_config_invalid", item["signals"])
+
     # unknown inputs ------------------------------------------------------
     def test_stale_quota_is_unknown_and_never_healthy(self):
         quota = self.write("quota.json", quota_payload([quota_row()]))
@@ -234,6 +316,37 @@ class GuardianObservationTests(unittest.TestCase):
         self.assertEqual(result["dimensions"]["quota"]["status"], "unknown")
         self.assertEqual(result["overall"]["status"], "unknown")
         self.assertNotEqual(result["overall"]["status"], "healthy")
+
+    def test_a_stale_report_is_never_escalated_into_a_fault(self):
+        health = self.write("health.json", health_payload(hosts=[
+            {"name": "alpha", "reachable": False, "status": "unreachable", "error": "boom"}]))
+        stale = time.time() - 7200
+        os.utime(health, (stale, stale))
+        result = self.observe(health=health)
+        item = result["dimensions"]["health"]["hosts"]["items"][0]
+        self.assertEqual(item["status"], "unknown")
+        self.assertEqual(item["unconfirmed_status"], "unhealthy")
+        self.assertEqual(result["overall"]["status"], "unknown")
+        self.assertTrue(result["signals"])
+        self.assertEqual([signal["confirmed"] for signal in result["signals"]],
+                         [False] * len(result["signals"]))
+
+    def test_a_stale_quota_report_does_not_poison_a_fresh_provider(self):
+        snapshot = self.write("snapshot.json", snapshot_payload(
+            lanes=[lane()], providers={"codex": "vendor"}))
+        quota = self.write("quota.json", quota_payload([
+            quota_row(backend="codex", remaining=0, status="low",
+                      detail="remaining 0 is at or below threshold 5")]))
+        stale = time.time() - 7200
+        os.utime(quota, (stale, stale))
+        result = self.observe(snapshot=snapshot, quota=quota)
+        provider = result["dimensions"]["snapshot"]["providers"]["items"][0]
+        self.assertEqual(provider["status"], "healthy")
+        self.assertNotIn("rate_limited", provider["signals"])
+        self.assertNotIn("quota_exhausted", provider["signals"])
+        # the stale quota is still reported as unknown, never as a fault
+        self.assertEqual(result["dimensions"]["quota"]["status"], "unknown")
+        self.assertNotEqual(result["overall"]["status"], "unhealthy")
 
     def test_unsupported_quota_input_is_unknown(self):
         quota = self.write("quota.json", {"something_else": {"rows": []}})
@@ -286,6 +399,33 @@ class GuardianObservationTests(unittest.TestCase):
                                   require=["quota"])
         self.assertEqual(result["coverage"]["missing_required"], ["quota"])
         self.assertEqual(result["overall"]["status"], "unknown")
+
+    def test_a_missing_required_input_never_erases_a_known_unhealthy_fleet(self):
+        snapshot = self.write("snapshot.json", snapshot_payload(lanes=[lane(state="crashed")]))
+        result = guardian.observe({"snapshot": snapshot}, state_dir=str(self.state), persist=False,
+                                  require=["quota"])
+        self.assertEqual(result["coverage"]["missing_required"], ["quota"])
+        self.assertEqual(result["overall"]["status"], "unhealthy")
+        self.assertIn("required input missing", result["overall"]["reason"])
+
+    def test_a_future_timestamp_is_rejected(self):
+        snapshot = self.write("snapshot.json", dict(snapshot_payload(lanes=[lane()]),
+                                                    observed_at=time.time() + 3600))
+        result = self.observe(snapshot=snapshot)
+        record = {item["kind"]: item for item in result["coverage"]["inputs"]}["snapshot"]
+        self.assertEqual(record["status"], "invalid")
+        self.assertIn("future", record["detail"])
+        self.assertEqual(result["dimensions"]["snapshot"]["status"], "unknown")
+        self.assertNotEqual(result["overall"]["status"], "healthy")
+
+    def test_a_future_file_timestamp_is_rejected(self):
+        snapshot = self.write("snapshot.json", snapshot_payload(lanes=[lane()]))
+        ahead = time.time() + 3600
+        os.utime(snapshot, (ahead, ahead))
+        result = self.observe(snapshot=snapshot)
+        record = {item["kind"]: item for item in result["coverage"]["inputs"]}["snapshot"]
+        self.assertEqual(record["status"], "invalid")
+        self.assertNotEqual(result["overall"]["status"], "healthy")
 
     def test_a_stale_drain_scope_does_not_hide_an_unknown(self):
         health = self.write("health.json", health_payload(hosts=[
@@ -359,6 +499,24 @@ class GuardianObservationTests(unittest.TestCase):
         self.assertEqual(by_name["beta"]["status"], "healthy")
         self.assertEqual(result["overall"]["status"], "healthy")
 
+    def test_a_host_scoped_drain_covers_the_lanes_and_runs_of_that_host(self):
+        health = self.write("health.json", {"hosts": [
+            {"name": "alpha", "reachable": True, "paused": False, "status": "reachable",
+             "health": {"runs": [{"id": "run-1", "verdict": "dead", "reason": "runner gone"}],
+                        "lanes": [{"name": "L1", "state": "crashed"}],
+                        "summary": {"alive": 0, "dead": 1, "zombie": 0, "unknown": 0},
+                        "lane_config_valid": True}},
+            {"name": "beta", "reachable": True, "paused": False, "status": "reachable",
+             "health": {"runs": [], "lanes": [], "summary": {"alive": 0, "dead": 0, "zombie": 0,
+                                                             "unknown": 0},
+                        "lane_config_valid": True}}]})
+        guardian.drain(str(self.state), "alpha is being rebuilt", host="alpha")
+        result = self.observe(health=health)
+        self.assertEqual(result["dimensions"]["health"]["hosts"]["items"][0]["status"], "drained")
+        self.assertEqual(result["dimensions"]["health"]["lanes"]["items"][0]["status"], "drained")
+        self.assertEqual(result["dimensions"]["health"]["runs"]["items"][0]["status"], "drained")
+        self.assertEqual(result["overall"]["status"], "healthy")
+
     # persistence ---------------------------------------------------------
     def test_snapshot_is_persisted_atomically_and_readable_after_restart(self):
         snapshot = self.write("snapshot.json", snapshot_payload(lanes=[lane(state="crashed")]))
@@ -396,6 +554,192 @@ class GuardianObservationTests(unittest.TestCase):
         with self.assertRaises(guardian.GuardianError):
             guardian.load_snapshot(str(self.root / "nowhere"))
 
+    # re-reading the persisted state -------------------------------------
+    def test_reading_the_snapshot_again_re_evaluates_its_freshness(self):
+        snapshot = self.write("snapshot.json", snapshot_payload(lanes=[lane()]))
+        guardian.observe({"snapshot": snapshot}, state_dir=str(self.state))
+        fresh = guardian.load_snapshot(str(self.state))
+        self.assertEqual(fresh["overall"]["status"], "healthy")
+        # the same snapshot, read two hours later: its input went stale
+        later = time.time() + 7200
+        aged = guardian.load_snapshot(str(self.state), now=later)
+        record = {item["kind"]: item for item in aged["coverage"]["inputs"]}["snapshot"]
+        self.assertEqual(record["freshness"], "stale")
+        self.assertEqual(aged["dimensions"]["snapshot"]["status"], "unknown")
+        self.assertEqual(aged["overall"]["status"], "unknown")
+        self.assertNotEqual(aged["overall"]["status"], "healthy")
+
+    def test_reading_the_snapshot_again_re_evaluates_the_manual_drain(self):
+        guardian.drain(str(self.state), "waiting for a window")
+        snapshot = self.write("snapshot.json", snapshot_payload(lanes=[lane()]))
+        guardian.observe({"snapshot": snapshot}, state_dir=str(self.state))
+        drained = guardian.load_snapshot(str(self.state))
+        self.assertEqual(drained["overall"]["status"], "drained")
+        self.assertTrue(drained["manual_drain"]["active"])
+        # the operator lifts the drain while the controller is down
+        guardian.undrain(str(self.state))
+        lifted = guardian.load_snapshot(str(self.state))
+        self.assertFalse(lifted["manual_drain"]["active"])
+        self.assertEqual(lifted["overall"]["status"], "healthy")
+        self.assertEqual(lifted["overall"]["transient_status"], "healthy")
+
+    def test_reading_the_snapshot_again_keeps_a_verified_fault(self):
+        snapshot = self.write("snapshot.json", snapshot_payload(lanes=[lane(state="crashed")]))
+        guardian.observe({"snapshot": snapshot}, state_dir=str(self.state))
+        later = time.time() + 7200
+        aged = guardian.load_snapshot(str(self.state), now=later)
+        # the input went stale, so nothing may be called healthy ...
+        self.assertEqual(aged["overall"]["status"], "unknown")
+        # ... but the fault that was verified is not hidden either
+        item = aged["dimensions"]["snapshot"]["lanes"]["items"][0]
+        self.assertEqual(item["unconfirmed_status"], "unhealthy")
+        self.assertEqual(item["status"], "unknown")
+
+    # concurrency and crashes --------------------------------------------
+    def test_atomic_writes_use_a_unique_scratch_file(self):
+        names = []
+        real_replace = observation.os.replace
+
+        def capture(source, target):
+            names.append(source)
+            return real_replace(source, target)
+
+        target = self.root / "out.json"
+        with mock.patch.object(observation.os, "replace", capture):
+            for index in range(5):
+                observation._atomic_write_json(str(target), {"index": index})
+        self.assertEqual(len(names), 5)
+        self.assertEqual(len(set(names)), 5)
+        # every scratch file was renamed onto the target: none was left behind
+        for name in names:
+            self.assertFalse(os.path.exists(name))
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["index"], 4)
+
+    def test_the_state_lock_serialises_concurrent_updates(self):
+        order = []
+
+        def worker():
+            with observation._state_lock(str(self.state), create=True):
+                order.append("second")
+
+        thread = threading.Thread(target=worker)
+        with observation._state_lock(str(self.state), create=True):
+            order.append("first")
+            thread.start()
+            time.sleep(0.2)
+            order.append("first-done")
+        thread.join(timeout=30)
+        self.assertEqual(order, ["first", "first-done", "second"])
+
+    def test_concurrent_writes_use_unique_temporary_files(self):
+        snapshot = self.write("snapshot.json", snapshot_payload(lanes=[lane()]))
+        errors = []
+
+        def worker():
+            try:
+                guardian.observe({"snapshot": snapshot}, state_dir=str(self.state))
+            except Exception as error:  # pragma: no cover - failure path
+                errors.append(error)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertEqual(errors, [])
+        stored = json.loads((self.state / "health.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored["schema"], guardian.SCHEMA)
+        # every scratch file was cleaned up: no half-written snapshot is left
+        self.assertEqual([path.name for path in self.state.iterdir()
+                          if path.name.startswith(".")], [])
+
+    def test_concurrent_state_and_drain_updates_stay_consistent(self):
+        snapshot = self.write("snapshot.json", snapshot_payload(lanes=[lane()]))
+        errors = []
+
+        def observer():
+            try:
+                guardian.observe({"snapshot": snapshot}, state_dir=str(self.state))
+            except Exception as error:  # pragma: no cover - failure path
+                errors.append(error)
+
+        def drainer():
+            try:
+                for _ in range(5):
+                    guardian.drain(str(self.state), "maintenance window")
+                    guardian.undrain(str(self.state))
+            except Exception as error:  # pragma: no cover - failure path
+                errors.append(error)
+
+        threads = [threading.Thread(target=observer) for _ in range(4)]
+        threads.append(threading.Thread(target=drainer))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertEqual(errors, [])
+        stored = json.loads((self.state / "health.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored["schema"], guardian.SCHEMA)
+        record = guardian.load_drain(str(self.state))
+        self.assertIn("active", record)
+        self.assertEqual(record["schema"], guardian.DRAIN_SCHEMA)
+
+    def test_concurrent_processes_leave_a_valid_snapshot(self):
+        snapshot = self.write("snapshot.json", snapshot_payload(lanes=[lane(state="crashed")]))
+        processes = [subprocess.Popen(
+            [sys.executable, str(CLI), "observe", "--snapshot", snapshot,
+             "--state-dir", str(self.state)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(4)]
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=60)
+            self.assertEqual(process.returncode, 0, stderr)
+        stored = json.loads((self.state / "health.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored["schema"], guardian.SCHEMA)
+        self.assertEqual(stored["overall"]["status"], "unhealthy")
+        self.assertEqual([path.name for path in self.state.iterdir()
+                          if path.name.startswith(".")], [])
+
+    def test_a_crash_during_the_write_keeps_the_last_good_snapshot(self):
+        snapshot = self.write("snapshot.json", snapshot_payload(lanes=[lane(state="crashed")]))
+        guardian.observe({"snapshot": snapshot}, state_dir=str(self.state))
+        before = (self.state / "health.json").read_text(encoding="utf-8")
+
+        # a child that dies half way through the next write
+        child = subprocess.Popen([sys.executable, "-c", CRASH_WRITER % {"bin": str(BIN)},
+                                  str(self.state / "health.json")],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(1.0)
+        child.kill()
+        child.communicate(timeout=30)
+
+        # the snapshot that was on disk is untouched and still readable
+        after = (self.state / "health.json").read_text(encoding="utf-8")
+        self.assertEqual(after, before)
+        reloaded = guardian.load_snapshot(str(self.state))
+        self.assertEqual(reloaded["overall"]["status"], "unhealthy")
+
+    def test_a_restart_after_a_crash_reads_the_last_good_snapshot(self):
+        snapshot = self.write("snapshot.json", snapshot_payload(lanes=[lane(state="crashed")]))
+        guardian.observe({"snapshot": snapshot}, state_dir=str(self.state))
+        child = subprocess.Popen([sys.executable, "-c", CRASH_WRITER % {"bin": str(BIN)},
+                                  str(self.state / "health.json")],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(1.0)
+        child.kill()
+        child.communicate(timeout=30)
+
+        # a restarted controller (a fresh process) reads the state back
+        status = self.run_cli("status", "--state-dir", str(self.state))
+        self.assertEqual(status.returncode, 0, status.stderr)
+        payload = json.loads(status.stdout)
+        self.assertEqual(payload["overall"]["status"], "unhealthy")
+
+        # and the next write still works: the scratch file of the crashed
+        # writer never gets in the way
+        again = self.run_cli("observe", "--snapshot", snapshot, "--state-dir", str(self.state))
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(json.loads(again.stdout)["overall"]["status"], "unhealthy")
+
     # bounded inputs ------------------------------------------------------
     def test_oversized_input_is_rejected_as_unusable(self):
         big = self.root / "big.json"
@@ -428,6 +772,48 @@ class GuardianObservationTests(unittest.TestCase):
         result = self.observe(snapshot=str(broken), require_fleet=False)
         record = {item["kind"]: item for item in result["coverage"]["inputs"]}["snapshot"]
         self.assertEqual(record["status"], "invalid")
+
+    # truncated records --------------------------------------------------
+    def test_truncated_records_are_reported_as_incomplete_and_unknown(self):
+        lanes = [lane(name="L%d" % index) for index in range(5)]
+        snapshot = self.write("snapshot.json", snapshot_payload(lanes=lanes))
+        thresholds = observation.load_thresholds(overrides={"max_records": 2})
+        result = guardian.observe({"snapshot": snapshot}, thresholds=thresholds,
+                                  state_dir=str(self.state), persist=False)
+        block = result["dimensions"]["snapshot"]["lanes"]
+        self.assertTrue(block["incomplete"])
+        self.assertEqual(block["truncated"], 3)
+        self.assertIn("incomplete", block["detail"])
+        self.assertEqual(block["status"], "unknown")
+        self.assertEqual(len(block["items"]), 2)
+        self.assertIn("snapshot", result["coverage"]["truncated"])
+        self.assertNotEqual(result["overall"]["status"], "healthy")
+
+    def test_truncation_never_conceals_a_verified_fault(self):
+        lanes = [lane(name="L0"), lane(name="L1"), lane(name="L2", state="crashed")]
+        snapshot = self.write("snapshot.json", snapshot_payload(lanes=lanes))
+        thresholds = observation.load_thresholds(overrides={"max_records": 2})
+        result = guardian.observe({"snapshot": snapshot}, thresholds=thresholds,
+                                  state_dir=str(self.state), persist=False)
+        block = result["dimensions"]["snapshot"]["lanes"]
+        self.assertTrue(block["incomplete"])
+        self.assertEqual(block["status"], "unhealthy")
+        self.assertEqual([fault["name"] for fault in block["truncated_faults"]], ["L2"])
+        self.assertEqual(result["overall"]["status"], "unhealthy")
+
+    def test_truncated_hosts_never_conceal_an_unreachable_host(self):
+        hosts = [{"name": "host-%d" % index, "reachable": True, "status": "reachable"}
+                 for index in range(4)]
+        hosts.append({"name": "host-late", "reachable": False, "status": "unreachable",
+                      "error": "ssh timed out"})
+        health = self.write("health.json", {"hosts": hosts})
+        thresholds = observation.load_thresholds(overrides={"max_records": 2})
+        result = guardian.observe({"health": health}, thresholds=thresholds,
+                                  state_dir=str(self.state), persist=False)
+        block = result["dimensions"]["health"]["hosts"]
+        self.assertTrue(block["incomplete"])
+        self.assertEqual(block["status"], "unhealthy")
+        self.assertEqual(result["overall"]["status"], "unhealthy")
 
     # what the guardian must never do -------------------------------------
     def test_guardian_never_shells_out_and_never_reports_capacity(self):

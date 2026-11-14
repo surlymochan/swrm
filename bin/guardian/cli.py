@@ -145,8 +145,10 @@ def _render_text(snapshot):
     if signals:
         lines.append("signals:")
         for signal in signals:
-            lines.append("  %-18s %-10s %s" % (signal.get("kind"), signal.get("item") or "-",
-                                               signal.get("detail") or ""))
+            lines.append("  %-18s %-10s %s%s"
+                         % (signal.get("kind"), signal.get("item") or "-",
+                            signal.get("detail") or "",
+                            "" if signal.get("confirmed", True) else " (unconfirmed)"))
     return "\n".join(lines)
 
 

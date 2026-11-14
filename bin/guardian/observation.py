@@ -18,20 +18,34 @@ the guardian state directory: the health snapshot and the manual-drain record.
 Resource metrics are *accepted* as an existing structured input; the guardian
 never collects them, and it never claims a source it did not read.
 
-Two rules shape every verdict:
+Three rules shape every verdict:
 
 * Unknown is never healthy. A stale, missing, unsupported or unreadable
   input yields UNKNOWN for the signals it would have carried, so the overall
-  verdict can never be `healthy` while evidence is missing.
+  verdict can never be `healthy` while evidence is missing. Missing evidence
+  never erases a verdict that *was* verified: an unhealthy fleet stays
+  unhealthy, and the missing input is reported next to it.
 * A manual drain is durable operator intent, kept in its own file. Observing
   a healthy fleet never clears it.
+* Stale evidence never poisons fresh evidence. A stale quota report cannot
+  mark a provider unhealthy, and a stale fleet report cannot escalate into a
+  fault: unconfirmed evidence is reported, never acted on.
 """
+import contextlib
 import datetime
 import json
 import math
 import os
 import sys
+import tempfile
+import threading
 import time
+
+try:
+    import fcntl
+except ImportError:  # Windows: no fcntl; the state lock falls back to msvcrt.
+    fcntl = None
+    import msvcrt
 
 SCHEMA = "swrm.guardian.health"
 SCHEMA_VERSION = 1
@@ -60,6 +74,18 @@ INPUT_KINDS = ("snapshot", "health", "quota", "probe", "resources")
 
 SNAPSHOT_FILE = "health.json"
 DRAIN_FILE = "drain.json"
+#: Advisory lock file that serialises the guardian's state updates between
+#: threads and between processes.
+LOCK_FILE = "state.lock"
+
+#: An observation that claims to be from the future is not evidence, it is a
+#: broken clock. A small allowance absorbs ordinary clock jitter between the
+#: producer and the guardian; anything beyond it is refused.
+MAX_FUTURE_SKEW_SECONDS = 1.0
+
+#: Temporary files older than this are leftovers of a crashed write. They
+#: are never read, but they are cleaned up so the state directory stays tidy.
+STALE_TEMP_SECONDS = 3600.0
 
 #: Explicit provider-side failure markers. A 429 is a provider failure, not a
 #: local one, so it is reported as such instead of being folded into "unhealthy".
@@ -409,6 +435,18 @@ def read_input(kind, source, thresholds, now=None, observed_at=None):
     else:
         record["observed_at"] = now
         record["timestamp_source"] = "ingest"
+    if record["observed_at"] > now + MAX_FUTURE_SKEW_SECONDS:
+        # A future observation cannot be aged: it would look infinitely fresh
+        # and would age to "fresh" for ever. Refuse it instead of trusting it.
+        record["status"] = "invalid"
+        record["detail"] = ("input timestamp is %.3fs in the future; a future observation "
+                            "cannot be trusted" % (record["observed_at"] - now))
+        record["payload"] = None
+        record["observed_at"] = None
+        record["age_seconds"] = None
+        record["freshness"] = UNKNOWN
+        record["confidence"] = "none"
+        return record
     age = now - record["observed_at"]
     if age < 0:
         age = 0.0
@@ -481,7 +519,7 @@ def _unknown_dimension(kind, record, detail):
 def _lane_items(rows, thresholds):
     """One item per lane: state, provider and the lane's own error."""
     items = []
-    for row in list(rows)[:thresholds["max_records"]]:
+    for row in rows:
         if not isinstance(row, dict):
             continue
         state = str(row.get("state") or "").strip().lower()
@@ -530,6 +568,7 @@ def _lane_items(rows, thresholds):
         items.append({"name": _short(row.get("name") or "", 64), "status": status, "detail": detail,
                       "state": state, "backend": _short(row.get("backend") or "", 64),
                       "provider": _short(row.get("provider") or "", 64), "signals": signals,
+                      "host": _short(row.get("host") or "", 64) or None,
                       "evidence": {"last_error": error_text or None,
                                    "quota_reset_at": row.get("quota_reset_at"),
                                    "current_run": _short(row.get("current_run") or "", 64) or None}})
@@ -558,7 +597,7 @@ def _provider_items(payload, lane_rows, thresholds):
             if not isinstance(name, str) or not name:
                 continue
             backend_provider[str(backend)] = name
-    for row in list(lane_rows)[:thresholds["max_records"]]:
+    for row in lane_rows:
         if not isinstance(row, dict):
             continue
         provider = row.get("provider")
@@ -591,9 +630,80 @@ def _provider_items(payload, lane_rows, thresholds):
     return [providers[name] for name in sorted(providers)], sorted(set(unobserved))
 
 
+def _host_nested_faults(nested):
+    """Faults seen in the per-host health payload nested under a host row.
+
+    `openswarm fleet health --json` nests each host's own lanes and runs
+    under the host, so a crashed lane, a dead run or a provider rate limit
+    only shows up there. Without this the host would be reported healthy
+    while its own lanes were crashing.
+    """
+    faults = []
+    if not isinstance(nested, dict):
+        return faults
+    if nested.get("lane_config_valid") is False:
+        faults.append((UNHEALTHY, "lane_config_invalid",
+                       "host reports an invalid lane config: %s"
+                       % _short(nested.get("lane_config_error"), 160)))
+    for row in nested.get("runs") or []:
+        if not isinstance(row, dict):
+            continue
+        verdict = str(row.get("verdict") or "").strip().lower()
+        name = _short(row.get("id") or "?", 64)
+        reason = _short(row.get("reason"), 200)
+        if verdict == "dead":
+            faults.append((UNHEALTHY, "run_dead", "run %s is dead%s"
+                           % (name, (": " + reason) if reason else "")))
+        elif verdict == "zombie":
+            faults.append((DEGRADED, "run_zombie", "run %s is a zombie%s"
+                           % (name, (": " + reason) if reason else "")))
+        marker = _rate_limit_marker(reason)
+        if marker:
+            faults.append((UNHEALTHY, "rate_limited",
+                           "run %s hit a provider rate limit (%s): %s" % (name, marker, reason)))
+    for row in nested.get("lanes") or []:
+        if not isinstance(row, dict):
+            continue
+        state = str(row.get("state") or "").strip().lower()
+        name = _short(row.get("name") or "?", 64)
+        error = _short(row.get("last_error"), 200)
+        if state in ("crashed", "dead", "failed"):
+            faults.append((UNHEALTHY, "lane_crashed", "lane %s is %s" % (name, state)))
+        elif state in LANE_DEGRADED_STATES:
+            faults.append((DEGRADED, "lane_down" if state == "down" else "lane_transitional",
+                           "lane %s is %s" % (name, state)))
+        marker = _rate_limit_marker(error)
+        if marker:
+            faults.append((UNHEALTHY, "rate_limited",
+                           "lane %s hit a provider rate limit (%s): %s" % (name, marker, error)))
+        elif error:
+            faults.append((DEGRADED, "lane_error", "lane %s reported an error: %s" % (name, error)))
+    return faults
+
+
+def _nested_summary(nested):
+    """Counts of the runs and lanes nested under one host, for the evidence."""
+    if not isinstance(nested, dict):
+        return None
+    runs = {}
+    for row in nested.get("runs") or []:
+        if not isinstance(row, dict):
+            continue
+        verdict = str(row.get("verdict") or "unknown").strip().lower() or "unknown"
+        runs[verdict] = runs.get(verdict, 0) + 1
+    lanes = {}
+    for row in nested.get("lanes") or []:
+        if not isinstance(row, dict):
+            continue
+        state = str(row.get("state") or "unknown").strip().lower() or "unknown"
+        lanes[state] = lanes.get(state, 0) + 1
+    return {"runs": runs, "lanes": lanes,
+            "lane_config_valid": nested.get("lane_config_valid")}
+
+
 def _host_items(rows, thresholds):
     items = []
-    for row in list(rows)[:thresholds["max_records"]]:
+    for row in rows:
         if not isinstance(row, dict):
             continue
         name = _short(row.get("name") or "", 64)
@@ -625,15 +735,24 @@ def _host_items(rows, thresholds):
             if status in (HEALTHY, UNKNOWN):
                 status = UNHEALTHY if not reachable else DEGRADED
             detail = (detail + "; " if detail else "") + error
+        nested = row.get("health") if isinstance(row.get("health"), dict) else None
+        faults = _host_nested_faults(nested)
+        if faults:
+            # the host's own lanes and runs are part of the host's health
+            status = _worst([status] + [fault[0] for fault in faults])
+            for _, signal, text in faults:
+                signals.append(signal)
+                detail = (detail + "; " if detail else "") + text
         items.append({"name": name, "status": status, "detail": detail, "signals": signals,
                       "evidence": {"reachable": reachable, "paused": paused,
-                                   "reported_status": status_text or None, "error": error or None}})
+                                   "reported_status": status_text or None, "error": error or None,
+                                   "nested": _nested_summary(nested)}})
     return items
 
 
 def _run_items(rows, thresholds):
     items = []
-    for row in list(rows)[:thresholds["max_records"]]:
+    for row in rows:
         if not isinstance(row, dict):
             continue
         verdict = str(row.get("verdict") or "").strip().lower()
@@ -659,7 +778,7 @@ def _run_items(rows, thresholds):
         items.append({"name": _short(row.get("id") or "", 64), "status": status,
                       "detail": reason or ("verdict %s" % verdict if verdict else "no verdict reported"),
                       "verdict": verdict or None, "backend": _short(row.get("backend") or "", 64),
-                      "signals": signals,
+                      "signals": signals, "host": _short(row.get("host") or "", 64) or None,
                       "evidence": {"runner_pid": evidence.get("runner_pid"),
                                    "pid_identity": evidence.get("pid_identity"),
                                    "idle_minutes": evidence.get("idle_minutes"),
@@ -671,7 +790,7 @@ def _run_items(rows, thresholds):
 def _quota_items(payload, thresholds):
     rows = payload.get("backends") if isinstance(payload, dict) else payload
     items = []
-    for row in list(rows or [])[:thresholds["max_records"]]:
+    for row in rows or []:
         if not isinstance(row, dict):
             continue
         backend = _short(row.get("backend") or "", 64)
@@ -880,7 +999,7 @@ def _resource_items(payload, thresholds):
         row.setdefault("name", "default")
         rows.append(row)
     items = []
-    for row in rows[:thresholds["max_records"]]:
+    for row in rows:
         if not isinstance(row, dict):
             continue
         name = _short(row.get("name") or "", 64)
@@ -911,12 +1030,89 @@ def _resource_items(payload, thresholds):
     return items
 
 
+def _bounded(items, limit):
+    """(kept, info) for a list of items and the per-dimension record limit.
+
+    Items beyond the limit are not reported, but the faults among them are
+    kept: a row limit must never conceal a verified fault, and it always
+    marks the dimension as incomplete.
+    """
+    total = len(items)
+    info = {"truncated": 0, "truncated_faults": [], "row_limit": limit, "row_total": total}
+    if limit <= 0 or total <= limit:
+        return items, info
+    dropped = items[limit:]
+    faults = [{"name": item.get("name"), "status": item.get("status"), "detail": item.get("detail")}
+              for item in dropped if item.get("status") in (DEGRADED, UNHEALTHY)]
+    info["truncated"] = len(dropped)
+    info["truncated_faults"] = faults
+    return items[:limit], info
+
+
+def _status_with_truncation(status, info):
+    """The status of a dimension whose rows were cut off by the record limit.
+
+    The rows that were not read could hold anything, so the dimension is
+    `unknown` (incomplete). A fault that was verified among the rows that
+    were not reported is never hidden by the limit.
+    """
+    if not info or not info.get("truncated"):
+        return status
+    faults = info.get("truncated_faults") or []
+    if faults:
+        return _worst([status] + [fault["status"] for fault in faults])
+    return UNKNOWN
+
+
+def _apply_truncation(block, info):
+    """Mark a block incomplete when the record limit dropped rows."""
+    if not info or not info.get("truncated"):
+        return block
+    block.update(info)
+    block["incomplete"] = True
+    block["detail"] = ("%s; incomplete: %d of %d row(s) were not reported (record limit %d)"
+                       % (block.get("detail") or "", info.get("truncated", 0),
+                          info.get("row_total", 0), info.get("row_limit", 0)))
+    block["status"] = _status_with_truncation(block.get("status"), info)
+    return block
+
+
 def _dimension(items, detail, observation, extra=None):
     block = {"status": _worst([item["status"] for item in items]) if items else UNKNOWN,
              "detail": detail, "items": items, "observation": _observation_view(observation)}
     if extra:
-        block.update(extra)
+        _apply_truncation(block, extra)
     return block
+
+
+def _nested_health_rows(hosts_raw):
+    """The run and lane rows nested under the hosts of a fleet health report.
+
+    `openswarm fleet health --json` reports one health payload per host, so
+    the lanes and runs of the fleet are nested under their host. They are
+    lifted out (and tagged with their host) so a crashed lane or a dead run
+    is visible on its own and not only through its host.
+    """
+    runs = []
+    lanes = []
+    for row in hosts_raw:
+        if not isinstance(row, dict):
+            continue
+        nested = row.get("health")
+        if not isinstance(nested, dict):
+            continue
+        host = _short(row.get("name") or "", 64)
+        for entry in nested.get("runs") or []:
+            if isinstance(entry, dict):
+                item = dict(entry)
+                item["host"] = host
+                runs.append(item)
+        for entry in nested.get("lanes") or []:
+            if isinstance(entry, dict):
+                item = dict(entry)
+                item["host"] = host
+                lanes.append(item)
+    return runs, lanes
 
 
 def _dimensions_for(observation, thresholds):
@@ -933,8 +1129,10 @@ def _dimensions_for(observation, thresholds):
         return {"%s" % kind: _unknown_dimension(kind, observation, observation["detail"])}
     if kind == "snapshot":
         lanes_raw = payload.get("lanes") if isinstance(payload.get("lanes"), list) else []
-        lane_items = _lane_items(lanes_raw, thresholds)
+        lane_items, lane_info = _bounded(_lane_items(lanes_raw, thresholds),
+                                          thresholds["max_records"])
         provider_items, unobserved = _provider_items(payload, lanes_raw, thresholds)
+        provider_items, provider_info = _bounded(provider_items, thresholds["max_records"])
         config_invalid = payload.get("lane_config_valid") is False
         lanes_detail = "no lane rows were reported"
         if lane_items:
@@ -944,6 +1142,7 @@ def _dimensions_for(observation, thresholds):
         lanes = {"status": _worst([item["status"] for item in lane_items]) if lane_items else UNKNOWN,
                  "detail": lanes_detail, "items": lane_items,
                  "observation": _observation_view(observation)}
+        _apply_truncation(lanes, lane_info)
         if config_invalid:
             lanes["status"] = UNHEALTHY
         providers = {"status": _worst([item["status"] for item in provider_items]) if provider_items else UNKNOWN,
@@ -951,6 +1150,7 @@ def _dimensions_for(observation, thresholds):
                      else "%d provider(s) observed" % len(provider_items),
                      "items": provider_items, "unobserved": unobserved,
                      "observation": _observation_view(observation)}
+        _apply_truncation(providers, provider_info)
         return {"snapshot": {"status": _worst([lanes["status"], providers["status"]]),
                              "detail": "fleet snapshot: %s" % lanes_detail,
                              "observation": _observation_view(observation),
@@ -959,52 +1159,64 @@ def _dimensions_for(observation, thresholds):
         hosts_raw = payload.get("hosts") if isinstance(payload.get("hosts"), list) else []
         runs_raw = payload.get("runs") if isinstance(payload.get("runs"), list) else []
         lanes_raw = payload.get("lanes") if isinstance(payload.get("lanes"), list) else []
+        nested_runs, nested_lanes = _nested_health_rows(hosts_raw)
+        run_rows = list(runs_raw) + nested_runs
+        lane_rows = list(lanes_raw) + nested_lanes
         blocks = {}
         if hosts_raw or "hosts" in payload:
-            items = _host_items(hosts_raw, thresholds)
+            items, info = _bounded(_host_items(hosts_raw, thresholds), thresholds["max_records"])
             blocks["hosts"] = _dimension(items,
                                          "%d host(s) reported" % len(items) if items
-                                         else "no host rows were reported", observation)
-        if runs_raw or "runs" in payload:
-            items = _run_items(runs_raw, thresholds)
+                                         else "no host rows were reported", observation, extra=info)
+        if run_rows or "runs" in payload:
+            items, info = _bounded(_run_items(run_rows, thresholds), thresholds["max_records"])
             blocks["runs"] = _dimension(items,
                                         "%d run(s) reported" % len(items) if items
-                                        else "no run rows were reported", observation)
-        if lanes_raw:
-            items = _lane_items(lanes_raw, thresholds)
+                                        else "no run rows were reported", observation, extra=info)
+        if lane_rows:
+            items, info = _bounded(_lane_items(lane_rows, thresholds), thresholds["max_records"])
             blocks["lanes"] = _dimension(items,
                                          "%d lane(s) reported" % len(items) if items
-                                         else "no lane rows were reported", observation)
+                                         else "no lane rows were reported", observation, extra=info)
         if not blocks:
             blocks["hosts"] = _unknown_dimension("hosts", observation, "health input carried no usable rows")
-        status = _worst([block["status"] for block in blocks.values()])
+        status = _fold_statuses([block["status"] for block in blocks.values()])
         return {"health": {"status": status, "detail": "fleet health: %d block(s)" % len(blocks),
                            "observation": _observation_view(observation), **blocks}}
     if kind == "quota":
-        items = _quota_items(payload, thresholds)
+        items, info = _bounded(_quota_items(payload, thresholds), thresholds["max_records"])
         metered = [item for item in items if item["status"] != NOT_METERED]
         unmetered = [item for item in items if item["status"] == NOT_METERED]
         block = _dimension(metered, "%d backend(s) reported" % len(metered) if metered
-                           else "no metered backend reported a quota", observation)
+                           else "no metered backend reported a quota", observation, extra=info)
         block["unmetered"] = unmetered
         if unmetered:
             block["detail"] += "; %d backend(s) are not metered" % len(unmetered)
         return {"quota": block}
     if kind == "probe":
         items, unobserved = _probe_items(payload, thresholds)
+        items, info = _bounded(items, thresholds["max_records"])
         block = _dimension(items, "%d backend(s) with quota evidence" % len(items) if items
-                           else "the probe state carries no quota evidence", observation)
+                           else "the probe state carries no quota evidence", observation, extra=info)
         block["unobserved"] = unobserved
         return {"probe": block}
     if kind == "resources":
-        items = _resource_items(payload, thresholds)
+        items, info = _bounded(_resource_items(payload, thresholds), thresholds["max_records"])
         block = _dimension(items, "%d host(s) reported" % len(items) if items
-                           else "no resource rows were reported", observation)
+                           else "no resource rows were reported", observation, extra=info)
         return {"resources": block}
     return {}
 
 
 # ---------------------------------------------------------------- snapshot assembly
+
+def _item_signals(dimension, item):
+    """The failure signals of one item, flagged with their confirmation."""
+    confirmed = not item.get("unconfirmed")
+    return [{"kind": kind, "dimension": dimension, "item": item.get("name"),
+             "detail": item.get("detail"), "confirmed": confirmed}
+            for kind in item.get("signals") or []]
+
 
 def _collect_signals(dimensions):
     """Cross-cutting failure signals, so one list shows every fault kind."""
@@ -1015,22 +1227,29 @@ def _collect_signals(dimensions):
             if not isinstance(inner, dict):
                 continue
             for item in inner.get("items") or []:
-                for kind in item.get("signals") or []:
-                    signals.append({"kind": kind, "dimension": name, "item": item.get("name"),
-                                    "detail": item.get("detail")})
+                signals.extend(_item_signals(name, item))
         for item in block.get("items") or []:
-            for kind in item.get("signals") or []:
-                signals.append({"kind": kind, "dimension": name, "item": item.get("name"),
-                                "detail": item.get("detail")})
+            signals.extend(_item_signals(name, item))
     return signals
+
+
+def _is_fresh(block):
+    """True when the input behind a dimension block is fresh evidence."""
+    return (block.get("observation") or {}).get("freshness") == "fresh"
 
 
 def _attribute_provider_failures(dimensions):
     """A provider failure seen in the quota rows also marks that backend's
-    provider, when the snapshot named one."""
+    provider, when the snapshot named one.
+
+    Only fresh evidence is attributed: a stale quota report must never
+    poison a provider that a fresh snapshot observed.
+    """
     snapshot = dimensions.get("snapshot")
     quota = dimensions.get("quota")
     if not isinstance(snapshot, dict) or not isinstance(quota, dict):
+        return
+    if not _is_fresh(snapshot) or not _is_fresh(quota):
         return
     providers = snapshot.get("providers")
     if not isinstance(providers, dict):
@@ -1055,6 +1274,22 @@ def _attribute_provider_failures(dimensions):
             provider["signals"] = sorted(set(provider.get("signals") or []) | set(kinds))
             provider["detail"] = "provider failure seen in the quota rows: %s" % item.get("detail")
             provider.setdefault("evidence", []).append("quota row for %s" % item.get("backend"))
+
+
+def _fold_statuses(statuses):
+    """Fold statuses; a set that holds nothing but drained items is drained.
+
+    `drained` is operator intent, not a missing observation: a fleet that is
+    only held is drained, not unknown.
+    """
+    if statuses and all(status == DRAINED for status in statuses):
+        return DRAINED
+    return _worst(statuses)
+
+
+def _status_with_drain(items):
+    """The status of a block whose items may all be drained."""
+    return _fold_statuses([item.get("status") for item in items])
 
 
 def _apply_scoped_drain(dimensions, drain_record):
@@ -1087,9 +1322,34 @@ def _apply_scoped_drain(dimensions, drain_record):
         item["detail"] = "host is manually drained (%s)" % (
             drain_record.get("reason") or "no reason recorded")
         item["signals"] = sorted(set(item.get("signals") or []) | {"manual_drain"})
-    hosts["status"] = _worst([item["status"] for item in hosts.get("items") or []])
-    health["status"] = _worst([health[block]["status"] for block in ("hosts", "runs", "lanes")
-                                if isinstance(health.get(block), dict)])
+    hosts["status"] = _status_with_drain(hosts.get("items") or [])
+    # the lanes and runs of the drained host belong to the drained host: they
+    # stop counting against the fleet verdict with it
+    for name in ("runs", "lanes"):
+        inner = health.get(name)
+        if not isinstance(inner, dict):
+            continue
+        for item in inner.get("items") or []:
+            if item.get("host") != target:
+                continue
+            item["status"] = DRAINED
+            item["detail"] = "host %s is manually drained (%s)" % (
+                target, drain_record.get("reason") or "no reason recorded")
+            item["signals"] = sorted(set(item.get("signals") or []) | {"manual_drain"})
+        inner["status"] = _status_with_drain(inner.get("items") or [])
+    health["status"] = _fold_statuses([health[block]["status"] for block in ("hosts", "runs", "lanes")
+                                       if isinstance(health.get(block), dict)])
+
+
+def _block_items(block):
+    """Every item of a block, including the items of its sub-blocks."""
+    items = []
+    for sub in ("lanes", "hosts", "runs", "providers"):
+        inner = block.get(sub)
+        if isinstance(inner, dict):
+            items.extend(inner.get("items") or [])
+    items.extend(block.get("items") or [])
+    return items
 
 
 def _mark_unconfirmed(blocks, observation):
@@ -1097,7 +1357,8 @@ def _mark_unconfirmed(blocks, observation):
 
     Its items stay in the snapshot as unconfirmed evidence, but they never
     count as a healthy signal and never escalate into a fault: acting on
-    evidence nobody can date would be guessing.
+    evidence nobody can date would be guessing. The status each item had is
+    kept next to it, so nothing is silently rewritten.
     """
     note = "input is %s (%s)" % (observation["freshness"], observation["detail"] or "no detail")
     for block in blocks.values():
@@ -1108,11 +1369,26 @@ def _mark_unconfirmed(blocks, observation):
             if isinstance(inner, dict):
                 inner["status"] = UNKNOWN
                 inner["detail"] = (inner.get("detail", "") + "; " if inner.get("detail") else "") + note
+        for item in _block_items(block):
+            item["unconfirmed"] = True
+            item["unconfirmed_status"] = item.get("status")
+            item["status"] = UNKNOWN
 
 
-def build_snapshot(observations, thresholds, now=None, drain_record=None, required=()):
-    """Assemble the versioned health snapshot from the input observations."""
-    now = now if now is not None else now_ts()
+def _missing_required(required, fresh):
+    """The required input slots that carry no fresh evidence."""
+    missing = []
+    for name in required:
+        if name == "fleet":
+            if not fresh & {"snapshot", "health"}:
+                missing.append("fleet")
+        elif name not in fresh:
+            missing.append(name)
+    return missing
+
+
+def _dimensions_from_observations(observations, thresholds):
+    """The dimension blocks of every observation that carried something."""
     dimensions = {}
     for observation in observations:
         if observation["status"] == "not_provided":
@@ -1121,6 +1397,12 @@ def build_snapshot(observations, thresholds, now=None, drain_record=None, requir
         if observation["status"] == "ok" and observation["freshness"] != "fresh":
             _mark_unconfirmed(blocks, observation)
         dimensions.update(blocks)
+    return dimensions
+
+
+def _assemble(dimensions, observations, thresholds, now, drain_record=None, required=(),
+              drain_error=None):
+    """Fold the dimension blocks into the overall verdict of one snapshot."""
     _apply_scoped_drain(dimensions, drain_record)
     _attribute_provider_failures(dimensions)
     signals = _collect_signals(dimensions)
@@ -1128,16 +1410,10 @@ def build_snapshot(observations, thresholds, now=None, drain_record=None, requir
     usable = {observation["kind"] for observation in observations if observation["status"] == "ok"}
     fresh = {observation["kind"] for observation in observations
              if observation["status"] == "ok" and observation["freshness"] == "fresh"}
-    missing_required = []
-    for name in required:
-        if name == "fleet":
-            if not fresh & {"snapshot", "health"}:
-                missing_required.append("fleet")
-        elif name not in fresh:
-            missing_required.append(name)
+    missing_required = _missing_required(required, fresh)
 
     evaluated = [block["status"] for block in dimensions.values()]
-    transient = _worst(evaluated) if evaluated else UNKNOWN
+    transient = _fold_statuses(evaluated) if evaluated else UNKNOWN
     reasons = []
     if not dimensions:
         reasons.append("no observation input was provided")
@@ -1146,8 +1422,20 @@ def build_snapshot(observations, thresholds, now=None, drain_record=None, requir
             if block["status"] in (DEGRADED, UNHEALTHY, UNKNOWN):
                 reasons.append("%s=%s" % (name, block["status"]))
     if missing_required:
-        transient = UNKNOWN
-        reasons.insert(0, "required input missing: %s" % ", ".join(sorted(missing_required)))
+        note = "required input missing: %s" % ", ".join(sorted(missing_required))
+        if transient == HEALTHY:
+            # nothing was verified, so the verdict stays unknown ...
+            transient = UNKNOWN
+        else:
+            # ... but evidence that *was* verified is never erased by
+            # evidence that is missing.
+            note += " (a verified status is never erased by missing evidence)"
+        reasons.insert(0, note)
+    if drain_error:
+        note = "manual drain record is unreadable: %s" % drain_error
+        if transient == HEALTHY:
+            transient = UNKNOWN
+        reasons.insert(0, note)
     if drain_record and drain_record.get("active") and drain_record.get("scope") == "fleet":
         overall = DRAINED
     else:
@@ -1169,6 +1457,9 @@ def build_snapshot(observations, thresholds, now=None, drain_record=None, requir
                         if observation["status"] == "ok" and observation["freshness"] != "fresh"),
         "dimensions": sorted(dimensions),
         "missing_required": sorted(missing_required),
+        "required": sorted(required),
+        "truncated": sorted(name for name, block in dimensions.items()
+                            if block.get("truncated") or _has_truncated_sub(block)),
     }
     return {
         "schema": SCHEMA,
@@ -1184,6 +1475,23 @@ def build_snapshot(observations, thresholds, now=None, drain_record=None, requir
         "signals": signals,
         "manual_drain": drain_view,
     }
+
+
+def _has_truncated_sub(block):
+    """True when a sub-block of a dimension was cut off by the record limit."""
+    for sub in ("lanes", "hosts", "runs", "providers"):
+        inner = block.get(sub)
+        if isinstance(inner, dict) and inner.get("truncated"):
+            return True
+    return False
+
+
+def build_snapshot(observations, thresholds, now=None, drain_record=None, required=()):
+    """Assemble the versioned health snapshot from the input observations."""
+    now = now if now is not None else now_ts()
+    dimensions = _dimensions_from_observations(observations, thresholds)
+    return _assemble(dimensions, observations, thresholds, now, drain_record=drain_record,
+                      required=list(required))
 
 
 def _overall_confidence(observations, dimensions):
@@ -1216,23 +1524,128 @@ def _drain_view(record):
             "by": record.get("by")}
 
 
+# ---------------------------------------------------------------- the state lock
+
+_LOCK_LOCAL = threading.local()
+
+
+def _lock_handle(handle):
+    """Take an exclusive advisory lock on an open file descriptor."""
+    if fcntl is not None:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        return
+    try:  # pragma: no cover - exercised on Windows only
+        os.lseek(handle, 0, os.SEEK_SET)
+    except OSError:
+        pass
+    try:  # pragma: no cover - exercised on Windows only
+        msvcrt.locking(handle, msvcrt.LK_LOCK, 1)
+    except OSError as error:  # pragma: no cover - exercised on Windows only
+        raise OSError("cannot lock the guardian state: %s" % (error.strerror or error))
+
+
+def _unlock_handle(handle):
+    """Release an advisory lock taken by _lock_handle()."""
+    if fcntl is not None:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        return
+    try:  # pragma: no cover - exercised on Windows only
+        os.lseek(handle, 0, os.SEEK_SET)
+        msvcrt.locking(handle, msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _state_lock(state_dir, create=False):
+    """Serialise the guardian's state updates between threads and processes.
+
+    The lock is an advisory file lock on `<state-dir>/state.lock`. It only
+    guards the guardian's own state files; nothing else is touched. A thread
+    that already holds the lock re-enters it instead of deadlocking on
+    itself, so the public helpers can be composed freely.
+    """
+    if not state_dir:
+        yield
+        return
+    depth = getattr(_LOCK_LOCAL, "depth", 0)
+    if depth:
+        _LOCK_LOCAL.depth = depth + 1
+        try:
+            yield
+        finally:
+            _LOCK_LOCAL.depth = depth
+        return
+    directory = os.path.abspath(state_dir)
+    if not os.path.isdir(directory):
+        if not create:
+            # nothing is written into a directory that does not exist, so
+            # there is nothing to synchronise either.
+            yield
+            return
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    handle = None
+    try:
+        handle = os.open(os.path.join(directory, LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o600)
+        if os.fstat(handle).st_size == 0:
+            # a lock needs a byte to lock on Windows
+            os.write(handle, b"\0")
+        _lock_handle(handle)
+        _LOCK_LOCAL.depth = 1
+        yield
+    finally:
+        _LOCK_LOCAL.depth = 0
+        if handle is not None:
+            try:
+                _unlock_handle(handle)
+            except OSError:
+                pass
+            os.close(handle)
+
+
 # ---------------------------------------------------------------- persistence
 
+def _clean_stale_temps(directory, prefix, now=None):
+    """Remove the temporary files a crashed write left behind."""
+    now = now if now is not None else now_ts()
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(prefix) or not name.endswith(".tmp"):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            if now - os.path.getmtime(path) < STALE_TEMP_SECONDS:
+                continue
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def _atomic_write_json(path, payload):
-    """Write JSON so a reader never sees a half-written file."""
+    """Write JSON so a reader never sees a half-written file.
+
+    The temporary file name is unique (it is created with `mkstemp`), so two
+    writers in the same process - or two processes - never share a scratch
+    file, and the rename onto the target is atomic on every platform.
+    """
     directory = os.path.dirname(os.path.abspath(path))
     if directory:
         os.makedirs(directory, mode=0o700, exist_ok=True)
-    temporary = os.path.join(directory, ".%s.tmp-%d" % (os.path.basename(path), os.getpid()))
+    prefix = ".%s." % os.path.basename(path)
+    _clean_stale_temps(directory, prefix)
+    handle, temporary = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=directory or None)
     try:
-        with open(temporary, "w", encoding="utf-8") as stream:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
             json.dump(payload, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
-    except OSError:
+    except BaseException:
         try:
             os.unlink(temporary)
         except OSError:
@@ -1248,32 +1661,154 @@ def _atomic_write_json(path, payload):
         pass
 
 
-def save_snapshot(state_dir, snapshot):
-    """Persist the snapshot atomically; returns the file path."""
+def _write_snapshot(state_dir, snapshot):
+    """Write the snapshot file. The caller holds the state lock."""
     path = os.path.join(state_dir, SNAPSHOT_FILE)
     _atomic_write_json(path, snapshot)
     return path
 
 
-def load_snapshot(state_dir):
-    """Read the persisted snapshot back (restart-readable)."""
-    path = os.path.join(state_dir, SNAPSHOT_FILE)
+def save_snapshot(state_dir, snapshot):
+    """Persist the snapshot atomically; returns the file path."""
+    with _state_lock(state_dir, create=True):
+        return _write_snapshot(state_dir, snapshot)
+
+
+def _observation_from_view(view):
+    """Rebuild an observation record from a persisted observation view."""
+    if not isinstance(view, dict):
+        return None
+    return {"kind": view.get("kind"), "path": view.get("path"),
+            "status": view.get("status") or "not_provided",
+            "detail": view.get("detail") or "", "payload": None,
+            "observed_at": view.get("observed_at"),
+            "timestamp_source": view.get("timestamp_source"),
+            "age_seconds": view.get("age_seconds"),
+            "freshness": view.get("freshness") or UNKNOWN,
+            "confidence": view.get("confidence") or "none"}
+
+
+def _refresh_observation(record, thresholds, now):
+    """Re-evaluate the freshness of a persisted observation."""
+    if record is None or record.get("status") == "not_provided":
+        return record
+    stamp = record.get("observed_at")
+    if stamp is None:
+        record["age_seconds"] = None
+        record["freshness"] = UNKNOWN
+        record["confidence"] = "low" if record.get("status") == "ok" else "none"
+        return record
+    stamp = float(stamp)
+    if stamp > now + MAX_FUTURE_SKEW_SECONDS:
+        record["status"] = "invalid"
+        record["detail"] = "persisted observation timestamp is in the future"
+        record["observed_at"] = None
+        record["age_seconds"] = None
+        record["freshness"] = UNKNOWN
+        record["confidence"] = "none"
+        return record
+    age = now - stamp
+    if age < 0:
+        age = 0.0
+    record["observed_at"] = stamp
+    record["age_seconds"] = round(age, 3)
+    if record.get("timestamp_source") == "ingest":
+        record["freshness"] = UNKNOWN
+    elif age > thresholds["max_age_seconds"]:
+        record["freshness"] = "stale"
+    else:
+        record["freshness"] = "fresh"
+    record["confidence"] = _input_confidence(record)
+    return record
+
+
+def _reevaluate(payload, state_dir, now=None, thresholds=None):
+    """Re-evaluate a persisted snapshot against the current time and state.
+
+    A snapshot is a point-in-time verdict: the inputs it was built from age
+    while the controller is down, and the manual drain can be changed while
+    it is down. Reading it back therefore re-checks both, so a restarted
+    controller never acts on evidence that went stale and never reports a
+    drain that was already lifted.
+    """
+    now = now if now is not None else now_ts()
+    stored = payload.get("thresholds")
+    merged = dict(DEFAULT_THRESHOLDS)
+    if isinstance(stored, dict):
+        merged.update({key: value for key, value in stored.items() if key in DEFAULT_THRESHOLDS})
+    if thresholds:
+        merged.update({key: value for key, value in thresholds.items() if key in DEFAULT_THRESHOLDS})
+    dimensions = payload.get("dimensions")
+    if not isinstance(dimensions, dict):
+        dimensions = {}
+    views = (payload.get("coverage") or {}).get("inputs") or []
+    observations = []
+    for view in views:
+        record = _observation_from_view(view)
+        if record is not None:
+            observations.append(_refresh_observation(record, merged, now))
+    by_kind = {record["kind"]: record for record in observations if record.get("kind")}
+    for name, block in dimensions.items():
+        if not isinstance(block, dict):
+            continue
+        observation = by_kind.get((block.get("observation") or {}).get("kind"))
+        if observation is None:
+            continue
+        view = _observation_view(observation)
+        block["observation"] = view
+        for sub in ("lanes", "hosts", "runs", "providers"):
+            inner = block.get(sub)
+            if isinstance(inner, dict):
+                inner["observation"] = view
+        if observation["status"] == "ok" and observation["freshness"] != "fresh":
+            _mark_unconfirmed({name: block}, observation)
+    drain_record = None
+    drain_error = None
     try:
-        with open(path, encoding="utf-8") as stream:
-            payload = json.load(stream)
-    except FileNotFoundError:
-        raise GuardianError("no health snapshot in %s" % state_dir)
-    except OSError as error:
-        raise GuardianError("health snapshot in %s is unreadable: %s" % (state_dir, error.strerror or error))
-    except ValueError as error:
-        raise GuardianError("health snapshot in %s is corrupt: %s" % (state_dir, error))
-    if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
-        raise GuardianError("health snapshot in %s has an unsupported schema" % state_dir)
-    version = payload.get("schema_version")
-    if version != SCHEMA_VERSION:
-        raise GuardianError("health snapshot schema version %r is not supported (expected %d)"
-                            % (version, SCHEMA_VERSION))
-    return payload
+        drain_record = load_drain(state_dir)
+    except GuardianError as error:
+        drain_error = str(error)
+    required = (payload.get("coverage") or {}).get("required") or []
+    assembled = _assemble(dimensions, observations, merged, now, drain_record=drain_record,
+                          required=required, drain_error=drain_error)
+    result = dict(payload)
+    result["overall"] = assembled["overall"]
+    result["coverage"] = assembled["coverage"]
+    result["dimensions"] = assembled["dimensions"]
+    result["signals"] = assembled["signals"]
+    result["manual_drain"] = assembled["manual_drain"]
+    result["reevaluated_at"] = now
+    result["reevaluated_at_iso"] = iso(now)
+    return result
+
+
+def load_snapshot(state_dir, now=None, thresholds=None):
+    """Read the persisted snapshot back (restart-readable).
+
+    The snapshot is re-evaluated on read: the freshness of its inputs and
+    the current manual drain are checked again, so what a restarted
+    controller reads is what is true now, not what was true when the
+    snapshot was written.
+    """
+    path = os.path.join(state_dir, SNAPSHOT_FILE)
+    with _state_lock(state_dir):
+        try:
+            with open(path, encoding="utf-8") as stream:
+                payload = json.load(stream)
+        except FileNotFoundError:
+            raise GuardianError("no health snapshot in %s" % state_dir)
+        except OSError as error:
+            raise GuardianError("health snapshot in %s is unreadable: %s"
+                                % (state_dir, error.strerror or error))
+        except ValueError as error:
+            raise GuardianError("health snapshot in %s is corrupt: %s" % (state_dir, error))
+        if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
+            raise GuardianError("health snapshot in %s has an unsupported schema" % state_dir)
+        version = payload.get("schema_version")
+        if version != SCHEMA_VERSION:
+            raise GuardianError("health snapshot schema version %r is not supported (expected %d)"
+                                % (version, SCHEMA_VERSION))
+        return _reevaluate(payload, state_dir, now=now, thresholds=thresholds)
 
 
 def load_drain(state_dir):
@@ -1308,18 +1843,20 @@ def drain(state_dir, reason, by=None, host=None, now=None):
               "scope": "host" if host else "fleet", "target": host or None,
               "reason": reason, "by": _short(by or "operator", 64),
               "since": now, "since_iso": iso(now)}
-    _atomic_write_json(os.path.join(state_dir, DRAIN_FILE), record)
+    with _state_lock(state_dir, create=True):
+        _atomic_write_json(os.path.join(state_dir, DRAIN_FILE), record)
     return record
 
 
 def undrain(state_dir, now=None):
     """Clear a manual drain. The record is kept for audit."""
-    record = load_drain(state_dir)
     now = now if now is not None else now_ts()
-    if record is None:
-        return {"active": False, "cleared": False, "detail": "no manual drain was recorded"}
-    cleared = dict(record, active=False, cleared_at=now, cleared_at_iso=iso(now))
-    _atomic_write_json(os.path.join(state_dir, DRAIN_FILE), cleared)
+    with _state_lock(state_dir, create=True):
+        record = load_drain(state_dir)
+        if record is None:
+            return {"active": False, "cleared": False, "detail": "no manual drain was recorded"}
+        cleared = dict(record, active=False, cleared_at=now, cleared_at_iso=iso(now))
+        _atomic_write_json(os.path.join(state_dir, DRAIN_FILE), cleared)
     return cleared
 
 
@@ -1342,13 +1879,17 @@ def observe(inputs=None, thresholds=None, state_dir=None, now=None, persist=True
     for kind in INPUT_KINDS:
         observations.append(read_input(kind, inputs.get(kind), thresholds, now=now,
                                        observed_at=observed_at))
-    if drain_record is None and state_dir:
-        drain_record = load_drain(state_dir)
     required = list(require)
     if require_fleet:
         required.append("fleet")
-    snapshot = build_snapshot(observations, thresholds, now=now, drain_record=drain_record,
-                              required=required)
-    if persist:
-        save_snapshot(state_dir, snapshot)
+    # The drain record and the snapshot are read and written under one lock,
+    # so a concurrent drain (or undrain) can never be half-applied to the
+    # snapshot that is written next to it.
+    with _state_lock(state_dir, create=bool(persist)):
+        if drain_record is None and state_dir:
+            drain_record = load_drain(state_dir)
+        snapshot = build_snapshot(observations, thresholds, now=now, drain_record=drain_record,
+                                  required=required)
+        if persist:
+            _write_snapshot(state_dir, snapshot)
     return snapshot
