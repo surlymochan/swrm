@@ -19355,7 +19355,26 @@ def cmd_regress_compare(args):
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
 
+def _configure_utf8_output():
+    """Reconfigure stdout/stderr to UTF-8 (Windows: console defaults to cp1252).
+
+    `intake decisions --json` prints ensure_ascii=False JSON that can contain
+    non-ASCII text (e.g. Chinese in decision reasons); on Windows the default
+    cp1252 stdout raises UnicodeEncodeError ('charmap' codec can't encode).
+    POSIX is unaffected (already UTF-8). Never fatal: a replaced or
+    non-reconfigurable stream is left alone.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is not None:
+                reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main():
+    _configure_utf8_output()
     ap = argparse.ArgumentParser(prog="openswarm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     # Declarative custom backends (M3 slice 1, #101): route/run accept them,
