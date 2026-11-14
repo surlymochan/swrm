@@ -4395,6 +4395,72 @@ def resets_left(policy):
     return int((policy.get("codex") or {}).get("manual_resets_remaining") or 0)
 
 
+# Opt-in, explicitly time-bounded Codex usage-independent window
+# (`codex.usage_independent_until` in policy.json / policy.local.json).
+# While the window is active the recommended Codex concurrency comes from
+# the configured backend cap (concurrency.codex) instead of the observed
+# Codex usage window, and the observed usage window / the remaining quota
+# inferred from it neither exclude Codex nor degrade its effort. The
+# window is strictly bounded in UTC: before the deadline it is active, at
+# the deadline and after it the default behaviour returns. A missing or
+# malformed setting fails safe to the default behaviour — it never
+# raises and never invents an active window.
+CODEX_USAGE_INDEPENDENT_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$")
+
+
+def codex_usage_independent_until(policy):
+    """The UTC deadline of the opt-in Codex usage-independent window.
+
+    Returns the deadline as epoch seconds, or None when the setting is
+    absent, empty, not a string, or not a strict UTC instant
+    ("YYYY-MM-DDTHH:MM:SSZ"). Offsets other than UTC are rejected on
+    purpose: the deadline is compared against UTC everywhere.
+    """
+    raw = (policy.get("codex") or {}).get("usage_independent_until")
+    if not isinstance(raw, str):
+        return None
+    match = CODEX_USAGE_INDEPENDENT_RE.match(raw.strip())
+    if not match:
+        return None
+    try:
+        micros = int((match.group(7) or "").ljust(6, "0")[:6] or 0)
+        when = dt.datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)),
+                           int(match.group(4)), int(match.group(5)), int(match.group(6)),
+                           micros, tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+    return when.timestamp()
+
+
+def codex_usage_independent(policy):
+    """True while the opt-in Codex usage-independent window is active.
+
+    Strictly bounded: active only while now < the deadline; at the
+    deadline and after it the default behaviour returns. The clock is
+    the injected NOW(), so a test can pin it instead of waiting.
+    """
+    deadline = codex_usage_independent_until(policy)
+    if deadline is None:
+        return False
+    return NOW() < deadline
+
+
+def codex_concurrency_cap(policy):
+    """The configured Codex backend cap (policy.concurrency.codex), or None.
+
+    Only a positive integer counts. A missing or malformed cap means
+    "no configured cap": the usage-independent window then keeps the
+    default behaviour instead of inventing a capacity.
+    """
+    configured = policy.get("concurrency") or {}
+    if not isinstance(configured, dict):
+        return None
+    value = configured.get("codex")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def plan_codex(prof, st, policy, forced, notes):
     cx = st["codex"]
     th = policy["thresholds"]
@@ -4426,7 +4492,12 @@ def plan_codex(prof, st, policy, forced, notes):
         m = cands[0]
         lim = (cx["limits"].get(m["limit_id"]) or {})
         w = worst_window(lim.get("windows"))
-        if w:
+        # Opt-in usage-independent window: the observed Codex usage
+        # window neither excludes Codex nor shifts its effort. Real
+        # provider limits (breakers, model availability, hard caps) are
+        # untouched.
+        usage_independent = bool(w) and codex_usage_independent(policy)
+        if w and not usage_independent:
             if w["used"] >= th["window_hard"]:
                 notes.append(f"codex limit {m['limit_id']} at {w['used']:.0%} >= hard {th['window_hard']:.0%}")
                 if resets_left(policy):
@@ -4445,7 +4516,7 @@ def plan_codex(prof, st, policy, forced, notes):
                   and w["used"] < th["upgrade_if_used_below"]):
                 effort = shift_effort(effort, +1, policy)
                 notes.append(f"codex window resets in {w['hours_to_reset']}h with {w['used']:.0%} used: effort +1")
-        else:
+        elif not w:
             notes.append("codex quota unknown (no recent rollout); using defaults")
         if t != tier:
             notes.append(f"codex tier {tier} unavailable, using {t}")
@@ -4453,6 +4524,8 @@ def plan_codex(prof, st, policy, forced, notes):
             effort = config["default_effort"]
             if effort not in m["efforts"]:
                 return None, f"configured Codex effort {effort} is unavailable for {required_model}"
+        if usage_independent:
+            notes.append("codex usage window ignored (usage-independent window active)")
         return {"backend": "codex", "model": m["id"], "effort": clamp_effort(effort, m["efforts"], policy),
                 "tier": t, "limit_id": m["limit_id"]}, None
     return None, "codex unavailable (limits/breakers)"
@@ -5413,6 +5486,20 @@ def builtin_quota_remaining(backend, st):
     return None, None, None
 
 
+def codex_quota_signal_ignored(policy, backend, cfg):
+    """True when the Codex quota signal must not exclude Codex.
+
+    While the opt-in usage-independent window is active, the remaining
+    quota inferred from the observed Codex usage windows never excludes
+    Codex. An explicitly configured source (routing.quota.sources.codex)
+    stays authoritative: that is a deliberate reading of a real quota,
+    not a usage inference.
+    """
+    if backend != "codex" or not codex_usage_independent(policy):
+        return False
+    return backend not in ((cfg or {}).get("sources") or {})
+
+
 def quota_remaining_for_backend(backend, cfg, custom_backends=(), st=None):
     """Remaining quota for one backend: (remaining, error).
 
@@ -5593,6 +5680,12 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
     while True:
         backend = current["backend"]
         remaining, error = quota_remaining_for_backend(backend, cfg, custom_backends, st)
+        ignored = codex_quota_signal_ignored(policy, backend, cfg)
+        if ignored:
+            # Opt-in usage-independent window: the Codex quota inferred
+            # from the observed usage windows is not a reason to exclude
+            # Codex. Unknown, never zero.
+            remaining, error = None, None
         if error is not None:
             errors[backend] = error
             if not tried:
@@ -5612,11 +5705,15 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
         checked[backend] = remaining
         if remaining is None or remaining > threshold:
             if not tried:
+                if ignored:
+                    why = (f"{backend} usage-independent window active: inferred quota ignored; "
+                           "kept the default pick")
+                elif remaining is None:
+                    why = f"{backend} quota unknown; kept the default pick"
+                else:
+                    why = f"{backend} remaining {remaining} is above threshold {threshold}"
                 return current, {**base, "applied": False, "quota_before": checked,
-                                 "reason": ((f"{backend} quota unknown; kept the default pick"
-                                             if remaining is None else
-                                             f"{backend} remaining {remaining} is above threshold {threshold}")
-                                            + veto_note)}
+                                 "reason": why + veto_note}
             rerouted = dict(current)
             rerouted["quota_rerouted_from"] = decision["backend"]
             return rerouted, {**base, "applied": True, "rerouted": True,
@@ -6231,10 +6328,18 @@ def claude_mode(st, policy):
 def concurrency(st, policy):
     w = worst_window((st["codex"]["limits"].get("codex") or {}).get("windows"))
     u = w["used"] if w else 0.5
+    recommended = {"codex": 1, "ocgo": 1}
     for row in policy.get("recommended_concurrency", []):
         if u < row["codex_used_below"]:
-            return {"codex": row["codex"], "ocgo": row["ocgo"]}
-    return {"codex": 1, "ocgo": 1}
+            recommended = {"codex": row["codex"], "ocgo": row["ocgo"]}
+            break
+    cap = codex_concurrency_cap(policy)
+    if cap is not None and codex_usage_independent(policy):
+        # Opt-in usage-independent window: the recommended Codex
+        # concurrency is the configured backend cap, never a value
+        # derived from the observed Codex usage or quota.
+        recommended["codex"] = cap
+    return recommended
 
 
 def route(prof, st, policy, exclude=(), custom_backends=()):
