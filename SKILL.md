@@ -318,7 +318,7 @@ Grouped by what the command does. `openswarm <command> --help` lists every flag.
 | `ingest-claude` | Record Claude plan usage from the statusline hook or from flags. | `$XS ingest-claude --five-hour 80 --seven-day 40` |
 | `fleet status` | Show reachability, paused hosts, lanes, and active runs. | `$XS fleet status --json` |
 | `fleet health` | Per-run alive/dead/zombie verdicts with evidence pointers (ledger line, pid identity, last activity); read-only by default, `--reap` explicitly reaps dead runs (M11 semantics, one ledger line per reap; zombie/alive/unknown are reported as skipped). | `$XS fleet health --json` |
-| `fleet exec` | Run an swrm command on another host; stdout and the exit code are forwarded. | `$XS fleet exec worker -- lane status` |
+| `fleet exec` | Run an swrm command on another host; stdout and the exit code are forwarded. A forwarded `run` can be health-gated at the controller (`fleet exec --health-gate <host> -- run ...`, M25 #204; off by default): an unhealthy effective backend is refused before forwarding, never rerouted. | `$XS fleet exec worker -- lane status` |
 | `fleet ledger pull` | Merge the host ledgers into one fleet ledger file. | `$XS fleet ledger pull --hosts worker,sandbox` |
 
 ### Learn
