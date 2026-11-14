@@ -284,6 +284,7 @@ Grouped by what the command does. `openswarm <command> --help` lists every flag.
 | `run` | Route, execute in an isolated worktree, verify on the host, record the ledger entry. Add `--scope host` for host operations. | `$XS run --scope host --cwd ~/code/myrepo --task-file /tmp/task.md` |
 | `run --detach` | Run in the background and print the run id to watch. | `$XS run --detach --cwd ~/code/myrepo --verify 'pytest -q' --task-file /tmp/task.md` |
 | `run --rework-of` | Resume an earlier run's task as a rework, linked in the ledger as `rework_of`. | `$XS run --rework-of <run-id> --cwd ~/code/myrepo --task-file /tmp/task.md` |
+| `run --health-gate` | Pre-dispatch health gate (M24, #198; off by default): probe the selected backend before dispatch (login/session, quota readable, transport reachable, per backend type); refuse when unhealthy (`health_gate_blocked`, exit 2), never reroute; `--no-health-gate` forces it off, `--skip-health-gate` bypasses it for one run (bypass recorded in ledger/result). | `$XS run --health-gate --dry-run --cwd ~/code/myrepo --task-file /tmp/task.md` |
 | `stop` | Kill a running executor; partial work stays on its branch. | `$XS stop <run-id>` |
 | `lane up` | Start the configured lane supervisors. | `$XS lane up C1 K1` |
 | `lane assign` | Give one task to an idle lane; returns the run id. Supports `--scope repo|host`. | `$XS lane assign C1 --scope host --task-file /tmp/task.md` |

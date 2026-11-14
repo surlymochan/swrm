@@ -62,6 +62,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import statistics
 import subprocess
 import sys
@@ -5629,6 +5630,473 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
         current = nxt
 
 
+# ---------------------------------------------------------------- health gate (M24 slice 1, #198)
+# Pre-dispatch backend health gate for `openswarm run`: before any exec
+# attempt, probe the selected backend (login/session alive, quota probe
+# readable, transport reachable — whichever applies to that backend type)
+# and refuse to dispatch an unhealthy one. A refusal never reroutes to
+# another backend silently, and an explicit --backend is gated exactly
+# like a routed pick. The gate is read-only: probes never write backend
+# state, never start a session, never spend quota, and never read a
+# credential value (only its presence, or a provider error string).
+#
+# Shipped default is enabled=false (routing.health_gate in policy.json):
+# the mechanism is present, behaviour is byte-identical to today until
+# slice 2 decides whether to flip it on (M9/M16/M19 pattern). Enabling is
+# by config or by the --health-gate flag; --no-health-gate forces it off
+# for one run; --skip-health-gate bypasses it for one run and the bypass
+# itself is recorded in the ledger and result.json.
+#
+# Timeout: each backend's whole probe is bounded by timeout_seconds
+# (default 10, configurable 1..120). A probe that cannot finish in time
+# is verdict "unknown", never a silent allow or a silent block: the
+# unknown verdict is recorded in the ledger/result, and what happens next
+# is the configured on_unknown posture ("allow" by default, "block" if
+# set). The posture is pinned by tests, not by the dispatch path.
+#
+# Policy shape (policy.json, routing.health_gate):
+#   {"enabled": false, "timeout_seconds": 10, "on_unknown": "allow"}
+# Batch/fleet paths are untouched: the gate only runs in cmd_run's
+# single-dispatch path (initial pick + fallback re-route). The auto-rework
+# escalation pick is not gated in this slice (known gap, see README).
+
+HEALTH_GATE_DEFAULT_TIMEOUT_SECONDS = 10
+HEALTH_GATE_TIMEOUT_MIN_SECONDS = 1
+HEALTH_GATE_TIMEOUT_MAX_SECONDS = 120
+HEALTH_GATE_ON_UNKNOWN_VALUES = ("allow", "block")
+
+
+def health_gate_config(policy):
+    """Validate routing.health_gate → {"enabled", "timeout_seconds", "on_unknown"}.
+
+    Missing section means disabled with a 10s timeout and on_unknown
+    "allow". Any invalid value raises ValueError: a health-gate config
+    that cannot be read must fail loudly, never dispatch on a misread
+    timeout or posture.
+    """
+    raw = (policy.get("routing") or {}).get("health_gate") or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"routing.health_gate must be an object with 'enabled', 'timeout_seconds' "
+                         f"and 'on_unknown', got {type(raw).__name__}; "
+                         f"fix policy.json or remove the block")
+    unknown = sorted(set(raw) - {"enabled", "timeout_seconds", "on_unknown"})
+    if unknown:
+        raise ValueError(f"routing.health_gate: unknown field(s) {', '.join(unknown)}; allowed fields are "
+                         f"enabled, timeout_seconds, on_unknown")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"routing.health_gate.enabled must be a boolean, got {enabled!r}")
+    timeout_seconds = raw.get("timeout_seconds", HEALTH_GATE_DEFAULT_TIMEOUT_SECONDS)
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+        raise ValueError(f"routing.health_gate.timeout_seconds must be a number between "
+                         f"{HEALTH_GATE_TIMEOUT_MIN_SECONDS} and {HEALTH_GATE_TIMEOUT_MAX_SECONDS}, "
+                         f"got {timeout_seconds!r}")
+    if not HEALTH_GATE_TIMEOUT_MIN_SECONDS <= timeout_seconds <= HEALTH_GATE_TIMEOUT_MAX_SECONDS:
+        raise ValueError(f"routing.health_gate.timeout_seconds must be between "
+                         f"{HEALTH_GATE_TIMEOUT_MIN_SECONDS} and {HEALTH_GATE_TIMEOUT_MAX_SECONDS}, "
+                         f"got {timeout_seconds!r}")
+    on_unknown = raw.get("on_unknown", "allow")
+    if on_unknown not in HEALTH_GATE_ON_UNKNOWN_VALUES:
+        raise ValueError(f"routing.health_gate.on_unknown must be one of "
+                         f"{', '.join(HEALTH_GATE_ON_UNKNOWN_VALUES)}, got {on_unknown!r}")
+    return {"enabled": enabled, "timeout_seconds": timeout_seconds, "on_unknown": on_unknown}
+
+
+def _health_check(name, status, detail, evidence):
+    """One probe check: status is pass/fail/unknown/timeout/not_applicable.
+
+    `detail` is the human-readable finding; `evidence` is the pointer a
+    later reader can re-check (command run, file read, probe-state field).
+    No credential value ever lands in either string.
+    """
+    return {"name": name, "status": status, "detail": detail, "evidence": evidence}
+
+
+def _health_binary_for_backend(backend, st, policy, custom_backends=()):
+    """(binary_or_None, known_bool, evidence) for the backend's executable.
+
+    The probe state cmd_run already routed on wins: re-resolving a binary
+    here would re-run slow discovery (codex --version + features list).
+    `known` is False only when the state carries no section for the
+    backend at all — then the binary is unknown, never assumed missing.
+    """
+    if isinstance(st, dict) and isinstance(st.get(backend), dict):
+        known = True
+        section = st[backend]
+    else:
+        known = False
+        section = {}
+    binary = section.get("binary")
+    if backend == "deepseek" and binary is None:
+        # DeepSeek runs through the opencode binary; probe_deepseek
+        # carries no binary of its own.
+        binary = ((st.get("ocgo") or {}).get("binary") if isinstance(st, dict) else None)
+    if backend == "codex":
+        evidence = "probe state: codex.binary"
+    elif backend == "pi":
+        evidence = "probe state: pi.binary"
+    elif backend in ("ocgo", "deepseek"):
+        evidence = "probe state: ocgo.binary (opencode runs deepseek too)"
+    elif backend == "cursor":
+        evidence = "probe state: cursor.binary"
+    elif backend == "agy":
+        evidence = "probe state: agy.binary"
+    elif backend == "copilot":
+        binary = copilot_bin()
+        known = True
+        evidence = "copilot binary lookup"
+    elif backend == "hermes":
+        binary = hermes_bin(policy)
+        known = True
+        evidence = "policy hermes.binary"
+    else:
+        for entry in custom_backends or ():
+            if entry["id"] == backend:
+                command = (entry.get("command") or [None])[0]
+                if command and (os.sep in command or (os.altsep and os.altsep in command)):
+                    binary = command if os.path.isfile(command) and os.access(command, os.X_OK) else None
+                else:
+                    binary = shutil.which(command) if command else None
+                known = True
+                evidence = f"custom backend {backend!r} command[0]"
+                return binary, known, evidence
+        return None, False, f"no binary resolver for backend {backend!r}"
+    if binary is None and not known:
+        # State has no section: fall back to the cheap live resolver
+        # rather than declaring the binary missing. (Codex is excluded:
+        # find_codex runs --version + features list and can take ~35s,
+        # far outside a health probe's budget; a missing codex section
+        # stays unknown.)
+        if backend == "pi":
+            binary = pi_bin()
+        elif backend in ("ocgo", "deepseek"):
+            binary = opencode_bin()
+        elif backend == "cursor":
+            binary = cursor_bin()
+        elif backend == "agy":
+            binary = agy_bin()
+    return binary, known, evidence
+
+
+def _health_check_binary(backend, binary, known, evidence):
+    if binary is None and not known:
+        return _health_check("binary", "unknown",
+                             f"no probe state for backend {backend!r}; binary presence could not be judged",
+                             evidence)
+    if binary is None:
+        return _health_check("binary", "fail",
+                             f"no working {backend} binary on this host",
+                             evidence)
+    if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
+        return _health_check("binary", "fail",
+                             f"{backend} binary {binary} is not an executable file",
+                             evidence)
+    return _health_check("binary", "pass", f"{backend} binary {binary} is executable", evidence)
+
+
+def _health_codex_login(binary, timeout_seconds):
+    """`codex login status`: the session check route() cannot see.
+
+    `codex debug models` lists a static catalogue whether or not the
+    account is logged in, and app-server model/list answers without a
+    session, so neither proves login; `login status` does, in ~20ms,
+    read-only. Its output is "Not logged in" (rc 0) when the session is
+    gone — the exact failure M23 slice 2 hit at exec time (401) — and
+    "Logged in ..." when it is alive.
+    """
+    evidence = "command: codex login status"
+    if not binary:
+        return _health_check("login", "unknown", "no codex binary, login cannot be checked", evidence)
+    rc, out, err = sh([binary, "login", "status"], timeout=max(1, timeout_seconds))
+    text = f"{out or ''}\n{err or ''}".strip()
+    lowered = text.lower()
+    if rc == 127 and "timed out" in err.lower():
+        return _health_check("login", "timeout",
+                             f"codex login status timed out after {timeout_seconds}s; session state unknown",
+                             evidence)
+    if "not logged in" in lowered:
+        return _health_check("login", "fail",
+                             "codex is not logged in (codex login status says 'Not logged in')",
+                             evidence)
+    if "logged in" in lowered:
+        return _health_check("login", "pass", "codex login status reports a live session", evidence)
+    if rc != 0 and AUTH_ERROR_RE.search(text):
+        return _health_check("login", "fail", f"codex login status reports an auth failure: {text[:200]}",
+                             evidence)
+    if rc != 0:
+        return _health_check("login", "unknown",
+                             f"codex login status exited {rc} with unparseable output: {text[:200] or '(empty)'}",
+                             evidence)
+    return _health_check("login", "unknown",
+                         f"codex login status output could not be classified: {text[:200] or '(empty)'}",
+                         evidence)
+
+
+def _health_pi_transport(policy, binary, timeout_seconds):
+    """Pi's transport: the isolated launcher's broker socket, or the
+    provider endpoint for a plain pi binary.
+
+    Isolated pi (this host's default) talks to pi-broker-service through
+    the OPENSWARM_PI_BROKER_SOCKET unix socket — the same listener whose
+    absence killed M23 slice 2's pi runs (9933/9934 no listener). The
+    check mirrors pi-isolated's own preconditions (socket is a socket;
+    bwrap/socat + the pi runtime exist) without starting anything. A
+    plain pi binary talks to its provider over HTTPS: a bare TCP connect
+    to the provider host (no data sent, no credentials) proves the path
+    is up. Other providers have no known endpoint here: not_applicable.
+    """
+    if not binary:
+        return _health_check("transport", "unknown", "no pi binary, transport cannot be checked",
+                             "pi binary lookup")
+    isolated = os.path.basename(os.path.realpath(binary)) == "pi-isolated"
+    if isolated:
+        broker = os.environ.get("OPENSWARM_PI_BROKER_SOCKET", "")
+        evidence = "env OPENSWARM_PI_BROKER_SOCKET"
+        if not broker:
+            return _health_check("transport", "fail",
+                                 "isolated Pi needs OPENSWARM_PI_BROKER_SOCKET and it is not set "
+                                 "(pi-broker-service is not wired up on this host)",
+                                 evidence)
+        try:
+            if not stat.S_ISSOCK(os.stat(os.path.realpath(broker)).st_mode):
+                return _health_check("transport", "fail",
+                                     f"isolated Pi broker socket {broker} is not a socket "
+                                     f"(pi-broker-service is not listening)",
+                                     evidence)
+        except OSError:
+            return _health_check("transport", "fail",
+                                 f"isolated Pi broker socket {broker} is missing "
+                                 f"(pi-broker-service is not listening)",
+                                 evidence)
+        runtime_env = os.environ.get("OPENSWARM_PI_RUNTIME", "")
+        runtime = os.path.realpath(runtime_env) if runtime_env else ""
+        missing = [tool for tool in ("bwrap", "socat") if not shutil.which(tool)]
+        if runtime and not os.path.isfile(os.path.join(runtime, "node_modules/.bin/pi")):
+            missing.append("pi runtime (OPENSWARM_PI_RUNTIME/node_modules/.bin/pi)")
+        if missing:
+            return _health_check("transport", "fail",
+                                 f"isolated Pi dependencies unavailable: {', '.join(missing)}",
+                                 evidence)
+        return _health_check("transport", "pass",
+                             f"isolated Pi broker socket {broker} is a live socket", evidence)
+    provider = (policy.get("pi") or {}).get("provider")
+    if provider != "minimax-cn":
+        return _health_check("transport", "not_applicable",
+                             f"plain pi provider {provider!r} has no known reachability endpoint here",
+                             "policy pi.provider")
+    evidence = "TCP connect www.minimaxi.com:443 (no data sent)"
+    try:
+        sock = socket.create_connection(("www.minimaxi.com", 443), timeout=max(1, min(3, timeout_seconds)))
+        sock.close()
+    except socket.timeout:
+        return _health_check("transport", "timeout",
+                             "TCP connect to www.minimaxi.com:443 timed out; transport unknown",
+                             evidence)
+    except OSError as exc:
+        return _health_check("transport", "fail",
+                             f"cannot reach www.minimaxi.com:443 ({exc}); plain pi cannot talk to MiniMax",
+                             evidence)
+    return _health_check("transport", "pass", "www.minimaxi.com:443 accepts a TCP connection", evidence)
+
+
+def _health_quota_readable(backend, st, policy, custom_backends=()):
+    """Is the backend's quota probe readable? Returns a check, or None
+    when the backend has no quota reader anywhere (not_applicable is
+    recorded by the caller as a skipped check, not a verdict input).
+
+    A readable number is a pass — even 0, which is a successful read of
+    an exhausted quota (quota routing, not the health gate, owns the
+    exhausted decision). An auth-flavoured read error is a fail: the
+    backend cannot authenticate, so dispatch would fail. Any other read
+    error, or no usable reading, is unknown.
+    """
+    cfg = quota_config(policy)
+    remaining, error, _text = builtin_quota_remaining(backend, st)
+    source = cfg["sources"].get(backend)
+    if source is not None:
+        remaining, error = quota_remaining_from_source(source)
+        evidence = f"quota source: {quota_source_text(source)}"
+    else:
+        for entry in custom_backends or ():
+            if entry["id"] == backend and entry["quota_source"] != "none":
+                source = custom_backend_source(entry)
+                remaining, error = quota_remaining_from_source(source)
+                evidence = f"quota source: {quota_source_text(source)}"
+                break
+        else:
+            evidence = f"probe state: builtin quota reader for {backend}"
+    if _text is None and source is None:
+        return None
+    if error is not None:
+        lowered = error.lower()
+        if "credential" in lowered or "401" in lowered or "unauthorized" in lowered or "auth" in lowered:
+            return _health_check("quota", "fail", f"quota probe reports an auth failure: {error[:200]}",
+                                 evidence)
+        return _health_check("quota", "unknown", f"quota probe failed: {error[:200]}", evidence)
+    if isinstance(remaining, (int, float)) and not isinstance(remaining, bool):
+        return _health_check("quota", "pass", f"quota probe reads remaining {remaining}", evidence)
+    return _health_check("quota", "unknown", "quota probe has no usable reading for this backend", evidence)
+
+
+def health_probe_backend(backend, st, policy, timeout_seconds=HEALTH_GATE_DEFAULT_TIMEOUT_SECONDS,
+                         custom_backends=()):
+    """Probe one backend for dispatch health. Returns the gate record.
+
+    Checks are per backend type (only applicable ones run): every
+    backend gets a binary check; codex gets a login check; pi gets a
+    transport check; agy gets a login check; deepseek gets a key check;
+    backends with a quota reader get a quota check. The whole probe is
+    bounded by timeout_seconds: once the deadline passes, no new check
+    starts and the verdict is unknown with the timeout on the record.
+    Read-only throughout: no state file, session, or quota is touched.
+    """
+    started = time.monotonic()
+    deadline = started + max(1, timeout_seconds)
+    checks = []
+
+    def remaining():
+        return deadline - time.monotonic()
+
+    def timed_out():
+        return remaining() <= 0
+
+    binary, known, binary_evidence = _health_binary_for_backend(backend, st, policy, custom_backends)
+    checks.append(_health_check_binary(backend, binary, known, binary_evidence))
+    if backend == "codex" and not timed_out():
+        checks.append(_health_codex_login(binary, max(1, min(remaining(), timeout_seconds))))
+    elif backend == "pi" and not timed_out():
+        checks.append(_health_pi_transport(policy, binary, max(1, min(remaining(), timeout_seconds))))
+    elif backend == "agy" and not timed_out():
+        state = agy_login_state(binary)
+        if state == "logged in":
+            checks.append(_health_check("login", "pass", "agy models reports a live session",
+                                        "command: agy models"))
+        elif state == "not logged in":
+            checks.append(_health_check("login", "fail",
+                                        "agy is not logged in (agy models reports an auth failure)",
+                                        "command: agy models"))
+        else:
+            checks.append(_health_check("login", "unknown",
+                                        "agy login state could not be determined (agy models inconclusive)",
+                                        "command: agy models"))
+    elif backend == "deepseek" and not timed_out():
+        ds = (st.get("deepseek") or {}) if isinstance(st, dict) else {}
+        if ds.get("error") == "no api key":
+            checks.append(_health_check("login", "fail",
+                                        "no DeepSeek API key (DEEPSEEK_API_KEY unset, no keychain item)",
+                                        "probe state: deepseek.error"))
+        elif isinstance(ds.get("balance"), (int, float)):
+            checks.append(_health_check("login", "pass",
+                                        f"DeepSeek balance readable ({ds.get('balance')} "
+                                        f"{ds.get('currency') or ''})".rstrip(),
+                                        "probe state: deepseek.balance"))
+        elif ds.get("error"):
+            checks.append(_health_check("login", "unknown",
+                                        f"DeepSeek probe failed: {str(ds['error'])[:200]}",
+                                        "probe state: deepseek.error"))
+        else:
+            checks.append(_health_check("login", "unknown",
+                                        "DeepSeek key presence could not be determined from probe state",
+                                        "probe state: deepseek"))
+    if backend in ("codex", "pi", "ocgo", "deepseek") and not timed_out():
+        quota_check = _health_quota_readable(backend, st, policy, custom_backends)
+        if quota_check is not None:
+            checks.append(quota_check)
+    if backend == "ocgo" and not timed_out():
+        models = ((st.get("ocgo") or {}).get("models") or []) if isinstance(st, dict) else []
+        if models:
+            checks.append(_health_check("models", "pass",
+                                        f"opencode lists {len(models)} model(s)",
+                                        "probe state: ocgo.models"))
+        else:
+            checks.append(_health_check("models", "unknown",
+                                        "opencode lists no models; model availability unknown",
+                                        "probe state: ocgo.models"))
+    applicable = [c for c in checks if c["status"] != "not_applicable"]
+    seconds = round(time.monotonic() - started, 3)
+    if timed_out() and not any(c["status"] == "timeout" for c in checks):
+        checks.append(_health_check("timeout", "timeout",
+                                    f"health probe exceeded its {timeout_seconds}s budget; "
+                                    f"verdict is unknown, not a pass",
+                                    "gate deadline"))
+        applicable = [c for c in checks if c["status"] != "not_applicable"]
+    failed = [c for c in applicable if c["status"] == "fail"]
+    unknown = [c for c in applicable if c["status"] in ("unknown", "timeout")]
+    if failed:
+        verdict, reason = "unhealthy", "; ".join(c["detail"] for c in failed)
+    elif unknown:
+        verdict, reason = "unknown", "; ".join(c["detail"] for c in unknown)
+    elif applicable:
+        verdict, reason = "healthy", f"all {len(applicable)} applicable check(s) passed"
+    else:
+        verdict, reason = "unknown", f"no health checks apply to backend {backend!r}"
+    return {"backend": backend, "verdict": verdict, "reason": reason, "checks": checks,
+            "seconds": seconds, "timeout_seconds": timeout_seconds}
+
+
+def health_gate_error(record):
+    """Actionable refusal text for a blocked dispatch: what failed, the
+    evidence pointer, and the fix or the explicit bypass."""
+    backend = record["backend"]
+    failed = [c for c in record.get("checks") or [] if c["status"] == "fail"]
+    detail = "; ".join(f"{c['name']}: {c['detail']} (evidence: {c['evidence']})" for c in failed) \
+        or record.get("reason", "")
+    fix = {"codex": "run `codex login` on this host, then retry",
+           "pi": "check pi-broker-service / OPENSWARM_PI_BROKER_SOCKET on this host, then retry",
+           "deepseek": "set DEEPSEEK_API_KEY (or a keychain item), then retry",
+           "agy": "log in to the agy CLI on this host, then retry"}.get(backend)
+    fix_text = f" Fix: {fix}." if fix else ""
+    return (f"health gate blocked dispatch: backend {backend!r} is unhealthy — {detail}."
+            f"{fix_text} Or bypass explicitly with --skip-health-gate (the bypass is recorded "
+            f"in the ledger and result.json). The gate never reroutes to another backend.")
+
+
+def apply_health_gate(backend, st, policy, args, custom_backends=(), stage="initial"):
+    """Decide whether `backend` may dispatch. Returns (record, blocked).
+
+    record is None when the gate is off: nothing is written anywhere, so
+    shipped behaviour stays byte-identical. Otherwise record is the
+    ledger/result entry: verdict healthy/unknown/unhealthy/bypassed,
+    action allowed/blocked/bypassed, the checks with evidence pointers,
+    and the config source. `blocked` is True only for unhealthy, or for
+    unknown when on_unknown is "block". A bypassed gate probes nothing.
+    """
+    cfg = health_gate_config(policy)
+    flag_on = bool(getattr(args, "health_gate", False))
+    flag_off = bool(getattr(args, "no_health_gate", False))
+    flag_skip = bool(getattr(args, "skip_health_gate", False))
+    if flag_on:
+        enabled, source = True, "flag --health-gate"
+    elif flag_off:
+        enabled, source = False, "flag --no-health-gate"
+    else:
+        enabled, source = cfg["enabled"], "policy routing.health_gate"
+    if not enabled:
+        return None, False
+    if flag_skip:
+        return {"enabled": True, "source": source, "stage": stage, "backend": backend,
+                "verdict": "bypassed", "action": "bypassed",
+                "reason": "health gate bypassed by explicit --skip-health-gate; no probe ran",
+                "checks": [], "seconds": 0, "timeout_seconds": cfg["timeout_seconds"],
+                "on_unknown": cfg["on_unknown"]}, False
+    record = health_probe_backend(backend, st, policy, cfg["timeout_seconds"], custom_backends)
+    record.update({"enabled": True, "source": source, "stage": stage,
+                   "on_unknown": cfg["on_unknown"]})
+    if record["verdict"] == "unhealthy":
+        record["action"] = "blocked"
+        return record, True
+    if record["verdict"] == "unknown" and cfg["on_unknown"] == "block":
+        record["action"] = "blocked"
+        record["reason"] = (f"health gate cannot judge {backend!r} ({record['reason']}); "
+                            f"on_unknown=block refuses to dispatch")
+        return record, True
+    record["action"] = "allowed"
+    if record["verdict"] == "unknown":
+        record["reason"] = (f"health gate cannot judge {backend!r} ({record['reason']}); "
+                            f"on_unknown=allow dispatches with the unknown verdict on the record")
+    return record, False
+
+
 def cmd_quota(args, policy, custom_backends=None):
     """Read-only quota probe (M17 slice 1, #169; M20 slice 1, #181): remaining quota per backend.
 
@@ -7892,6 +8360,35 @@ def cmd_run(args, policy, custom_backends=None):
         jsave(f"{rdir}/result.json", out)
         print(json.dumps(out, indent=2, ensure_ascii=False))
         sys.exit(2)
+    # M24 slice 1 (#198): pre-dispatch health gate on the final pick
+    # (after weighted + quota routing, so an explicit --backend is gated
+    # exactly like a routed pick). A refusal dispatches nothing and never
+    # reroutes: the run ends here as unroutable, mirroring the quota
+    # block above. When the gate is off, apply_health_gate returns None
+    # and nothing below changes behaviour. A healthy/unknown-allowed/
+    # bypassed record rides in routing_fields into result.json and the
+    # ledger with the rest of the run. Dry runs show the gate decision
+    # too, since the gate runs before the dry-run branch.
+    health_gate_record, health_blocked = apply_health_gate(
+        decision["backend"], st, policy, args, custom_backends=custom_backends)
+    if health_gate_record is not None:
+        routing_fields["health_gate"] = health_gate_record
+        if health_blocked:
+            error = health_gate_error(health_gate_record)
+            out = {"id": rid, "status": "unroutable", "error_class": "health_gate_blocked",
+                   "error": error, "decision": decision, "scope": scope, **routing_fields}
+            set_status(rdir, state="unroutable", scope=scope)
+            append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "unroutable",
+                           "decision": decision, "scope": scope, "error_class": "health_gate_blocked",
+                           "summary": error[:300],
+                           "card_type": card_type, "rework_of": rework_of,
+                           **exec_pass_fields(False, False, bool(args.verify), None),
+                           **routing_fields})
+            jsave(f"{rdir}/result.json", out)
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+            sys.exit(2)
+        if health_gate_record["verdict"] != "healthy":
+            print(f"health-gate: {health_gate_record['reason']}", file=sys.stderr)
     if args.dry_run:
         set_status(rdir, state="dry-run", scope=scope)
         print(json.dumps({"id": rid, "dry_run": True, "decision": decision, "scope": scope,
@@ -7938,6 +8435,11 @@ def cmd_run(args, policy, custom_backends=None):
                 child.append(str(args.auto_rework))
         for flag in ("no_worktree", "keep_worktree", "no_fallback"):
             if getattr(args, flag):
+                child.append(f"--{flag.replace('_', '-')}")
+        # M24 slice 1 (#198): the detached child re-runs the gate itself
+        # (it is the real dispatch), so the gate flags travel with it.
+        for flag in ("health_gate", "no_health_gate", "skip_health_gate"):
+            if getattr(args, flag, False):
                 child.append(f"--{flag.replace('_', '-')}")
         if getattr(args, "read_only", False):
             child.append("--read-only")
@@ -8026,6 +8528,20 @@ def cmd_run(args, policy, custom_backends=None):
         if not nxt["ok"]:
             result = final
             break
+        # M24 slice 1 (#198): a fallback pick is a new dispatch, so it is
+        # gated like the initial pick. A blocked fallback ends the run
+        # with the original attempt's result — the gate never picks a
+        # third backend on its own. The fallback record rides in
+        # routing_fields beside the initial one.
+        fb_record, fb_blocked = apply_health_gate(
+            nxt["backend"], st, policy, args, custom_backends=custom_backends, stage="fallback")
+        if fb_record is not None:
+            routing_fields["health_gate_fallback"] = fb_record
+            if fb_blocked:
+                print(f"health-gate: fallback to {nxt['backend']!r} refused: "
+                      f"{health_gate_error(fb_record)}", file=sys.stderr)
+                result = final
+                break
         # A fallback can change backends; retain the spent reservation and check the new cap.
         requests = [(a["backend"], a["seconds"] / 60) for a in attempts]
         requests.append((nxt["backend"], max(0, deadline - NOW()) / 60))
@@ -16499,6 +17015,15 @@ def main():
     sp.add_argument("--run-id", help=argparse.SUPPRESS)
     sp.add_argument("--no-auto-review", action="store_true", help=argparse.SUPPRESS)
     sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--health-gate", action="store_true",
+                    help="enable the pre-dispatch backend health gate for this run (M24, #198): "
+                         "probe the selected backend before dispatch and refuse when it is unhealthy")
+    sp.add_argument("--no-health-gate", action="store_true",
+                    help="disable the pre-dispatch backend health gate for this run even when "
+                         "routing.health_gate.enabled is true")
+    sp.add_argument("--skip-health-gate", action="store_true",
+                    help="bypass the health gate for this run; the bypass is recorded in the ledger "
+                         "and result.json (M24, #198)")
     sp.add_argument("--read-only", action="store_true",
                     help="review task: allow status=done without repo changes or commits")
     sp.add_argument("--executor", help="optional GitHub bus executor routing label")

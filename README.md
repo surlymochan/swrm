@@ -120,6 +120,7 @@ Routing decisions use live quota data, not guesses.
   - At the soft limit, easy work spills to other enabled backends.
   - A hard limit skips the backend.
   - Quota that is about to expire unused gets spent at higher effort.
+- **Pre-dispatch health gate (M24, #198; off by default).** Before `openswarm run` dispatches, it probes the selected backend — login/session alive (`codex login status`, `agy models`), quota probe readable, transport reachable (isolated Pi broker socket, or the provider endpoint for plain Pi) — whichever applies to that backend type. An unhealthy backend is refused with an actionable error (`health_gate_blocked`, exit 2) and the decision is recorded in the ledger and `result.json` as `health_gate` (verdict, reason, per-check evidence pointers). The gate never reroutes to another backend, and an explicit `--backend` is gated exactly like a routed pick. Probes are read-only and bounded by `routing.health_gate.timeout_seconds` (default 10s) for the gate's own checks (a configured quota command source keeps its own 10s cap, same as `openswarm quota`); a probe that cannot finish in time is verdict `unknown`, recorded explicitly — `on_unknown: allow` (default) dispatches with the unknown verdict on the record, `on_unknown: block` refuses. Enable with `routing.health_gate.enabled: true` or `--health-gate`; `--no-health-gate` forces it off for one run; `--skip-health-gate` bypasses it for one run and the bypass itself is recorded. When the gate is off, behaviour is unchanged. Known gap: the auto-rework escalation pick is not gated in this slice.
 - **Declarative custom backends.** Any CLI agent joins routing from one JSON config file — no code changes. See [Custom backends](#custom-backends).
 - **Isolated execution.** Each run gets its own `git worktree` and `openswarm/<id>` branch.
   - Dependency dirs (`node_modules`, `.venv`) are symlinked in and never committed.
@@ -242,6 +243,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm status` | Show plans, quota windows, models, breakers, and recommended concurrency. | `openswarm status --refresh` |
 | `openswarm probe` | Discover models, plans, and quotas into `$OPENSWARM_HOME/state.json`. | `openswarm probe --quiet` |
 | `openswarm quota` | Read-only probe: remaining quota per backend — live built-in readings (pi MiniMax, codex, deepseek, ocgo) or its configured source. | `openswarm quota --json` |
+| `openswarm run --health-gate` | Pre-dispatch health gate (M24, #198; off by default): probe the selected backend before dispatch; refuse when unhealthy (`health_gate_blocked`, exit 2), never reroute. `--no-health-gate` forces it off, `--skip-health-gate` bypasses it for one run (bypass recorded in ledger/result). | `openswarm run --health-gate --dry-run --cwd ~/code/myrepo --task-file /tmp/task.md` |
 | `openswarm runs` | Snapshot recent or active runs. | `openswarm runs --active --json` |
 | `openswarm diagnose` | Classify a failed run (timeout / quota / verify-fail / exec-error / runner-error / unknown) with evidence pointers; read-only. | `openswarm diagnose <run-id>` |
 | `openswarm resume` | Recover live runs, busy lanes and recent results after a planner restart. | `openswarm resume --since-hours 12 --json` |
@@ -741,6 +743,7 @@ See [docs/BUS.md](docs/BUS.md) for the issue/result schema and worker setup. The
 | DeepSeek balance below floor | Skips DeepSeek when it is enabled for routing |
 | `--backend ocgo` or `--backend deepseek` | Forces that opt-in backend; automatic routing uses either only when listed in `routing.default_order` |
 | `--backend cursor` | Forces the Cursor CLI. Cursor is never chosen on its own unless `cursor` is listed in `routing.default_order` |
+| Pre-dispatch health gate on (M24, #198) | Probes the selected backend before dispatch (login/session, quota readable, transport reachable, per backend type); an unhealthy backend is refused, never rerouted; a probe that times out is verdict `unknown` (`on_unknown: allow` dispatches with the verdict recorded, `on_unknown: block` refuses) |
 
 The full rules are in [`SKILL.md`](SKILL.md#7-routing-rules-what-route-does). Every threshold is in
 [`policy.json`](policy.json).
