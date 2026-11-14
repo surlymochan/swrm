@@ -255,6 +255,8 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm fleet exec` | Run an swrm command on another host; stdout and the exit code are forwarded. | `openswarm fleet exec worker -- lane status` |
 | `openswarm fleet runners` | List registered runners with declared backends, capacity, and live reachability (M26 slice 1, #207). | `openswarm fleet runners --json` |
 | `openswarm fleet dispatch` | Dispatch one task card to a named runner: card + worktree spec go over, the remote backend runs, result/verify/ledger pointers come back into the controller ledger (M26 slice 1, #207). | `openswarm fleet dispatch worker --repo project --task-file ./task.md --backend codex --verify 'pytest -q'` |
+| `openswarm fleet dispatch-many` | Fan a directory of task cards out across registered runners, capacity-aware and least-loaded-first, in waves (M26 slice 2, #210). | `openswarm fleet dispatch-many --cards-dir ./cards --repo project --backend pi` |
+| `openswarm fleet recover` | Recover outstanding remote dispatches after a disconnect: lost / recovered / finished / still-running verdicts in the controller ledger, `--redispatch` re-queues a lost task on another runner (M26 slice 2, #210). | `openswarm fleet recover --redispatch` |
 | `openswarm fleet ledger pull` | Merge the host ledgers into one fleet ledger file. | `openswarm fleet ledger pull --hosts worker,sandbox` |
 | `openswarm run --rework-of` | Resume an earlier run's task as a rework, linked in the ledger as `rework_of`. | `openswarm run --rework-of <run-id> --cwd ~/code/myrepo --task-file /tmp/task.md` |
 | `openswarm run --auto-rework` | On host verify failure, dispatch up to 2 automatic reworks (or N with `--auto-rework N`), each with the failure evidence injected, re-verifying after each; on exhaustion escalate once to a stronger backend tier; recorded in `result.auto_rework` and the ledger. | `openswarm run --auto-rework --cwd ~/code/myrepo --verify 'pytest -q' --task-file /tmp/task.md` |
@@ -642,6 +644,18 @@ backend; the dispatch exit code is the remote run's exit code, and a result that
 is recorded as `fetch_error`, never as a pass. The dispatch record is skipped by routing-weight, advice
 and backfill passes, so it never inflates run counts; the remote run's own ledger row remains the
 outcome source of truth and merges in via `fleet ledger pull`.
+`fleet dispatch-many` (M26 slice 2, #210) fans a directory of task cards out across every registered
+runner that offers the backend and maps the repo, least-loaded-first and never above a runner's
+`capacity`, in waves: a wave dispatches concurrently and the next wave starts only after the previous
+wave's runs finish, so spare capacity is re-read, never assumed. Each card may declare its own
+acceptance command on a `verify:` line (stripped before transfer); `--verify` applies to cards without
+one. A card no runner can take fails loudly with the per-runner reason. `fleet recover` (M26 slice 2,
+#210) re-examines controller dispatch records whose remote outcome never came back: `lost` (runner
+unreachable or run unreadable — non-final, re-probed next time), `recovered` (remote run dead, runner
+pid gone — M11/M12 semantics, final), `finished` (remote run terminal, final), or `still-running`
+(reported, untouched). `--redispatch` re-queues a lost/recovered task on another runner with spare
+capacity, reusing the original card / verify / base from the dispatch record. Both records are skipped
+by routing-weight, advice and backfill passes.
 A forwarded `run` can request evalid verification with `--verify-evalid` (plus `--evalid-bin` to point at
 the evalid binary on the executor host): the remote run replays the executor's claimed test command in a
 clean clone via `xflow audit`, and `fleet exec` waits for the run to finish, then copies the
