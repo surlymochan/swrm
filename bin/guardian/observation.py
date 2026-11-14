@@ -32,6 +32,7 @@ Three rules shape every verdict:
   fault: unconfirmed evidence is reported, never acted on.
 """
 import contextlib
+import copy
 import datetime
 import json
 import math
@@ -641,11 +642,16 @@ def _host_nested_faults(nested):
     faults = []
     if not isinstance(nested, dict):
         return faults
+    for key in ("runs", "lanes"):
+        rows = nested.get(key, [])
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            faults.append((UNKNOWN, "malformed_nested_health",
+                           "host reports malformed %s" % key))
     if nested.get("lane_config_valid") is False:
         faults.append((UNHEALTHY, "lane_config_invalid",
                        "host reports an invalid lane config: %s"
                        % _short(nested.get("lane_config_error"), 160)))
-    for row in nested.get("runs") or []:
+    for row in nested.get("runs") if isinstance(nested.get("runs"), list) else []:
         if not isinstance(row, dict):
             continue
         verdict = str(row.get("verdict") or "").strip().lower()
@@ -661,7 +667,7 @@ def _host_nested_faults(nested):
         if marker:
             faults.append((UNHEALTHY, "rate_limited",
                            "run %s hit a provider rate limit (%s): %s" % (name, marker, reason)))
-    for row in nested.get("lanes") or []:
+    for row in nested.get("lanes") if isinstance(nested.get("lanes"), list) else []:
         if not isinstance(row, dict):
             continue
         state = str(row.get("state") or "").strip().lower()
@@ -686,13 +692,13 @@ def _nested_summary(nested):
     if not isinstance(nested, dict):
         return None
     runs = {}
-    for row in nested.get("runs") or []:
+    for row in nested.get("runs") if isinstance(nested.get("runs"), list) else []:
         if not isinstance(row, dict):
             continue
         verdict = str(row.get("verdict") or "unknown").strip().lower() or "unknown"
         runs[verdict] = runs.get(verdict, 0) + 1
     lanes = {}
-    for row in nested.get("lanes") or []:
+    for row in nested.get("lanes") if isinstance(nested.get("lanes"), list) else []:
         if not isinstance(row, dict):
             continue
         state = str(row.get("state") or "unknown").strip().lower() or "unknown"
@@ -737,6 +743,8 @@ def _host_items(rows, thresholds):
             detail = (detail + "; " if detail else "") + error
         nested = row.get("health") if isinstance(row.get("health"), dict) else None
         faults = _host_nested_faults(nested)
+        if "health" in row and row["health"] is not None and nested is None:
+            faults.append((UNKNOWN, "malformed_nested_health", "host reports malformed health"))
         if faults:
             # the host's own lanes and runs are part of the host's health
             status = _worst([status] + [fault[0] for fault in faults])
@@ -832,7 +840,7 @@ def _quota_items(payload, thresholds):
             item_status = UNKNOWN
             item_detail = "unrecognised quota status %r" % status
         marker = _rate_limit_marker(detail) or _rate_limit_marker(source)
-        if marker:
+        if marker and row.get("stale") is not True:
             item_status = UNHEALTHY
             signals.append("rate_limited")
             item_detail = "provider rate-limit signal (%s): %s" % (marker, detail or source)
@@ -1059,9 +1067,7 @@ def _status_with_truncation(status, info):
     if not info or not info.get("truncated"):
         return status
     faults = info.get("truncated_faults") or []
-    if faults:
-        return _worst([status] + [fault["status"] for fault in faults])
-    return UNKNOWN
+    return _worst([status, UNKNOWN] + [fault["status"] for fault in faults])
 
 
 def _apply_truncation(block, info):
@@ -1102,16 +1108,14 @@ def _nested_health_rows(hosts_raw):
         if not isinstance(nested, dict):
             continue
         host = _short(row.get("name") or "", 64)
-        for entry in nested.get("runs") or []:
-            if isinstance(entry, dict):
-                item = dict(entry)
+        for key, output in (("runs", runs), ("lanes", lanes)):
+            entries = nested.get(key, [])
+            if not isinstance(entries, list):
+                entries = [None]
+            for entry in entries:
+                item = dict(entry) if isinstance(entry, dict) else {}
                 item["host"] = host
-                runs.append(item)
-        for entry in nested.get("lanes") or []:
-            if isinstance(entry, dict):
-                item = dict(entry)
-                item["host"] = host
-                lanes.append(item)
+                output.append(item)
     return runs, lanes
 
 
@@ -1322,7 +1326,7 @@ def _apply_scoped_drain(dimensions, drain_record):
         item["detail"] = "host is manually drained (%s)" % (
             drain_record.get("reason") or "no reason recorded")
         item["signals"] = sorted(set(item.get("signals") or []) | {"manual_drain"})
-    hosts["status"] = _status_with_drain(hosts.get("items") or [])
+    hosts["status"] = _status_with_truncation(_status_with_drain(hosts.get("items") or []), hosts)
     # the lanes and runs of the drained host belong to the drained host: they
     # stop counting against the fleet verdict with it
     for name in ("runs", "lanes"):
@@ -1336,7 +1340,7 @@ def _apply_scoped_drain(dimensions, drain_record):
             item["detail"] = "host %s is manually drained (%s)" % (
                 target, drain_record.get("reason") or "no reason recorded")
             item["signals"] = sorted(set(item.get("signals") or []) | {"manual_drain"})
-        inner["status"] = _status_with_drain(inner.get("items") or [])
+        inner["status"] = _status_with_truncation(_status_with_drain(inner.get("items") or []), inner)
     health["status"] = _fold_statuses([health[block]["status"] for block in ("hosts", "runs", "lanes")
                                        if isinstance(health.get(block), dict)])
 
@@ -1490,8 +1494,10 @@ def build_snapshot(observations, thresholds, now=None, drain_record=None, requir
     """Assemble the versioned health snapshot from the input observations."""
     now = now if now is not None else now_ts()
     dimensions = _dimensions_from_observations(observations, thresholds)
-    return _assemble(dimensions, observations, thresholds, now, drain_record=drain_record,
-                      required=list(required))
+    result = _assemble(copy.deepcopy(dimensions), observations, thresholds, now, drain_record=drain_record,
+                       required=list(required))
+    result["observed_dimensions"] = dimensions
+    return result
 
 
 def _overall_confidence(observations, dimensions):
@@ -1738,7 +1744,7 @@ def _reevaluate(payload, state_dir, now=None, thresholds=None):
         merged.update({key: value for key, value in stored.items() if key in DEFAULT_THRESHOLDS})
     if thresholds:
         merged.update({key: value for key, value in thresholds.items() if key in DEFAULT_THRESHOLDS})
-    dimensions = payload.get("dimensions")
+    dimensions = copy.deepcopy(payload.get("observed_dimensions", payload.get("dimensions")))
     if not isinstance(dimensions, dict):
         dimensions = {}
     views = (payload.get("coverage") or {}).get("inputs") or []
@@ -1760,7 +1766,7 @@ def _reevaluate(payload, state_dir, now=None, thresholds=None):
             inner = block.get(sub)
             if isinstance(inner, dict):
                 inner["observation"] = view
-        if observation["status"] == "ok" and observation["freshness"] != "fresh":
+        if observation["status"] != "ok" or observation["freshness"] != "fresh":
             _mark_unconfirmed({name: block}, observation)
     drain_record = None
     drain_error = None

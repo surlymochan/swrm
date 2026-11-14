@@ -815,6 +815,71 @@ class GuardianObservationTests(unittest.TestCase):
         self.assertEqual(block["status"], "unhealthy")
         self.assertEqual(result["overall"]["status"], "unhealthy")
 
+    def test_retained_fault_survives_healthy_truncated_rows(self):
+        thresholds = observation.load_thresholds(overrides={"max_records": 1})
+        result = guardian.observe({"snapshot": snapshot_payload(lanes=[lane(state="crashed"), lane(name="L2")])},
+                                  thresholds=thresholds, state_dir=str(self.state), persist=False,
+                                  observed_at=time.time())
+        block = result["dimensions"]["snapshot"]["lanes"]
+        self.assertTrue(block["incomplete"])
+        self.assertEqual(block["status"], "unhealthy")
+
+    def test_scoped_drain_preserves_truncated_fault_and_incompleteness(self):
+        thresholds = observation.load_thresholds(overrides={"max_records": 1})
+        guardian.drain(str(self.state), "maintenance", host="other")
+        for second, expected in (({"name": "beta", "reachable": False}, "unhealthy"),
+                                 ({"name": "beta", "reachable": True}, "unknown")):
+            result = guardian.observe({"health": {"hosts": [{"name": "alpha", "reachable": True}, second]}},
+                                      thresholds=thresholds, state_dir=str(self.state), persist=False,
+                                      observed_at=time.time())
+            block = result["dimensions"]["health"]["hosts"]
+            self.assertTrue(block["incomplete"])
+            self.assertEqual(block["status"], expected)
+
+    def test_host_undrain_restores_observations_after_restart(self):
+        guardian.drain(str(self.state), "maintenance", host="alpha")
+        health = {"hosts": [{"name": "alpha", "reachable": True, "status": "reachable",
+                             "health": {"runs": [{"id": "r1", "verdict": "dead"}],
+                                        "lanes": [lane(state="crashed")]}}]}
+        now = time.time()
+        result = guardian.observe({"health": health}, state_dir=str(self.state), now=now, observed_at=now)
+        self.assertEqual(result["dimensions"]["health"]["hosts"]["items"][0]["status"], "drained")
+        guardian.undrain(str(self.state))
+        restored = guardian.load_snapshot(str(self.state), now=now)
+        self.assertEqual(restored["overall"]["status"], "unhealthy")
+        for name in ("hosts", "runs", "lanes"):
+            self.assertEqual(restored["dimensions"]["health"][name]["items"][0]["status"], "unhealthy")
+
+    def test_stale_quota_row_does_not_attribute_429_to_fresh_provider(self):
+        row = quota_row(detail="HTTP 429 rate limit")
+        row["stale"] = True
+        now = time.time()
+        result = guardian.observe({"snapshot": snapshot_payload(lanes=[lane()], providers={"codex": "minimax-cn"}),
+                                   "quota": quota_payload([row])}, state_dir=str(self.state), persist=False,
+                                  now=now, observed_at=now)
+        self.assertEqual(result["dimensions"]["quota"]["items"][0]["status"], "unknown")
+        self.assertEqual(result["dimensions"]["snapshot"]["providers"]["items"][0]["status"], "healthy")
+
+    def test_malformed_nested_health_is_unknown(self):
+        for key, value in (("runs", [None]), ("lanes", [None]), ("runs", {})):
+            health = {"hosts": [{"name": "alpha", "reachable": True, "status": "reachable",
+                                 "health": {key: value}}]}
+            now = time.time()
+            result = guardian.observe({"health": health}, state_dir=str(self.state), persist=False,
+                                      now=now, observed_at=now)
+            self.assertEqual(result["dimensions"]["health"]["hosts"]["status"], "unknown")
+            self.assertEqual(result["overall"]["status"], "unknown")
+
+    def test_persisted_future_and_expired_observations_are_unknown(self):
+        now = time.time()
+        guardian.observe({"health": {"hosts": [{"name": "alpha", "reachable": True}]}},
+                         state_dir=str(self.state), now=now, observed_at=now)
+        for read_time in (now - observation.MAX_FUTURE_SKEW_SECONDS - 1,
+                          now + observation.DEFAULT_THRESHOLDS["max_age_seconds"] + 1):
+            result = guardian.load_snapshot(str(self.state), now=read_time)
+            self.assertEqual(result["dimensions"]["health"]["status"], "unknown")
+            self.assertEqual(result["dimensions"]["health"]["hosts"]["status"], "unknown")
+
     # what the guardian must never do -------------------------------------
     def test_guardian_never_shells_out_and_never_reports_capacity(self):
         source = (BIN / "guardian" / "observation.py").read_text(encoding="utf-8")
