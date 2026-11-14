@@ -7,6 +7,11 @@ lanes, 429/quota exhaustion, stale and unsupported inputs, the durable
 manual drain, and a controller restart that reads the state back.
 """
 import json
+import argparse
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
 import os
 import pathlib
 import subprocess
@@ -217,7 +222,73 @@ class GuardianObservationTests(unittest.TestCase):
         self.assertIn("quota_exhausted", result["dimensions"]["quota"]["items"][0]["signals"])
         provider = result["dimensions"]["snapshot"]["providers"]["items"][0]
         self.assertEqual(provider["status"], "unhealthy")
+        self.assertEqual(result["dimensions"]["snapshot"]["providers"]["status"], "unhealthy")
+        self.assertEqual(result["dimensions"]["snapshot"]["status"], "unhealthy")
         self.assertEqual(result["overall"]["status"], "unhealthy")
+
+    def test_actual_producers_unconfigured_and_broken_quota(self):
+        loader = importlib.machinery.SourceFileLoader("guardian_test_openswarm", str(BIN / "openswarm"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        with mock.patch.dict(os.environ, {"OPENSWARM_HOME": str(self.root)}, clear=True):
+            loader.exec_module(module)
+            with mock.patch.object(module, "opencode_models", return_value=[]):
+                deepseek = module.probe_deepseek({"deepseek": {"keychain_items": []}})
+            self.assertEqual(deepseek["error"], "no api key")
+            policy = module.jload(str(HERE.parent / "policy.json"), {})
+            policy.setdefault("routing", {})["quota"] = {"enabled": True, "threshold": 0, "sources": {}}
+            state = {"deepseek": deepseek, "codex": {"limits": {"codex": {"windows": {"w": {"used": 0.2}}}}}}
+            args = argparse.Namespace(backends_file=None, json=True)
+            output = io.StringIO()
+            with mock.patch.object(module, "probe_state", return_value=state), contextlib.redirect_stdout(output):
+                module.cmd_quota(args, policy, custom_backends=[])
+            quota = json.loads(output.getvalue())
+            row = next(row for row in quota["backends"] if row["backend"] == "deepseek")
+            self.assertEqual((row["status"], row["detail"]), ("error", "no api key"))
+            quota["backends"] = [row for row in quota["backends"] if row["backend"] in ("deepseek", "codex")]
+            now = time.time()
+            snapshot = snapshot_payload(lanes=[lane()], providers={"codex": "minimax-cn"})
+            result = guardian.observe({"snapshot": snapshot, "quota": quota}, state_dir=str(self.state),
+                                      persist=False, now=now, observed_at=now)
+            self.assertEqual(result["overall"]["status"], "healthy")
+            self.assertIn("deepseek", [item["name"] for item in result["dimensions"]["quota"]["unmetered"]])
+            probe = {"deepseek": deepseek, "codex": state["codex"]}
+            result = guardian.observe({"snapshot": snapshot, "probe": probe}, state_dir=str(self.state),
+                                      persist=False, now=now, observed_at=now)
+            self.assertEqual(result["overall"]["status"], "healthy")
+            self.assertIn("deepseek", result["dimensions"]["probe"]["unobserved"])
+            result = guardian.observe({"snapshot": snapshot, "probe": {"deepseek": deepseek}},
+                                      state_dir=str(self.state), persist=False, now=now, observed_at=now,
+                                      require=["probe"])
+            self.assertEqual(result["overall"]["status"], "unknown")
+            policy["routing"]["quota"]["sources"] = {"deepseek": {"source": "file", "file": str(self.root / "missing")}}
+            output = io.StringIO()
+            with mock.patch.object(module, "probe_state", return_value=state), contextlib.redirect_stdout(output):
+                with self.assertRaises(SystemExit):
+                    module.cmd_quota(args, policy, custom_backends=[])
+            result = guardian.observe({"quota": json.loads(output.getvalue())}, state_dir=str(self.state),
+                                      persist=False, now=now, observed_at=now, require_fleet=False)
+            self.assertEqual(result["dimensions"]["quota"]["status"], "unhealthy")
+
+    def test_rate_limit_code_boundaries_in_lane_errors(self):
+        for error, expected in [("HTTP 429: rejected", "unhealthy"), ("error 429", "unhealthy"),
+                                ("error 42918", "healthy"), ("error 4290", "healthy"),
+                                ("failed /tmp/429/file", "healthy")]:
+            with self.subTest(error=error):
+                now = time.time()
+                result = guardian.observe({"snapshot": snapshot_payload(lanes=[lane(error=error)])},
+                                          state_dir=str(self.state), persist=False, now=now, observed_at=now)
+                self.assertEqual(result["dimensions"]["snapshot"]["providers"]["status"], expected)
+
+    def test_corrupt_persisted_structure_reports_guardian_error(self):
+        self.state.mkdir()
+        (self.state / observation.SNAPSHOT_FILE).write_text(json.dumps({"schema": observation.SCHEMA,
+            "schema_version": observation.SCHEMA_VERSION, "coverage": [1]}), encoding="utf-8")
+        with self.assertRaises(guardian.GuardianError):
+            guardian.load_snapshot(str(self.state))
+        result = self.run_cli("status", "--state-dir", str(self.state))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("corrupt", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_quota_read_error_is_unhealthy_and_unknown_is_not_healthy(self):
         quota = self.write("quota.json", quota_payload([

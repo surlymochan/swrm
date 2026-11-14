@@ -37,6 +37,7 @@ import datetime
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -90,7 +91,7 @@ STALE_TEMP_SECONDS = 3600.0
 
 #: Explicit provider-side failure markers. A 429 is a provider failure, not a
 #: local one, so it is reported as such instead of being folded into "unhealthy".
-RATE_LIMIT_MARKERS = ("429", "rate limit", "rate_limit", "ratelimit",
+RATE_LIMIT_MARKERS = ("rate limit", "rate_limit", "ratelimit",
                       "too many requests", "throttl", "resource_exhausted")
 QUOTA_MARKERS = ("quota exceeded", "quota exhausted", "quota_exhausted",
                  "insufficient_quota", "insufficient quota")
@@ -196,6 +197,8 @@ def _rate_limit_marker(text):
     if not text:
         return None
     low = str(text).lower()
+    if re.search(r"(?<![\w/.-])429(?![\w/.-])", low):
+        return "429"
     for marker in RATE_LIMIT_MARKERS:
         if marker in low:
             return marker
@@ -828,6 +831,11 @@ def _quota_items(payload, thresholds):
                 item_status = UNHEALTHY
                 item_detail = "quota exhausted (remaining %g)" % remaining
                 signals.append("quota_exhausted")
+        elif (status == "error" and backend == "deepseek"
+              and source == "builtin deepseek (account balance, CNY)"
+              and detail == "no api key"):
+            item_status = NOT_METERED
+            item_detail = "deepseek is not configured: no api key"
         elif status == "error":
             item_status = UNHEALTHY
             item_detail = detail or "quota source read failed"
@@ -924,7 +932,9 @@ def _probe_items(payload, thresholds):
     if isinstance(deepseek, dict):
         error = _short(deepseek.get("error"), 200)
         balance = _num(deepseek.get("balance"))
-        if error:
+        if error == "no api key":
+            unobserved.append("deepseek")
+        elif error:
             items.append({"name": "deepseek", "status": DEGRADED,
                           "detail": "balance read failed: %s" % error, "signals": ["balance_error"],
                           "evidence": {"error": error}})
@@ -1281,6 +1291,9 @@ def _attribute_provider_failures(dimensions):
             provider["signals"] = sorted(set(provider.get("signals") or []) | set(kinds))
             provider["detail"] = "provider failure seen in the quota rows: %s" % item.get("detail")
             provider.setdefault("evidence", []).append("quota row for %s" % item.get("backend"))
+            providers["status"] = _status_with_truncation(
+                _status_with_drain(providers.get("items") or []), providers)
+            snapshot["status"] = _fold_statuses([snapshot["lanes"]["status"], providers["status"]])
 
 
 def _fold_statuses(statuses):
@@ -1823,7 +1836,16 @@ def load_snapshot(state_dir, now=None, thresholds=None):
         if version != SCHEMA_VERSION:
             raise GuardianError("health snapshot schema version %r is not supported (expected %d)"
                                 % (version, SCHEMA_VERSION))
-        return _reevaluate(payload, state_dir, now=now, thresholds=thresholds)
+        for field in ("coverage", "dimensions"):
+            if not isinstance(payload.get(field), dict):
+                raise GuardianError("health snapshot in %s is corrupt: invalid %s" % (state_dir, field))
+        if payload.get("observed_dimensions") is not None and not isinstance(payload["observed_dimensions"], dict):
+            raise GuardianError("health snapshot in %s is corrupt: invalid observed_dimensions" % state_dir)
+        try:
+            return _reevaluate(payload, state_dir, now=now, thresholds=thresholds)
+        except (AttributeError, TypeError, ValueError, KeyError, IndexError) as error:
+            raise GuardianError("health snapshot in %s is corrupt: invalid state structure (%s)"
+                                % (state_dir, error)) from error
 
 
 def load_drain(state_dir):
