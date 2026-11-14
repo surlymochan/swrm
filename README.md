@@ -258,6 +258,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm fleet ledger pull` | Merge the host ledgers into one fleet ledger file. | `openswarm fleet ledger pull --hosts worker,sandbox` |
 | `openswarm run --rework-of` | Resume an earlier run's task as a rework, linked in the ledger as `rework_of`. | `openswarm run --rework-of <run-id> --cwd ~/code/myrepo --task-file /tmp/task.md` |
 | `openswarm run --auto-rework` | On host verify failure, dispatch up to 2 automatic reworks (or N with `--auto-rework N`), each with the failure evidence injected, re-verifying after each; on exhaustion escalate once to a stronger backend tier; recorded in `result.auto_rework` and the ledger. | `openswarm run --auto-rework --cwd ~/code/myrepo --verify 'pytest -q' --task-file /tmp/task.md` |
+| `swrm-guardian observe` | Observe-only fleet health guardian (#216, stage 1 of #215): normalises the existing snapshot/health/quota/probe/resource outputs into one versioned health snapshot and persists it atomically. Explicit `unknown` for stale, missing or unsupported inputs, configurable thresholds, durable manual drain. It never dispatches, admits or recovers — see [docs/guardian-observation.md](docs/guardian-observation.md). | `bin/swrm-guardian observe --snapshot fleet-snapshot.json --quota quota.json` |
 
 ### Learn
 
