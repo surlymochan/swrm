@@ -10,6 +10,7 @@ usage: openswarm run [-h] [--type TYPE] [--difficulty DIFFICULTY]
                      [--verify-evalid] [--evalid-bin EVALID_BIN]
                      [--keep-worktree] [--no-fallback]
                      [--budget-minutes BUDGET_MINUTES] [--detach] [--dry-run]
+                     [--health-gate] [--no-health-gate] [--skip-health-gate]
                      [--read-only] [--executor EXECUTOR]
 
 options:
@@ -69,6 +70,13 @@ options:
                         exceeded
   --detach              run in background; monitor with `openswarm watch <id>`
   --dry-run
+  --health-gate         enable the pre-dispatch backend health gate for this
+                        run (M24, #198): probe the selected backend before
+                        dispatch and refuse when it is unhealthy
+  --no-health-gate      disable the pre-dispatch backend health gate for this
+                        run even when routing.health_gate.enabled is true
+  --skip-health-gate    bypass the health gate for this run; the bypass is
+                        recorded in the ledger and result.json (M24, #198)
   --read-only           review task: allow status=done without repo changes or
                         commits
   --executor EXECUTOR   optional GitHub bus executor routing label

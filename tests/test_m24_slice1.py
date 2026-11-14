@@ -282,6 +282,8 @@ class ProbeVerdicts(unittest.TestCase):
         rec = xs.health_probe_backend("ocgo", st, gate_policy(), 10)
         self.assertEqual(rec["verdict"], "unknown")
 
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"),
+                         "AF_UNIX unavailable on this platform (Windows)")
     def test_pi_isolated_broker_socket_pass_and_fail(self):
         st = {"pi": {"binary": os.path.join(_load.ROOT, "bin", "pi-isolated"),
                      "quota": {"error": "no MiniMax credential (pi auth.json has no minimax-cn key)"}}}
@@ -302,13 +304,20 @@ class ProbeVerdicts(unittest.TestCase):
         # Quota error is auth-flavoured (no credential) so the verdict is
         # unhealthy even with a live socket: the fail is recorded, not hidden.
         self.assertEqual(rec["verdict"], "unhealthy")
+
+    def test_pi_isolated_broker_socket_missing_fails(self):
+        """Platform-independent: with no broker socket configured, the
+        isolated-pi transport check fails (\"not set\") on every platform,
+        including Windows where AF_UNIX does not exist."""
+        st = {"pi": {"binary": os.path.join(_load.ROOT, "bin", "pi-isolated"),
+                     "quota": {"error": "no MiniMax credential (pi auth.json has no minimax-cn key)"}}}
         with mock.patch.dict(os.environ, {"OPENSWARM_PI_BROKER_SOCKET": ""}, clear=False):
             with mock.patch.object(xs.shutil, "which",
                                    side_effect=lambda c: f"/usr/bin/{c}"):
-                rec2 = xs.health_probe_backend("pi", st, gate_policy(), 10)
-        transport2 = [c for c in rec2["checks"] if c["name"] == "transport"][0]
-        self.assertEqual(transport2["status"], "fail")
-        self.assertIn("not set", transport2["detail"])
+                rec = xs.health_probe_backend("pi", st, gate_policy(), 10)
+        transport = [c for c in rec["checks"] if c["name"] == "transport"][0]
+        self.assertEqual(transport["status"], "fail")
+        self.assertIn("not set", transport["detail"])
 
     def test_pi_plain_transport_connect(self):
         st = {"pi": {"binary": sys.executable, "quota": {"remaining": 0.9, "unit": "fraction"}}}
