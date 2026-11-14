@@ -1,0 +1,265 @@
+{
+  "name": "m27-slice1-replay",
+  "description": "Replay of the real surlymochan/swrm issue/PR comment stream (6 verbatim comments fetched 2026-11-14 via gh api, ids in provenance) plus 4 labelled synthetic boundary cases the real stream does not cover (unlisted author, stop, money) and 1 duplicate re-delivery of R1. Expected Decisions were derived by hand from the admission table in docs/m27-slice1-intake-gate.md before running the replay.",
+  "policy": "built-in default intake policy v1 (shadow mode)",
+  "triggers": [
+    {
+      "id": "github:surlymochan/swrm#13:comment:6510574536",
+      "source": "github",
+      "thread": {
+        "repo": "surlymochan/swrm",
+        "kind": "pr",
+        "number": 13
+      },
+      "author": "surlymochan",
+      "author_is_bot": false,
+      "body": "@codex review",
+      "created_at": "2026-10-29T23:03:52Z",
+      "provenance": {
+        "verbatim": true,
+        "url": "https://github.com/surlymochan/swrm/pull/13#issuecomment-6510574536",
+        "comment_id": 6510574536,
+        "fetched": "2026-11-14"
+      }
+    },
+    {
+      "id": "github:surlymochan/swrm#13:comment:6510579421",
+      "source": "github",
+      "thread": {
+        "repo": "surlymochan/swrm",
+        "kind": "pr",
+        "number": 13
+      },
+      "author": "chatgpt-codex-connector[bot]",
+      "author_is_bot": true,
+      "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"2a35ccc12edfd93a3a21f62573a66c978c9ad235\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":\"2a35ccc12edfd93a3a21f62573a66c978c9ad235\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"completed\"}} -->\n<!-- codex-security-review:v1 {\"blockingSeverityThreshold\":\"P0\",\"headSha\":\"2a35ccc12edfd93a3a21f62573a66c978c9ad235\",\"mergeGateEnabled\":false,\"pullRequestNumber\":13,\"repository\":\"surlymochan/openswarm\",\"status\":\"completed\"} -->\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ✅ **Completed** <relative-time datetime=\"2026-10-30T00:46:29.921497Z\">2026-10-30T00:46:29.921497Z</relative-time> | `2a35ccc` | Manual request |\n| 🔒 **Security Review** | ✅ **Completed** <relative-time datetime=\"2026-10-30T00:47:33.043073Z\">2026-10-30T00:47:33.043073Z</relative-time> | `2a35ccc` | Manual request |\n\n\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with 👀 while any review is running, comments if it has suggestions, and reacts with 👍 once all reviews finish with no findings.\n\n</details>",
+      "created_at": "2026-10-29T23:04:10Z",
+      "provenance": {
+        "verbatim": true,
+        "url": "https://github.com/surlymochan/swrm/pull/13#issuecomment-6510579421",
+        "comment_id": 6510579421,
+        "fetched": "2026-11-14"
+      }
+    },
+    {
+      "id": "github:surlymochan/swrm#16:comment:6512478180",
+      "source": "github",
+      "thread": {
+        "repo": "surlymochan/swrm",
+        "kind": "pr",
+        "number": 16
+      },
+      "author": "surlymochan",
+      "author_is_bot": false,
+      "body": "The scoped wrapper has now been exercised through OpenSwarm consult `20261030-091140-8c0572`: both Antigravity and Codex returned valid reviews, the Antigravity log showed no Google 403, an agy fleet reservation was observed while running, and the coordinator was empty afterward. A preceding attempt that applied the proxy to the entire consult was partial because Codex timed out; the wrapper scopes the proxy to Antigravity to avoid this. The relay and reverse tunnel have since been restarted under isolated launch agents; the post-restart real task is still running. This remains a candidate, not a production rollout or proof of the 403 root cause.\n",
+      "created_at": "2026-10-30T01:14:09Z",
+      "provenance": {
+        "verbatim": true,
+        "url": "https://github.com/surlymochan/swrm/pull/16#issuecomment-6512478180",
+        "comment_id": 6512478180,
+        "fetched": "2026-11-14"
+      }
+    },
+    {
+      "id": "github:surlymochan/swrm#212:comment:6876814735",
+      "source": "github",
+      "thread": {
+        "repo": "surlymochan/swrm",
+        "kind": "issue",
+        "number": 212
+      },
+      "author": "surlymochan",
+      "author_is_bot": false,
+      "body": "排期确认（2026-11-14 19:48 SGT，用户在本线拍板）：按排队执行——M26 先收口（切片 2 #210 在飞 → 切片 3 验收发版），M26 验收后本 epic 第一顺位开工，不插队、不并行。",
+      "created_at": "2026-11-14T11:48:22Z",
+      "provenance": {
+        "verbatim": true,
+        "url": "https://github.com/surlymochan/swrm/issues/212#issuecomment-6876814735",
+        "comment_id": 6876814735,
+        "fetched": "2026-11-14"
+      }
+    },
+    {
+      "id": "github:surlymochan/swrm#13:comment:6510592583",
+      "source": "github",
+      "thread": {
+        "repo": "surlymochan/swrm",
+        "kind": "pr",
+        "number": 13
+      },
+      "author": "chatgpt-codex-connector[bot]",
+      "author_is_bot": true,
+      "body": "<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues. Another round soon, please!\n\n**Reviewed commit:** `956170254f`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "created_at": "2026-10-29T23:05:00Z",
+      "provenance": {
+        "verbatim": true,
+        "url": "https://github.com/surlymochan/swrm/pull/13#issuecomment-6510592583",
+        "comment_id": 6510592583,
+        "fetched": "2026-11-14"
+      }
+    },
+    {
+      "id": "github:surlymochan/swrm#210:comment:6876463120",
+      "source": "github",
+      "thread": {
+        "repo": "surlymochan/swrm",
+        "kind": "issue",
+        "number": 210
+      },
+      "author": "surlymochan",
+      "author_is_bot": false,
+      "body": "## M26 slice 2 证据（2026-11-14）\n\nPR：**#211** — https://github.com/surlymochan/swrm/pull/211\nhead SHA：`c0bf3e47c44cb9f40f0333305b0bb392891e8dff`（分支 `m26-slice2-fanout-recovery`，base main）\nPR CI：**全绿** — 9 个测试矩阵（ubuntu/macos/windows × py3.9/3.11/3.13）全部 pass，secrets pass。\n\n### 测试\n- 新测试：17 项（`tests/test_m26_slice2.py`），切片 1＋切片 2 单元测试 33 passed、20 subtests passed。\n- 本地全量（修复扫描 bug 后一次跑完）：**1055 passed、6 skipped、212 subtests passed，552.09 秒，exit 0**。\n\n### 跨机并发证据（VM ↔ gocc，pi 后端）\n`fleet dispatch-many` 6 卡、2 波次、分布 `{\"gocc\": 3, \"local\": 3}`，6/6 done，summary 账本 28 行：\n- fanout-1 → gocc `20261114-183458-dec0b6`，done rc 0，verify rc 0，分支 commit `925e90dec5d5`，5.9s，账本 23 行\n- fanout-2 → local `20261114-103426-b093ec`，done rc 0，verify rc 0，分支 commit `6441a1dba84c`，18.4s，账本 22 行\n- fanout-3 → gocc `20261114-183456-bae1c7`，done rc 0，commit `11b3b49bb16a`，12.1s，账本 24 行\n- fanout-4 → local `20261114-103426-1a8d79`，done rc 0，commit `7af769f99c28`，12.4s，账本 20 行\n- fanout-5 → gocc `20261114-183547-8c3cc6`，done rc 0，commit `3b117c763acf`，4.4s，账本 27 行\n- fanout-6 → local `20261114-103518-6e2fb4`，done rc 0，commit `982c503d839a`，19.2s，账本 26 行\n- fanout-1/2 带 per-card `verify:` 行（verify rc 0）；其余 4 卡无 verify。每条分支证明文件均以 `git show` 实读，内容恰为 `m26-slice2 fanout proof <n>`。\n- 控制端账本：`~/.claude/openswarm/ledger.jsonl`。首次尝试 6/6 全败（两边 pi 隔离启动器不可用）如实保留在文档中，含临时 `policy.local.json` 覆盖与事后双边还原。\n\n### 断线案例证据（真实停机，非构造）\n- 长任务（全量测试）派往 gocc，远端 run `20261114-183717-7ff501` 运行中、runner pid 45039 经 `ps` 核实后 SIGTERM 停掉；远端 status.json 仍为 running＋死 pid。\n- 派单侧：remote rc 255，`remote_run_id: null`，fetch_error 如实记账，账本 29 行（未静默丢失）。\n- `fleet recover 20261114-183717-7ff501 --runner gocc` → disposition `recovered`，`recovered_final: true`，账本 30 行。\n- `fleet recover … --redispatch` → 改派 local，新 run `20261114-103856-90ae55`，done，1050.8s，分支 commit `6fb7df897d6b`，证明文件 `m26-slice2 disconnect proof passed=1038 failed=0`，账本 34/35 行。\n- 证据运行中发现的扫描模式 bug（把无 id 记录的 entry id 当 run id 探查，账本 31/32 行误判）已在 PR 内修复并补回归测试；修复后扫描将两条无 id 记录列为 skipped、不写新账本行。\n\n### 未核实项\n- 无。gocc 侧临时覆盖已从备份逐字节恢复并核验（pi 段回原值）；本地临时 `policy.local.json` 已删；控制器 fleet.json 本地条目路径修正（`~/code/swrm` → 本工作树）与 capacity 2 保留，见文档说明。",
+      "created_at": "2026-11-14T11:16:50Z",
+      "provenance": {
+        "verbatim": true,
+        "url": "https://github.com/surlymochan/swrm/issues/210#issuecomment-6876463120",
+        "comment_id": 6876463120,
+        "fetched": "2026-11-14"
+      }
+    },
+    {
+      "id": "synthetic:unlisted-mentioned",
+      "source": "github",
+      "thread": {
+        "repo": "surlymochan/swrm",
+        "kind": "issue",
+        "number": 999
+      },
+      "author": "alice-example",
+      "author_is_bot": false,
+      "body": "@openswarm 请修一下这个 bug：fleet dispatch 在容量满时静默跳过了。",
+      "created_at": "2026-11-14T12:00:00Z",
+      "provenance": {
+        "verbatim": false,
+        "synthetic": true,
+        "reason": "real stream has no unlisted author; covers unlisted+mentioned"
+      }
+    },
+    {
+      "id": "synthetic:unlisted-unmentioned",
+      "source": "github",
+      "thread": {
+        "repo": "surlymochan/swrm",
+        "kind": "issue",
+        "number": 999
+      },
+      "author": "bob-example",
+      "author_is_bot": false,
+      "body": "这个功能很好，加油！",
+      "created_at": "2026-11-14T12:01:00Z",
+      "provenance": {
+        "verbatim": false,
+        "synthetic": true,
+        "reason": "real stream has no unlisted author; covers unlisted+unmentioned"
+      }
+    },
+    {
+      "id": "synthetic:listed-stop-pr13",
+      "source": "github",
+      "thread": {
+        "repo": "surlymochan/swrm",
+        "kind": "pr",
+        "number": 13
+      },
+      "author": "surlymochan",
+      "author_is_bot": false,
+      "body": "@openswarm stop，别做了",
+      "created_at": "2026-11-14T12:02:00Z",
+      "provenance": {
+        "verbatim": false,
+        "synthetic": true,
+        "reason": "real stream has no stop; ends R1's ticket on the same thread"
+      }
+    },
+    {
+      "id": "synthetic:listed-money",
+      "source": "github",
+      "thread": {
+        "repo": "surlymochan/swrm",
+        "kind": "issue",
+        "number": 998
+      },
+      "author": "surlymochan",
+      "author_is_bot": false,
+      "body": "@openswarm 帮我买 10 USDT 的 BTC",
+      "created_at": "2026-11-14T12:03:00Z",
+      "provenance": {
+        "verbatim": false,
+        "synthetic": true,
+        "reason": "real stream has no money request; covers money-draft-only"
+      }
+    },
+    {
+      "id": "github:surlymochan/swrm#13:comment:6510574536",
+      "source": "github",
+      "thread": {
+        "repo": "surlymochan/swrm",
+        "kind": "pr",
+        "number": 13
+      },
+      "author": "surlymochan",
+      "author_is_bot": false,
+      "body": "@codex review",
+      "created_at": "2026-10-29T23:03:52Z",
+      "provenance": {
+        "verbatim": true,
+        "url": "https://github.com/surlymochan/swrm/pull/13#issuecomment-6510574536",
+        "comment_id": 6510574536,
+        "fetched": "2026-11-14",
+        "note": "duplicate delivery of R1 (same trigger id)"
+      }
+    }
+  ],
+  "expected": {
+    "github:surlymochan/swrm#13:comment:6510574536": {
+      "decision": "accept",
+      "strength": "inferred",
+      "draft_only": false
+    },
+    "github:surlymochan/swrm#13:comment:6510579421": {
+      "decision": "ignore",
+      "strength": null,
+      "draft_only": false
+    },
+    "github:surlymochan/swrm#16:comment:6512478180": {
+      "decision": "accept",
+      "strength": "inferred",
+      "draft_only": false
+    },
+    "github:surlymochan/swrm#212:comment:6876814735": {
+      "decision": "accept",
+      "strength": "inferred",
+      "draft_only": false
+    },
+    "github:surlymochan/swrm#13:comment:6510592583": {
+      "decision": "ignore",
+      "strength": null,
+      "draft_only": false
+    },
+    "github:surlymochan/swrm#210:comment:6876463120": {
+      "decision": "accept",
+      "strength": "inferred",
+      "draft_only": false
+    },
+    "synthetic:unlisted-mentioned": {
+      "decision": "accept",
+      "strength": "inferred",
+      "draft_only": false
+    },
+    "synthetic:unlisted-unmentioned": {
+      "decision": "ignore",
+      "strength": null,
+      "draft_only": false
+    },
+    "synthetic:listed-stop-pr13": {
+      "decision": "stop",
+      "strength": null,
+      "draft_only": false
+    },
+    "synthetic:listed-money": {
+      "decision": "accept",
+      "strength": "explicit",
+      "draft_only": true
+    }
+  }
+}
