@@ -24,6 +24,7 @@ boundary is exact.
 
 Run: python3 -m unittest discover -s tests   (or: python3 tests/test_codex_usage_independent.py)
 """
+import argparse
 import copy
 import datetime as dt
 import json
@@ -151,6 +152,11 @@ class SettingParsing(unittest.TestCase):
                 self.assertIsNone(xs.codex_usage_independent_until(p))
                 with Clock(BEFORE):
                     self.assertFalse(xs.codex_usage_independent(p))
+
+    def test_non_dict_codex_section_fails_safe(self):
+        for value in (None, [], "invalid", 1):
+            with self.subTest(value=value), Clock(BEFORE):
+                self.assertFalse(xs.codex_usage_independent({"codex": value}))
 
     def test_valid_utc_deadline_is_parsed(self):
         p = policy()
@@ -383,6 +389,117 @@ class QuotaFilter(unittest.TestCase):
             decision, info = xs.apply_quota_routing(prof, copy.deepcopy(st), p, decision)
         self.assertIsNone(info)
         self.assertEqual(decision["backend"], "codex")
+
+
+class HealthGate(unittest.TestCase):
+    def test_only_codex_financial_check_is_waived(self):
+        p = policy()
+        p["routing"]["health_gate"] = {"enabled": True, "on_unknown": "block"}
+        p["routing"]["quota"]["sources"] = {
+            "codex": {"source": "env", "var": "SYNTHETIC_CODEX_QUOTA"},
+            "ocgo": {"source": "env", "var": "SYNTHETIC_OCGO_QUOTA"}}
+        args = argparse.Namespace(health_gate=True)
+        st = state()
+        good_binary = xs._health_check("binary", "pass", "synthetic binary", "mock")
+        good_login = xs._health_check("login", "pass", "synthetic login", "mock")
+        with mock.patch.object(xs, "_health_check_binary", return_value=good_binary), \
+             mock.patch.object(xs, "_health_codex_login", return_value=good_login) as login, \
+             mock.patch.object(xs, "quota_remaining_from_source") as reader:
+            for result, status, blocked in (((None, "401 unauthorized"), "fail", True),
+                                             ((None, None), "unknown", True),
+                                             ((0, None), "pass", False)):
+                with self.subTest(result=result):
+                    reader.reset_mock()
+                    reader.return_value = result
+                    with Clock(BEFORE):
+                        record, denied = xs.apply_health_gate("codex", st, p, args)
+                    self.assertFalse(denied)
+                    self.assertEqual(next(c for c in record["checks"] if c["name"] == "quota")["status"],
+                                     "not_applicable")
+                    reader.assert_not_called()
+                    with Clock(AT):
+                        record, denied = xs.apply_health_gate("codex", st, p, args)
+                    self.assertEqual(next(c for c in record["checks"] if c["name"] == "quota")["status"], status)
+                    self.assertEqual(denied, blocked)
+                    reader.assert_called_once()
+            login.return_value = xs._health_check("login", "fail", "synthetic login failure", "mock")
+            reader.reset_mock()
+            with Clock(BEFORE):
+                record, denied = xs.apply_health_gate("codex", st, p, args)
+            self.assertTrue(denied)
+            self.assertEqual(record["verdict"], "unhealthy")
+            reader.assert_not_called()
+            reader.return_value = (None, "401 unauthorized")
+            with Clock(BEFORE):
+                record, denied = xs.apply_health_gate("ocgo", st, p, args)
+            self.assertTrue(denied)
+            self.assertEqual(record["verdict"], "unhealthy")
+            reader.assert_called_once()
+
+
+class FreshProbe(unittest.TestCase):
+    def test_financial_collection_skipped_and_cache_keeps_original_time(self):
+        p = policy()
+        old = state()
+        old["generated_at"] = BEFORE - 10000
+        old["codex"]["limits_source"] = "local"
+        models = [{"id": "synthetic-model"}]
+        with mock.patch.object(xs, "jload", return_value=old), \
+             mock.patch.object(xs, "envvar", return_value=None), \
+             mock.patch.object(xs, "jsave"), \
+             mock.patch.object(xs, "find_codex", return_value=("synthetic", "1")), \
+             mock.patch.object(xs, "codex_models", return_value=(models, "mock")) as discover, \
+             mock.patch.object(xs, "codex_plan", return_value="mock"), \
+             mock.patch.object(xs, "codex_config_model", return_value=None), \
+             mock.patch.object(xs, "_codex_limits", side_effect=OSError("synthetic stat")) as limits, \
+             mock.patch.object(xs, "codex_snapshot_status", side_effect=AssertionError("snapshot read")) as snapshot, \
+             mock.patch.object(xs, "probe_claude", return_value={}), \
+             mock.patch.object(xs, "probe_ocgo", return_value={}) as ocgo, \
+             mock.patch.object(xs, "probe_deepseek", return_value={}), \
+             mock.patch.object(xs, "probe_cursor", return_value={}), \
+             mock.patch.object(xs, "probe_agy", return_value={}), \
+             mock.patch.object(xs, "probe_pi", return_value={}):
+            with Clock(BEFORE):
+                fresh = xs.get_state(p, refresh=True)
+            self.assertEqual(fresh["codex"]["models"], models)
+            self.assertEqual(fresh["codex"]["limits"]["codex"]["windows"],
+                             old["codex"]["limits"]["codex"]["windows"])
+            self.assertIsNone(fresh["codex"]["limits"]["codex"]["age_minutes"])
+            self.assertEqual(fresh["codex"]["limits_source"], "cached")
+            self.assertEqual(fresh["codex"]["limits_cached_at"], old["generated_at"])
+            xs.jload.return_value = fresh
+            with Clock(BEFORE + 10):
+                again = xs.get_state(p, refresh=True)
+            self.assertEqual(again["codex"]["limits_cached_at"], old["generated_at"])
+            limits.assert_not_called()
+            self.assertEqual(discover.call_count, 2)
+            self.assertEqual(ocgo.call_count, 2)
+            fresh["generated_at"] = AT - 1  # still inside the normal state TTL
+            with Clock(AT), self.assertRaisesRegex(OSError, "synthetic stat"):
+                xs.get_state(p)
+            limits.assert_called_once_with(p)
+            limits.side_effect = None
+            limits.return_value = ({"fresh": {}}, "local")
+            snapshot.side_effect = None
+            snapshot.return_value = None
+            with Clock(AT):
+                restored = xs.get_state(p)
+            self.assertEqual(restored["codex"]["limits_source"], "local")
+            self.assertEqual(restored["codex"]["limits"], {"fresh": {}})
+
+    def test_no_cache_does_not_invent_observation(self):
+        with Clock(BEFORE), mock.patch.object(xs, "jload", return_value={}), \
+             mock.patch.object(xs, "find_codex", return_value=(None, None)), \
+             mock.patch.object(xs, "codex_models", return_value=([], "mock")), \
+             mock.patch.object(xs, "codex_plan", return_value=None), \
+             mock.patch.object(xs, "codex_config_model", return_value=None), \
+             mock.patch.object(xs, "_codex_limits", side_effect=AssertionError("limits read")), \
+             mock.patch.object(xs, "codex_snapshot_status", side_effect=AssertionError("snapshot read")):
+            result = xs.probe_codex(policy())
+        self.assertEqual(result["limits"], {})
+        self.assertEqual(result["limits_source"], "not_collected")
+        self.assertNotIn("limits_cached_at", result)
+        self.assertNotIn("limits_snapshot", result)
 
 
 class Isolation(unittest.TestCase):

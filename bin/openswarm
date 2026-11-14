@@ -2070,13 +2070,30 @@ def cmd_quota_sync(args, policy, runner=None):
 def probe_codex(policy):
     binary, version = find_codex(policy)
     models, source = codex_models(binary, policy)
-    limits, origin = _codex_limits(policy)
+    independent = codex_usage_independent(policy)
+    if independent:
+        previous = jload(STATE, {}) or {}
+        previous = previous if isinstance(previous, dict) else {}
+        cached = previous.get("codex")
+        cached = cached if isinstance(cached, dict) else {}
+        limits = copy.deepcopy(cached.get("limits")) if isinstance(cached.get("limits"), dict) else {}
+        for entry in limits.values():
+            if isinstance(entry, dict):
+                observed = to_epoch(entry.get("observed_at"))
+                entry["age_minutes"] = round((NOW() - observed) / 60, 1) if observed else None
+        origin = "cached" if limits else "not_collected"
+    else:
+        limits, origin = _codex_limits(policy)
     out = {"binary": binary, "version": version, "plan": codex_plan(policy), "models": models,
            "models_source": source, "limits": limits, "limits_source": origin,
            "config_model": codex_config_model()}
-    snapshot = codex_snapshot_status(policy)
-    if snapshot is not None:
-        out["limits_snapshot"] = snapshot
+    if independent:
+        if limits:
+            out["limits_cached_at"] = cached.get("limits_cached_at", previous.get("generated_at"))
+    else:
+        snapshot = codex_snapshot_status(policy)
+        if snapshot is not None:
+            out["limits_snapshot"] = snapshot
     return out
 
 
@@ -2277,7 +2294,9 @@ def get_state(policy, refresh=False):
         return st
     st = jload(STATE)
     ttl = policy["thresholds"]["state_ttl_minutes"] * 60
-    if refresh or not st or NOW() - st.get("generated_at", 0) > ttl:
+    codex = st.get("codex") if isinstance(st, dict) else None
+    deferred = isinstance(codex, dict) and codex.get("limits_source") in ("cached", "not_collected")
+    if refresh or not st or NOW() - st.get("generated_at", 0) > ttl or (deferred and not codex_usage_independent(policy)):
         st = probe(policy)
     return st
 
@@ -4417,7 +4436,8 @@ def codex_usage_independent_until(policy):
     and offsets other than UTC are rejected on
     purpose: the deadline is compared against UTC everywhere.
     """
-    raw = (policy.get("codex") or {}).get("usage_independent_until")
+    codex = policy.get("codex")
+    raw = codex.get("usage_independent_until") if isinstance(codex, dict) else None
     if not isinstance(raw, str):
         return None
     match = CODEX_USAGE_INDEPENDENT_RE.match(raw.strip())
@@ -5452,7 +5472,9 @@ def builtin_quota_remaining(backend, st):
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     used.append(value)
         if used:
-            if cx.get("limits_source") == "snapshot" and snapshot is not None:
+            if cx.get("limits_source") == "cached":
+                text = "builtin codex (cached windows, fraction)"
+            elif cx.get("limits_source") == "snapshot" and snapshot is not None:
                 text = (f"builtin codex (synced snapshot from {snapshot['source_host']}, "
                         f"age {snapshot['age_minutes']} min, fraction)")
             else:
@@ -6103,7 +6125,12 @@ def health_probe_backend(backend, st, policy, timeout_seconds=HEALTH_GATE_DEFAUL
                                         "DeepSeek key presence could not be determined from probe state",
                                         "probe state: deepseek"))
     if backend in ("codex", "pi", "ocgo", "deepseek") and not timed_out():
-        quota_check = _health_quota_readable(backend, st, policy, custom_backends)
+        if backend == "codex" and codex_usage_independent(policy):
+            quota_check = _health_check("quota", "not_applicable",
+                                        "Codex financial quota check waived during usage-independent window",
+                                        "policy codex.usage_independent_until")
+        else:
+            quota_check = _health_quota_readable(backend, st, policy, custom_backends)
         if quota_check is not None:
             checks.append(quota_check)
     if backend == "ocgo" and not timed_out():
