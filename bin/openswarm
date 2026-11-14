@@ -2367,7 +2367,7 @@ def compute_routing_weights(entries, min_samples=8):
     for entry in entries:
         if not isinstance(entry, dict) or not entry.get("backend"):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch"):
             # M7 slice 1 (#122) / slice 2 (#124): a batch or fleet
             # routing-decision record is not a run outcome — it must not
             # inflate run counts or pass rates. A fleet-health reap record
@@ -2376,7 +2376,9 @@ def compute_routing_weights(entries, min_samples=8):
             # a verification record, not a second run outcome. A fleet
             # verify-evalid record (M13 slice 2, #153) is the same. A
             # fleet health-gate record (M25 slice 2, #204) is a dispatch
-            # decision, not a run outcome.
+            # decision, not a run outcome. A fleet remote-dispatch record
+            # (M26 slice 1, #207) mirrors a remote outcome, not a second
+            # local one.
             continue
         key = (entry.get("backend"), entry.get("model"), entry.get("card_type"))
         groups.setdefault(key, []).append(entry)
@@ -2535,7 +2537,7 @@ def compute_adaptive_margins(entries, policy):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -2916,7 +2918,7 @@ def compute_advice_accuracy(entries):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -3034,7 +3036,7 @@ def compute_weighted_eval(entries, margin=0.10, plan_ok=None):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -3222,7 +3224,7 @@ def compute_gate_eval(entries, margin=0.10,
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -11963,26 +11965,100 @@ def cmd_lane_systemd(args):
 
 # ---------------------------------------------------------------- fleet
 
+# Runner registry (M26 slice 1, #207): fleet.json is the declarative
+# registry of remote runners, in the M3 custom-backends style — a bad
+# registry refuses to start with an actionable error, never silently
+# degrades (no dropped runner, no invented backend list, no local
+# fallback for a remote dispatch).
+
+
+class FleetConfigError(ValueError):
+    """A fleet.json runner-registry entry is missing, malformed, or invalid."""
+
+
+class FleetDispatchError(ValueError):
+    """A fleet dispatch was refused or failed; nothing was silently rerouted."""
+
+
+FLEET_HOST_FIELDS = {"name", "kind", "ssh", "box", "repos", "openswarm",
+                     "backends", "capacity"}
+KNOWN_BACKEND_IDS = sorted(set(PLANNERS) | set(BACKEND_ALIASES))
+
+
 def fleet_config():
     path = os.path.join(DATA, "fleet.json")
-    cfg = jload(path, {"hosts": [{"name": "local", "kind": "local"}]} if not os.path.exists(path) else None)
+    if not os.path.exists(path):
+        cfg = {"hosts": [{"name": "local", "kind": "local"}]}
+    else:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError) as exc:
+            raise FleetConfigError(
+                f"fleet.json {path} is not readable JSON ({exc}); "
+                f"fix the file or delete it to fall back to the local-only default") from exc
     if not isinstance(cfg, dict) or not isinstance(cfg.get("hosts"), list):
-        raise ValueError("invalid fleet.json: expected {\"hosts\":[...]}")
+        raise FleetConfigError(
+            f"invalid fleet.json {path}: expected {{\"hosts\":[...]}}; "
+            f"fix the file or delete it to fall back to the local-only default")
     hosts = {}
     for host in cfg["hosts"]:
         if not isinstance(host, dict) or not isinstance(host.get("name"), str) or not LANE_NAME_RE.fullmatch(host["name"]):
-            raise ValueError("invalid fleet host name")
+            raise FleetConfigError(
+                f"invalid fleet.json {path}: each host needs a valid 'name' "
+                f"(1-48 chars, letters/digits/._-); fix the host entry or remove it")
         name, kind = host["name"], host.get("kind")
         if name in hosts or kind not in ("local", "ssh", "instabox"):
-            raise ValueError(f"invalid or duplicate fleet host: {name}")
+            raise FleetConfigError(
+                f"fleet.json {path}: host {name!r}: invalid or duplicate host — "
+                f"'kind' must be one of local/ssh/instabox and each name unique; "
+                f"fix the entry or remove it")
+        unknown = sorted(set(host) - FLEET_HOST_FIELDS)
+        if unknown:
+            raise FleetConfigError(
+                f"fleet.json {path}: host {name!r}: unknown field(s) {', '.join(unknown)}; "
+                f"allowed fields are {', '.join(sorted(FLEET_HOST_FIELDS))}; "
+                f"fix by removing the field(s) or moving the data elsewhere")
         field = {"ssh": "ssh", "instabox": "box"}.get(kind)
         if field and (not isinstance(host.get(field), str) or not host[field] or host[field].startswith("-")):
-            raise ValueError(f"fleet host {name} requires {field}")
+            raise FleetConfigError(
+                f"fleet.json {path}: host {name!r} requires a non-empty {field!r} "
+                f"(SSH alias / box name, not starting with '-'); fix by setting {field!r} for the host")
         repos = host.get("repos", {})
         if not isinstance(repos, dict) or any(not isinstance(p, str) or not p for p in repos.values()):
-            raise ValueError(f"invalid repos for fleet host {name}")
+            raise FleetConfigError(
+                f"fleet.json {path}: host {name!r}: 'repos' must map repo names to "
+                f"non-empty paths, e.g. {{\"repos\": {{\"project\": \"/srv/project\"}}}}; "
+                f"fix the mapping or remove it")
         if "openswarm" in host and (not isinstance(host["openswarm"], str) or not host["openswarm"]):
-            raise ValueError(f"invalid openswarm path for fleet host {name}")
+            raise FleetConfigError(
+                f"fleet.json {path}: host {name!r}: 'openswarm' must be a non-empty "
+                f"path to the runner binary on that host; fix the path or remove it")
+        backends = host.get("backends")
+        if backends is not None:
+            if (not isinstance(backends, list) or not backends
+                    or any(not isinstance(b, str) or not b for b in backends)):
+                raise FleetConfigError(
+                    f"fleet.json {path}: host {name!r}: 'backends' must be a non-empty "
+                    f"list of backend ids, e.g. [\"codex\", \"pi\"]; fix the list or remove it")
+            unknown_backends = sorted(set(backends) - set(KNOWN_BACKEND_IDS))
+            if unknown_backends:
+                raise FleetConfigError(
+                    f"fleet.json {path}: host {name!r}: unknown backend(s) "
+                    f"{', '.join(unknown_backends)}; known backends are "
+                    f"{', '.join(KNOWN_BACKEND_IDS)}; fix the id(s) — a typo here "
+                    f"would dispatch to a backend the runner cannot run")
+            if len(set(backends)) != len(backends):
+                raise FleetConfigError(
+                    f"fleet.json {path}: host {name!r}: duplicate backend in 'backends'; "
+                    f"fix by listing each backend once")
+        capacity = host.get("capacity")
+        if capacity is not None:
+            if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+                raise FleetConfigError(
+                    f"fleet.json {path}: host {name!r}: 'capacity' must be a positive "
+                    f"integer (max concurrent runs), got {capacity!r}; fix the value "
+                    f"or remove it for no cap")
         hosts[name] = host
     return hosts
 
@@ -12001,12 +12077,28 @@ def shell_path(path):
     return '"$HOME"/' + shlex.quote(path[2:]) if path.startswith("~/") else shlex.quote(path)
 
 
+def ssh_argv(host_alias):
+    """ssh argv for a fleet host, honoring OPENSWARM_SSH_CONFIG.
+
+    Unset, the argv is byte-identical to before. Set, ssh reads the given
+    config file — needed where the process user and the config owner
+    differ (this VM runs as root with HOME=/home/hatch, so plain ssh reads
+    the empty /root/.ssh/config instead of the user's config that defines
+    the gocc alias; point it at /home/hatch/.ssh/config there).
+    """
+    argv = ["ssh"]
+    config = os.environ.get("OPENSWARM_SSH_CONFIG")
+    if config:
+        argv += ["-F", config]
+    return argv + [host_alias, "--"]
+
+
 def host_run(host, command, timeout=60, input=None):
     """Binary-safe transport, including stdin for cards and git bundles. Never logs commands or env."""
     if host["kind"] == "local":
         argv = ["sh", "-c", command]
     elif host["kind"] == "ssh":
-        argv = ["ssh", host["ssh"], "--", command]
+        argv = ssh_argv(host["ssh"]) + [command]
     else:
         argv = ["instabox", "ssh", host["box"], "--", command]
     try:
@@ -12598,14 +12690,16 @@ def cmd_ledger_backfill_pass(args):
                 continue
             if not isinstance(entry, dict):
                 continue
-            if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate"):
+            if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch"):
                 # M7 slice 1 (#122) / slice 2 (#124): a batch or fleet
                 # routing-decision record is not a run outcome — backfill
                 # must not stamp exec_pass on it. Same for a fleet-health
                 # reap record (M12 slice 2, #148) and a batch verify-evalid
                 # record (M13 slice 1, #151). A fleet verify-evalid record
                 # (M13 slice 2, #153) is likewise a verification record,
-                # not a run outcome.
+                # not a run outcome. A fleet remote-dispatch record (M26
+                # slice 1, #207) mirrors a remote outcome, not a second
+                # local one.
                 skipped += 1
                 continue
             status = entry.get("status")
@@ -12849,6 +12943,12 @@ def cmd_fleet(args, policy=None):
                     print(f"  reaped {entry['id']} dead -> exited ledger:{entry.get('ledger_line')}")
                 for entry in (row.get("reap") or {}).get("skipped") or []:
                     print(f"  skip {entry['id']} {entry.get('verdict')} ({entry.get('reason')})")
+        return
+    if args.fleet_cmd == "runners":
+        cmd_fleet_runners(args)
+        return
+    if args.fleet_cmd == "dispatch":
+        cmd_fleet_dispatch(args, policy)
         return
     if args.fleet_cmd == "exec":
         host = fleet_host(args.host)
@@ -13603,6 +13703,286 @@ def fleet_exec_run_id(out):
         pass
     matches = re.findall(r'"id"\s*:\s*"([A-Za-z0-9][A-Za-z0-9_.-]*)"', text)
     return matches[-1] if matches else None
+
+
+# ---------------------------------------------------------------- remote runners (M26 slice 1, #207)
+# One-to-one remote dispatch: the controller packs a task card (+ optional
+# custom-backends file) and a worktree spec (repo + base commit), the runner
+# executes its own backend CLI, and the result/ledger/log pointers come
+# back into the controller ledger. A remote runner that cannot be reached
+# is refused loudly — dispatch never silently falls back to local, never
+# reroutes to another backend, and never records a run that did not happen.
+
+
+def fleet_runner_transport(host):
+    """Human-readable transport target for a runner registry entry."""
+    if host["kind"] == "ssh":
+        return host["ssh"]
+    if host["kind"] == "instabox":
+        return host["box"]
+    return "local"
+
+
+def fleet_dispatch_snapshot(host):
+    """Reachability preflight for one runner: its live snapshot, or a
+    FleetDispatchError naming the transport and the fix. Local runners
+    need no transport, so their snapshot is read directly."""
+    if host["kind"] == "local":
+        # Preflight only needs the active-run count for the capacity check,
+        # so read the capacity-only snapshot (no model probes).
+        previous = os.environ.get("OPENSWARM_FLEET_CAPACITY_ONLY")
+        os.environ["OPENSWARM_FLEET_CAPACITY_ONLY"] = "1"
+        try:
+            return fleet_snapshot()
+        except (ValueError, RuntimeError, OSError) as error:
+            raise FleetDispatchError(
+                f"runner 'local': local snapshot failed ({error}); fix the local "
+                f"openswarm state before dispatching") from error
+        finally:
+            if previous is None:
+                os.environ.pop("OPENSWARM_FLEET_CAPACITY_ONLY", None)
+            else:
+                os.environ["OPENSWARM_FLEET_CAPACITY_ONLY"] = previous
+    try:
+        return host_json(host, ["fleet", "_snapshot"], timeout=20, capacity_only=True)
+    except (ValueError, RuntimeError) as error:
+        raise FleetDispatchError(
+            f"runner {host['name']!r} unreachable via {host['kind']} "
+            f"{fleet_runner_transport(host)!r}: {error}; dispatch aborted — "
+            f"nothing ran on the runner and nothing fell back to local; fix the "
+            f"transport (check the SSH alias/box, the runner binary, and that "
+            f"the machine is up) and retry") from error
+
+
+def fleet_remote_home(host):
+    """Absolute home directory on the runner, for paths the remote Python
+    process opens directly (it never expands `~`)."""
+    rc, out, err = host_run(host, "printf '%s' \"$HOME\"", timeout=20)
+    if rc:
+        detail = err.decode(errors="replace").strip() or f"transport failed (rc={rc})"
+        raise FleetDispatchError(
+            f"runner {host['name']!r}: could not resolve the runner home directory "
+            f"({detail}); dispatch aborted")
+    home = out.decode(errors="replace").strip()
+    if not home.startswith("/"):
+        raise FleetDispatchError(
+            f"runner {host['name']!r}: unexpected home directory {home!r}; dispatch aborted")
+    return home
+
+
+def fleet_transfer_text(host, content, remote_path, timeout=60):
+    """Write `content` bytes to `remote_path` (absolute) on the runner via
+    its transport stdin; returns the remote path. A failed transfer is a
+    dispatch refusal, never a partial dispatch."""
+    rc, _, err = host_run(host, "cat > " + shell_path(remote_path), timeout=timeout, input=content)
+    if rc:
+        detail = err.decode(errors="replace").strip() or f"transport failed (rc={rc})"
+        raise FleetDispatchError(
+            f"runner {host['name']!r}: could not transfer {os.path.basename(remote_path)} "
+            f"({detail}); dispatch aborted — check the transport and the runner's "
+            f"home directory")
+    return remote_path
+
+
+def fleet_record_remote_dispatch(host_name, entry_id, backend, repo, base,
+                                 title, run_id, remote_rc, result, fetch_error,
+                                 remote_run_dir):
+    """Controller-ledger entry for one remote dispatch (M26 slice 1, #207).
+
+    The remote run writes its own outcome ledger on the runner; this entry
+    is the controller-side dispatch record — remote run id, remote status,
+    verify rc, branch/commit, and the pointers back to the remote run dir
+    and its _run-info — joined to the remote run by run_id so a later
+    `fleet ledger pull` dedups instead of double-counting. Flagged
+    fleet_remote_dispatch so routing-weight / advice-accuracy / eval /
+    backfill computations skip it: it mirrors a remote outcome, it is not
+    a second local outcome. A ledger write failure must not fail the
+    dispatch, so it is reported and the printed summary stays authoritative.
+    Returns the controller ledger line number, or None when it could not
+    be determined.
+    """
+    verify = (result or {}).get("verify") if isinstance(result, dict) else None
+    verify_rc = (verify or {}).get("rc") if isinstance(verify, dict) else None
+    entry = {"id": entry_id, "run_id": run_id, "ts": NOW(),
+             "title": f"fleet {host_name} remote dispatch: {title}",
+             "status": "dispatched", "host": host_name,
+             "backend": backend, "fleet_remote_dispatch": True,
+             "remote_run_id": run_id, "remote_repo": repo, "remote_base": base,
+             "remote_rc": remote_rc, "verify_rc": verify_rc,
+             "remote_run_dir": remote_run_dir,
+             "remote_log": (f"openswarm fleet exec {host_name} -- fleet _run-info {run_id}"
+                            if run_id else None),
+             "seconds": (result or {}).get("seconds") if isinstance(result, dict) else None}
+    if isinstance(result, dict):
+        entry["remote_result"] = {"status": result.get("status"),
+                                  "verify_rc": verify_rc,
+                                  "branch": result.get("branch"),
+                                  "commit": result.get("commit")}
+    if fetch_error is not None:
+        entry["fetch_error"] = fetch_error
+    try:
+        append_ledger(entry)
+    except OSError as error:
+        print(f"openswarm: warning: could not record remote dispatch for fleet "
+              f"{host_name} in ledger: {error}", file=sys.stderr)
+        return None
+    return ledger_run_lines().get(run_id or entry_id)
+
+
+def cmd_fleet_runners(args):
+    """List the registered runners with their declared backends, capacity,
+    and live reachability (M26 slice 1, #207). Unreachable runners are
+    shown, never dropped."""
+    hosts = list(fleet_config().values())
+    rows = []
+    for host in hosts:
+        row = {"name": host["name"], "kind": host["kind"],
+               "transport": fleet_runner_transport(host),
+               "backends": host.get("backends"),
+               "capacity": host.get("capacity"),
+               "reachable": None, "active_runs": None, "error": None}
+        try:
+            snapshot = fleet_dispatch_snapshot(host)
+            row["reachable"] = True
+            row["active_runs"] = len(snapshot.get("active_runs") or [])
+        except FleetDispatchError as error:
+            row["reachable"] = False
+            row["error"] = str(error)
+        rows.append(row)
+    if getattr(args, "json", False):
+        print(json.dumps({"runners": rows}, indent=2, ensure_ascii=False))
+        return
+    for row in rows:
+        backends = ",".join(row["backends"]) if row["backends"] else "unspecified"
+        capacity = row["capacity"] if row["capacity"] is not None else "unlimited"
+        active = row["active_runs"] if row["active_runs"] is not None else "-"
+        status = "reachable" if row["reachable"] else "unreachable"
+        print(f"{row['name']}  {row['kind']}  {row['transport']}  "
+              f"backends={backends}  capacity={capacity}  {status}  active={active}")
+        if row.get("error"):
+            print(f"  {row['error']}")
+
+
+def cmd_fleet_dispatch(args, policy=None):
+    """Dispatch one task card to one named runner and record the returned
+    result in the controller ledger (M26 slice 1, #207).
+
+    Order: registry validation → runner + backend + repo checks → transport
+    preflight (unreachable refuses loudly, no local fallback) → capacity
+    check → card transfer → remote run → result fetch → ledger record.
+    The remote run's exit code is the dispatch exit code; a fetch failure
+    after a successful remote run still exits non-zero so the gap is
+    visible, with fetch_error on the ledger record instead of a fabricated
+    verdict.
+    """
+    hosts = fleet_config()
+    if args.runner not in hosts:
+        raise FleetDispatchError(
+            f"unknown runner {args.runner!r}; registered runners are "
+            f"{', '.join(sorted(hosts)) or 'none'}; add the runner to fleet.json "
+            f"or pick a registered one")
+    host = hosts[args.runner]
+    try:
+        with open(args.task_file, "rb") as fh:
+            card = fh.read()
+    except OSError as exc:
+        raise FleetDispatchError(
+            f"cannot read task card {args.task_file!r} ({exc}); fix the path") from exc
+    if not card.strip():
+        raise FleetDispatchError(
+            f"task card {args.task_file!r} is empty; write the task before dispatching")
+    declared = host.get("backends")
+    if declared is not None and args.backend not in declared:
+        raise FleetDispatchError(
+            f"runner {args.runner!r} does not offer backend {args.backend!r}; "
+            f"it offers {', '.join(declared)}; pick an offered backend or add "
+            f"{args.backend!r} to the runner's 'backends' in fleet.json")
+    repo_path = (host.get("repos") or {}).get(args.repo)
+    if not repo_path:
+        raise FleetDispatchError(
+            f"runner {args.runner!r} has no repository mapping for {args.repo!r}; "
+            f"add \"repos\": {{\"{args.repo}\": \"<path on the runner>\"}} to the "
+            f"runner's fleet.json entry")
+    snapshot = fleet_dispatch_snapshot(host)
+    capacity = host.get("capacity")
+    active = len(snapshot.get("active_runs") or [])
+    if capacity is not None and active >= capacity:
+        raise FleetDispatchError(
+            f"runner {args.runner!r} is at capacity ({active}/{capacity} active runs); "
+            f"wait for a run to finish or raise 'capacity' in fleet.json — "
+            f"the task was not dispatched anywhere")
+    if args.base:
+        base = args.base
+    else:
+        rc, out, err = host_git(host, repo_path, ["rev-parse", "HEAD"], timeout=60)
+        if rc:
+            detail = err.decode(errors="replace").strip() or f"git failed (rc={rc})"
+            raise FleetDispatchError(
+                f"runner {args.runner!r}: could not resolve base commit in {repo_path!r} "
+                f"({detail}); pass --base explicitly or fix the repo mapping")
+        base = out.decode(errors="replace").strip()
+    token = uuid.uuid4().hex[:8]
+    remote_home = fleet_remote_home(host)
+    remote_card = fleet_transfer_text(
+        host, card, f"{remote_home}/.claude/openswarm/dispatch-{token}.md")
+    remote_backends = None
+    if args.backends_file:
+        try:
+            with open(args.backends_file, "rb") as fh:
+                backends_content = fh.read()
+        except OSError as exc:
+            raise FleetDispatchError(
+                f"cannot read backends file {args.backends_file!r} ({exc}); "
+                f"fix the path") from exc
+        remote_backends = fleet_transfer_text(
+            host, backends_content,
+            f"{remote_home}/.claude/openswarm/dispatch-{token}-backends.json")
+    title = args.title or card.decode(errors="replace").strip().splitlines()[0][:72]
+    remote_cmd = ["run", "--task-file", remote_card, "--cwd", repo_path,
+                  "--base", base, "--backend", args.backend, "--title", title]
+    if args.verify:
+        remote_cmd += ["--verify", args.verify]
+    if remote_backends:
+        remote_cmd += ["--backends-file", remote_backends]
+    timeout = args.timeout if args.timeout is not None else 900
+    rc, out, err = host_run(host, host_openswarm(host, remote_cmd), timeout=timeout)
+    # Relay the remote run output (bytes when stdout is a real terminal or
+    # pipe; decoded text when a caller redirected stdout to StringIO).
+    for stream, data in ((sys.stdout, out), (sys.stderr, err)):
+        buffer = getattr(stream, "buffer", None)
+        if buffer is not None:
+            buffer.write(data)
+        else:
+            stream.write(data.decode("utf-8", errors="replace"))
+    run_id = fleet_exec_run_id(out) if rc not in (124, 127) else None
+    result, fetch_error = (None, None)
+    if run_id is not None:
+        result, fetch_error = fleet_wait_run_result(host, run_id, timeout=60)
+    elif rc in (124, 127):
+        fetch_error = (f"transport failed (rc={rc}); the remote run did not return — "
+                       f"check the runner before retrying, never assume it ran")
+    else:
+        fetch_error = "could not determine remote run id from the runner reply"
+    entry_id = f"fleet-{host['name']}-{uuid.uuid4().hex[:8]}"
+    remote_run_dir = f"{remote_home}/.claude/openswarm/runs/{run_id}" if run_id else None
+    ledger_line = fleet_record_remote_dispatch(
+        host["name"], entry_id, args.backend, args.repo, base, title,
+        run_id, rc, result, fetch_error, remote_run_dir)
+    verify = (result or {}).get("verify") if isinstance(result, dict) else None
+    summary = {"ok": rc == 0 and fetch_error is None, "runner": host["name"],
+               "transport": fleet_runner_transport(host),
+               "remote_run_id": run_id, "remote_rc": rc,
+               "remote_status": (result or {}).get("status") if isinstance(result, dict) else None,
+               "verify_rc": (verify or {}).get("rc") if isinstance(verify, dict) else None,
+               "remote_base": base, "remote_run_dir": remote_run_dir,
+               "ledger_line": ledger_line, "entry_id": entry_id}
+    if fetch_error is not None:
+        summary["fetch_error"] = fetch_error
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    if rc != 0:
+        raise SystemExit(rc)
+    if fetch_error is not None:
+        raise SystemExit(1)
 
 
 def batch_plan(cards_dir):
@@ -17383,6 +17763,19 @@ def main():
     fp.add_argument("--reap", action="store_true",
                     help="explicitly reap runs judged dead (M11 semantics: mark finished/exited, one ledger line per reap; "
                          "zombie/alive/unknown runs are reported as skipped, never reaped). Default is read-only.")
+    fp = fleet_sub.add_parser("runners", help="list registered remote runners with declared backends, capacity, and reachability (M26 slice 1, #207)")
+    fp.add_argument("--json", action="store_true")
+    fp = fleet_sub.add_parser("dispatch", help="dispatch one task card to a named runner and record the returned result (M26 slice 1, #207)")
+    fp.add_argument("runner")
+    fp.add_argument("--repo", required=True, help="repository name from the runner's fleet.json repos mapping")
+    fp.add_argument("--task-file", required=True, help="local task card (Markdown); transferred to the runner")
+    fp.add_argument("--backend", required=True, help="backend id the runner must offer (fleet.json backends)")
+    fp.add_argument("--title", help="run title (default: first line of the task card)")
+    fp.add_argument("--verify", help="acceptance command run in the remote worktree")
+    fp.add_argument("--base", help="base commit for the remote worktree (default: remote HEAD)")
+    fp.add_argument("--backends-file", help="custom-backends JSON transferred to the runner and forwarded as --backends-file")
+    fp.add_argument("--timeout", type=float, default=900, help="seconds to wait for the remote run (default 900)")
+    fp.add_argument("--json", action="store_true", help="print only the dispatch summary JSON (the remote run output is still relayed)")
     fp = fleet_sub.add_parser("exec")
     fp.add_argument("--timeout", type=float, default=None,
                     help="seconds; default 300, none for `watch`")
