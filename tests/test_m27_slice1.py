@@ -294,6 +294,42 @@ class M27Slice1Tests(unittest.TestCase):
         self.assertEqual(kinds[-1], "duplicate_skipped")
         self.assertIsNotNone(before["ticket_id"])
 
+    def test_state_round_trips_non_ascii_under_ascii_locale(self):
+        # Regression: on Windows the locale default encoding is cp1252 and
+        # jsave opened the temp file without an explicit encoding, so intake
+        # state holding Chinese bodies (mandate scope summaries) raised
+        # UnicodeEncodeError (PR #220 windows py3.13 leg). Reproduce the
+        # mechanism in a subprocess forced to an ASCII locale
+        # (-X utf8=0 + LC_ALL=C; this VM's interpreter otherwise defaults
+        # to UTF-8 mode): pre-fix jsave fails with UnicodeEncodeError,
+        # post-fix the explicit UTF-8 in jsave/jload makes it pass.
+        # Verified by hand: the same snippet against pre-fix bin/openswarm
+        # exits 1 with UnicodeEncodeError in jsave.
+        # NOTE: the snippet must live in a file, not a -c argument: under an
+        # ASCII locale the -c command line itself cannot carry the Chinese
+        # characters (the interpreter refuses to decode it).
+        script_path = self.data / "ascii_locale_check.py"
+        script_path.write_text(
+            "import sys\n"
+            "sys.path.insert(0, 'tests')\n"
+            "import _load; xs = _load.load()\n"
+            "xs.intake_ingest_trigger({'id': 't1', 'source': 'github', "
+            "'thread': {'repo': 'surlymochan/swrm', 'kind': 'issue', 'number': 1}, "
+            "'author': 'surlymochan', 'author_is_bot': False, "
+            "'body': '排期确认：按排队执行', 'created_at': None}, "
+            "policy=xs.default_intake_policy(), data_dir=sys.argv[1], now=1000.0)\n"
+            "state = xs.load_intake_state(sys.argv[1])\n"
+            "assert '排期确认' in state['mandates'][0]['scope']['summary']\n"
+            "print('non-ascii round-trip OK')\n",
+            encoding="utf-8")
+        env = dict(os.environ, PYTHONCOERCECLOCALE="0", LC_ALL="C", LANG="C")
+        env.pop("PYTHONUTF8", None)
+        proc = subprocess.run([sys.executable, "-X", "utf8=0", str(script_path), str(self.data)],
+                              capture_output=True, text=True, env=env,
+                              cwd=str(HERE.parent), timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("non-ascii round-trip OK", proc.stdout)
+
     def test_policy_version_is_pinned_per_mandate(self):
         xs.intake_ingest_trigger(
             trig("t1", body="@openswarm fix this"), policy=self.policy,

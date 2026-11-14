@@ -147,8 +147,11 @@ _AGY_LOGIN_CACHE = {}
 # ---------------------------------------------------------------- utils
 
 def jload(path, default=None):
+    # Explicit UTF-8: json.dump writes ensure_ascii=False, so a locale
+    # default encoding (e.g. cp1252 on Windows) cannot round-trip
+    # non-ASCII content (M27 slice 1: intake state holds Chinese bodies).
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
@@ -157,7 +160,7 @@ def jload(path, default=None):
 def jsave(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.tmp{os.getpid()}"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
 
