@@ -2367,7 +2367,7 @@ def compute_routing_weights(entries, min_samples=8):
     for entry in entries:
         if not isinstance(entry, dict) or not entry.get("backend"):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch") or entry.get("fleet_dispatch_many") or entry.get("fleet_remote_recovery"):
             # M7 slice 1 (#122) / slice 2 (#124): a batch or fleet
             # routing-decision record is not a run outcome — it must not
             # inflate run counts or pass rates. A fleet-health reap record
@@ -2537,7 +2537,7 @@ def compute_adaptive_margins(entries, policy):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch") or entry.get("fleet_dispatch_many") or entry.get("fleet_remote_recovery"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -2918,7 +2918,7 @@ def compute_advice_accuracy(entries):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch") or entry.get("fleet_dispatch_many") or entry.get("fleet_remote_recovery"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -3036,7 +3036,7 @@ def compute_weighted_eval(entries, margin=0.10, plan_ok=None):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch") or entry.get("fleet_dispatch_many") or entry.get("fleet_remote_recovery"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -3224,7 +3224,7 @@ def compute_gate_eval(entries, margin=0.10,
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             continue
-        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch"):
+        if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch") or entry.get("fleet_dispatch_many") or entry.get("fleet_remote_recovery"):
             continue
         advice = entry.get("routing_advice")
         if not isinstance(advice, dict) or not advice.get("backend"):
@@ -12690,7 +12690,7 @@ def cmd_ledger_backfill_pass(args):
                 continue
             if not isinstance(entry, dict):
                 continue
-            if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch"):
+            if entry.get("batch_routing_decision") or entry.get("fleet_routing_decision") or entry.get("fleet_health_reap") or entry.get("batch_verify_evalid") or entry.get("fleet_verify_evalid") or entry.get("fleet_health_gate") or entry.get("fleet_remote_dispatch") or entry.get("fleet_dispatch_many") or entry.get("fleet_remote_recovery"):
                 # M7 slice 1 (#122) / slice 2 (#124): a batch or fleet
                 # routing-decision record is not a run outcome — backfill
                 # must not stamp exec_pass on it. Same for a fleet-health
@@ -12949,6 +12949,12 @@ def cmd_fleet(args, policy=None):
         return
     if args.fleet_cmd == "dispatch":
         cmd_fleet_dispatch(args, policy)
+        return
+    if args.fleet_cmd == "dispatch-many":
+        cmd_fleet_dispatch_many(args, policy)
+        return
+    if args.fleet_cmd == "recover":
+        cmd_fleet_recover(args, policy)
         return
     if args.fleet_cmd == "exec":
         host = fleet_host(args.host)
@@ -13210,6 +13216,35 @@ def strip_card_verify_evalid(text):
     if isinstance(text, bytes):
         return re.sub(rb"^verify-evalid:[^\n]*\n?", b"", text, flags=re.MULTILINE)
     return re.sub(r"^verify-evalid:[^\n]*\n?", "", text, flags=re.MULTILINE)
+
+
+_CARD_VERIFY_RE = re.compile(r"^verify:[ \t]*([^\n]*?)[ \t]*$", re.MULTILINE)
+
+
+def parse_card_verify(text):
+    """Per-card acceptance command from a card's `verify:` line (M26 slice 2, #210).
+
+    One line, e.g. `verify: test -f proof.md`. An empty value means no
+    verification for this card. No such line returns None, so a caller can
+    fall back to a batch-level --verify. The value is taken verbatim; a
+    card that needs no verify simply omits the line.
+    """
+    match = _CARD_VERIFY_RE.search(text)
+    if not match:
+        return None
+    return match.group(1).strip() or None
+
+
+def strip_card_verify(text):
+    """Remove the planner-only `verify:` line before dispatch.
+
+    The declaration is planner metadata (like `depends_on:` / `verify-evalid:`);
+    the executor only ever sees the task text. Accepts str or bytes and
+    preserves everything else byte-for-byte.
+    """
+    if isinstance(text, bytes):
+        return re.sub(rb"^verify:[^\n]*\n?", b"", text, flags=re.MULTILINE)
+    return re.sub(r"^verify:[^\n]*\n?", "", text, flags=re.MULTILINE)
 
 
 def strip_card_planner_lines(text):
@@ -13729,11 +13764,14 @@ def fleet_dispatch_snapshot(host):
     need no transport, so their snapshot is read directly."""
     if host["kind"] == "local":
         # Preflight only needs the active-run count for the capacity check,
-        # so read the capacity-only snapshot (no model probes).
+        # so read the capacity-only snapshot (no model probes). The env
+        # toggle is process-global, so concurrent dispatch-many workers
+        # take it under one lock (M26 slice 2, #210).
         previous = os.environ.get("OPENSWARM_FLEET_CAPACITY_ONLY")
         os.environ["OPENSWARM_FLEET_CAPACITY_ONLY"] = "1"
         try:
-            return fleet_snapshot()
+            with _FLEET_SNAPSHOT_LOCK:
+                return fleet_snapshot()
         except (ValueError, RuntimeError, OSError) as error:
             raise FleetDispatchError(
                 f"runner 'local': local snapshot failed ({error}); fix the local "
@@ -13786,7 +13824,7 @@ def fleet_transfer_text(host, content, remote_path, timeout=60):
 
 def fleet_record_remote_dispatch(host_name, entry_id, backend, repo, base,
                                  title, run_id, remote_rc, result, fetch_error,
-                                 remote_run_dir):
+                                 remote_run_dir, card_file=None, verify_cmd=None):
     """Controller-ledger entry for one remote dispatch (M26 slice 1, #207).
 
     The remote run writes its own outcome ledger on the runner; this entry
@@ -13798,6 +13836,9 @@ def fleet_record_remote_dispatch(host_name, entry_id, backend, repo, base,
     backfill computations skip it: it mirrors a remote outcome, it is not
     a second local outcome. A ledger write failure must not fail the
     dispatch, so it is reported and the printed summary stays authoritative.
+    `card_file` / `verify_cmd` (M26 slice 2, #210) remember where the
+    dispatched card and its acceptance command came from, so `fleet
+    recover --redispatch` can re-dispatch the same task without guessing.
     Returns the controller ledger line number, or None when it could not
     be determined.
     """
@@ -13810,6 +13851,7 @@ def fleet_record_remote_dispatch(host_name, entry_id, backend, repo, base,
              "remote_run_id": run_id, "remote_repo": repo, "remote_base": base,
              "remote_rc": remote_rc, "verify_rc": verify_rc,
              "remote_run_dir": remote_run_dir,
+             "card_file": card_file, "verify_cmd": verify_cmd,
              "remote_log": (f"openswarm fleet exec {host_name} -- fleet _run-info {run_id}"
                             if run_id else None),
              "seconds": (result or {}).get("seconds") if isinstance(result, dict) else None}
@@ -13863,13 +13905,121 @@ def cmd_fleet_runners(args):
             print(f"  {row['error']}")
 
 
+# One local-snapshot preflight at a time: fleet_dispatch_snapshot for a
+# local runner toggles OPENSWARM_FLEET_CAPACITY_ONLY in the process
+# environment, which concurrent dispatch-many workers would otherwise
+# clobber for each other (M26 slice 2, #210).
+_FLEET_SNAPSHOT_LOCK = threading.Lock()
+
+
+def fleet_dispatch_once(host, card, *, repo, backend, title=None, verify=None,
+                        base=None, backends_content=None, timeout=900,
+                        card_file=None, relay=True):
+    """Dispatch one task card to one registered runner (M26 slice 1, #207).
+
+    The shared core behind `fleet dispatch`, `fleet dispatch-many`, and
+    `fleet recover --redispatch`. Order: backend + repo checks → transport
+    preflight (unreachable refuses loudly, no local fallback) → capacity
+    check → card transfer → remote run → result fetch → ledger record.
+    Returns the dispatch summary dict and never raises SystemExit: a
+    remote failure is a summary with ok False (the caller decides the
+    exit code), while a refusal raises FleetDispatchError before anything
+    ran. With relay=False (concurrent dispatch-many workers) the remote
+    run output is not written to stdout; its tail is kept on the summary
+    instead, so concurrent relays cannot interleave.
+    """
+    if not card.strip():
+        raise FleetDispatchError("task card is empty; write the task before dispatching")
+    declared = host.get("backends")
+    if declared is not None and backend not in declared:
+        raise FleetDispatchError(
+            f"runner {host['name']!r} does not offer backend {backend!r}; "
+            f"it offers {', '.join(declared)}; pick an offered backend or add "
+            f"{backend!r} to the runner's 'backends' in fleet.json")
+    repo_path = (host.get("repos") or {}).get(repo)
+    if not repo_path:
+        raise FleetDispatchError(
+            f"runner {host['name']!r} has no repository mapping for {repo!r}; "
+            f"add \"repos\": {{\"{repo}\": \"<path on the runner>\"}} to the "
+            f"runner's fleet.json entry")
+    snapshot = fleet_dispatch_snapshot(host)
+    capacity = host.get("capacity")
+    active = len(snapshot.get("active_runs") or [])
+    if capacity is not None and active >= capacity:
+        raise FleetDispatchError(
+            f"runner {host['name']!r} is at capacity ({active}/{capacity} active runs); "
+            f"wait for a run to finish or raise 'capacity' in fleet.json — "
+            f"the task was not dispatched anywhere")
+    if base:
+        pass
+    else:
+        rc, out, err = host_git(host, repo_path, ["rev-parse", "HEAD"], timeout=60)
+        if rc:
+            detail = err.decode(errors="replace").strip() or f"git failed (rc={rc})"
+            raise FleetDispatchError(
+                f"runner {host['name']!r}: could not resolve base commit in {repo_path!r} "
+                f"({detail}); pass --base explicitly or fix the repo mapping")
+        base = out.decode(errors="replace").strip()
+    token = uuid.uuid4().hex[:8]
+    remote_home = fleet_remote_home(host)
+    remote_card = fleet_transfer_text(
+        host, card, f"{remote_home}/.claude/openswarm/dispatch-{token}.md")
+    remote_backends = None
+    if backends_content is not None:
+        remote_backends = fleet_transfer_text(
+            host, backends_content,
+            f"{remote_home}/.claude/openswarm/dispatch-{token}-backends.json")
+    title = title or card.decode(errors="replace").strip().splitlines()[0][:72]
+    remote_cmd = ["run", "--task-file", remote_card, "--cwd", repo_path,
+                  "--base", base, "--backend", backend, "--title", title]
+    if verify:
+        remote_cmd += ["--verify", verify]
+    if remote_backends:
+        remote_cmd += ["--backends-file", remote_backends]
+    rc, out, err = host_run(host, host_openswarm(host, remote_cmd), timeout=timeout)
+    if relay:
+        # Relay the remote run output (bytes when stdout is a real terminal or
+        # pipe; decoded text when a caller redirected stdout to StringIO).
+        for stream, data in ((sys.stdout, out), (sys.stderr, err)):
+            buffer = getattr(stream, "buffer", None)
+            if buffer is not None:
+                buffer.write(data)
+            else:
+                stream.write(data.decode("utf-8", errors="replace"))
+    run_id = fleet_exec_run_id(out) if rc not in (124, 127) else None
+    result, fetch_error = (None, None)
+    if run_id is not None:
+        result, fetch_error = fleet_wait_run_result(host, run_id, timeout=60)
+    elif rc in (124, 127):
+        fetch_error = (f"transport failed (rc={rc}); the remote run did not return — "
+                       f"check the runner before retrying, never assume it ran")
+    else:
+        fetch_error = "could not determine remote run id from the runner reply"
+    entry_id = f"fleet-{host['name']}-{uuid.uuid4().hex[:8]}"
+    remote_run_dir = f"{remote_home}/.claude/openswarm/runs/{run_id}" if run_id else None
+    ledger_line = fleet_record_remote_dispatch(
+        host["name"], entry_id, backend, repo, base, title,
+        run_id, rc, result, fetch_error, remote_run_dir,
+        card_file=card_file, verify_cmd=verify)
+    verify_result = (result or {}).get("verify") if isinstance(result, dict) else None
+    summary = {"ok": rc == 0 and fetch_error is None, "runner": host["name"],
+               "transport": fleet_runner_transport(host),
+               "remote_run_id": run_id, "remote_rc": rc,
+               "remote_status": (result or {}).get("status") if isinstance(result, dict) else None,
+               "verify_rc": (verify_result or {}).get("rc") if isinstance(verify_result, dict) else None,
+               "remote_base": base, "remote_run_dir": remote_run_dir,
+               "ledger_line": ledger_line, "entry_id": entry_id}
+    if fetch_error is not None:
+        summary["fetch_error"] = fetch_error
+    if not relay:
+        summary["remote_output_tail"] = (out + err).decode("utf-8", errors="replace")[-2000:]
+    return summary
+
+
 def cmd_fleet_dispatch(args, policy=None):
     """Dispatch one task card to one named runner and record the returned
     result in the controller ledger (M26 slice 1, #207).
 
-    Order: registry validation → runner + backend + repo checks → transport
-    preflight (unreachable refuses loudly, no local fallback) → capacity
-    check → card transfer → remote run → result fetch → ledger record.
     The remote run's exit code is the dispatch exit code; a fetch failure
     after a successful remote run still exits non-zero so the gap is
     visible, with fetch_error on the ledger record instead of a fabricated
@@ -13888,44 +14038,7 @@ def cmd_fleet_dispatch(args, policy=None):
     except OSError as exc:
         raise FleetDispatchError(
             f"cannot read task card {args.task_file!r} ({exc}); fix the path") from exc
-    if not card.strip():
-        raise FleetDispatchError(
-            f"task card {args.task_file!r} is empty; write the task before dispatching")
-    declared = host.get("backends")
-    if declared is not None and args.backend not in declared:
-        raise FleetDispatchError(
-            f"runner {args.runner!r} does not offer backend {args.backend!r}; "
-            f"it offers {', '.join(declared)}; pick an offered backend or add "
-            f"{args.backend!r} to the runner's 'backends' in fleet.json")
-    repo_path = (host.get("repos") or {}).get(args.repo)
-    if not repo_path:
-        raise FleetDispatchError(
-            f"runner {args.runner!r} has no repository mapping for {args.repo!r}; "
-            f"add \"repos\": {{\"{args.repo}\": \"<path on the runner>\"}} to the "
-            f"runner's fleet.json entry")
-    snapshot = fleet_dispatch_snapshot(host)
-    capacity = host.get("capacity")
-    active = len(snapshot.get("active_runs") or [])
-    if capacity is not None and active >= capacity:
-        raise FleetDispatchError(
-            f"runner {args.runner!r} is at capacity ({active}/{capacity} active runs); "
-            f"wait for a run to finish or raise 'capacity' in fleet.json — "
-            f"the task was not dispatched anywhere")
-    if args.base:
-        base = args.base
-    else:
-        rc, out, err = host_git(host, repo_path, ["rev-parse", "HEAD"], timeout=60)
-        if rc:
-            detail = err.decode(errors="replace").strip() or f"git failed (rc={rc})"
-            raise FleetDispatchError(
-                f"runner {args.runner!r}: could not resolve base commit in {repo_path!r} "
-                f"({detail}); pass --base explicitly or fix the repo mapping")
-        base = out.decode(errors="replace").strip()
-    token = uuid.uuid4().hex[:8]
-    remote_home = fleet_remote_home(host)
-    remote_card = fleet_transfer_text(
-        host, card, f"{remote_home}/.claude/openswarm/dispatch-{token}.md")
-    remote_backends = None
+    backends_content = None
     if args.backends_file:
         try:
             with open(args.backends_file, "rb") as fh:
@@ -13934,55 +14047,510 @@ def cmd_fleet_dispatch(args, policy=None):
             raise FleetDispatchError(
                 f"cannot read backends file {args.backends_file!r} ({exc}); "
                 f"fix the path") from exc
-        remote_backends = fleet_transfer_text(
-            host, backends_content,
-            f"{remote_home}/.claude/openswarm/dispatch-{token}-backends.json")
-    title = args.title or card.decode(errors="replace").strip().splitlines()[0][:72]
-    remote_cmd = ["run", "--task-file", remote_card, "--cwd", repo_path,
-                  "--base", base, "--backend", args.backend, "--title", title]
-    if args.verify:
-        remote_cmd += ["--verify", args.verify]
-    if remote_backends:
-        remote_cmd += ["--backends-file", remote_backends]
     timeout = args.timeout if args.timeout is not None else 900
-    rc, out, err = host_run(host, host_openswarm(host, remote_cmd), timeout=timeout)
-    # Relay the remote run output (bytes when stdout is a real terminal or
-    # pipe; decoded text when a caller redirected stdout to StringIO).
-    for stream, data in ((sys.stdout, out), (sys.stderr, err)):
-        buffer = getattr(stream, "buffer", None)
-        if buffer is not None:
-            buffer.write(data)
-        else:
-            stream.write(data.decode("utf-8", errors="replace"))
-    run_id = fleet_exec_run_id(out) if rc not in (124, 127) else None
-    result, fetch_error = (None, None)
-    if run_id is not None:
-        result, fetch_error = fleet_wait_run_result(host, run_id, timeout=60)
-    elif rc in (124, 127):
-        fetch_error = (f"transport failed (rc={rc}); the remote run did not return — "
-                       f"check the runner before retrying, never assume it ran")
-    else:
-        fetch_error = "could not determine remote run id from the runner reply"
-    entry_id = f"fleet-{host['name']}-{uuid.uuid4().hex[:8]}"
-    remote_run_dir = f"{remote_home}/.claude/openswarm/runs/{run_id}" if run_id else None
-    ledger_line = fleet_record_remote_dispatch(
-        host["name"], entry_id, args.backend, args.repo, base, title,
-        run_id, rc, result, fetch_error, remote_run_dir)
-    verify = (result or {}).get("verify") if isinstance(result, dict) else None
-    summary = {"ok": rc == 0 and fetch_error is None, "runner": host["name"],
-               "transport": fleet_runner_transport(host),
-               "remote_run_id": run_id, "remote_rc": rc,
-               "remote_status": (result or {}).get("status") if isinstance(result, dict) else None,
-               "verify_rc": (verify or {}).get("rc") if isinstance(verify, dict) else None,
-               "remote_base": base, "remote_run_dir": remote_run_dir,
-               "ledger_line": ledger_line, "entry_id": entry_id}
-    if fetch_error is not None:
-        summary["fetch_error"] = fetch_error
+    summary = fleet_dispatch_once(
+        host, card, repo=args.repo, backend=args.backend, title=args.title,
+        verify=args.verify, base=args.base, backends_content=backends_content,
+        timeout=timeout, card_file=args.task_file, relay=True)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
-    if rc != 0:
-        raise SystemExit(rc)
-    if fetch_error is not None:
+    if summary["remote_rc"] != 0:
+        raise SystemExit(summary["remote_rc"])
+    if summary.get("fetch_error") is not None:
         raise SystemExit(1)
+
+
+# ---------------------------------------------------------------- multi-runner fan-out + disconnect recovery (M26 slice 2, #210)
+# dispatch-many fans a directory of task cards out across every registered
+# runner that offers the backend and maps the repo, in capacity-sized
+# waves, concurrently within a wave; recover re-examines controller
+# dispatch records whose remote outcome never came back and marks each one
+# lost / recovered / finished / still-running in the controller ledger,
+# with an explicit --redispatch to another runner. Neither command ever
+# falls back to local, reroutes silently, or records a run that did not
+# happen; both reuse the one-to-one fleet_dispatch_once core above.
+
+FLEET_TERMINAL_REMOTE_STATES = ("finished", "unroutable", "dead", "dry-run")
+FLEET_RECOVERY_FINAL = ("recovered", "finished")
+
+
+def fleet_read_ledger_entries():
+    """Controller-ledger entries in file order (tolerates a missing ledger)."""
+    entries = []
+    try:
+        with open(LEDGER, encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict):
+                    entries.append(entry)
+    except OSError:
+        pass
+    return entries
+
+
+def fleet_record_remote_recovery(run_id, runner, disposition, reason,
+                                 remote_state=None, redispatch=None,
+                                 final=False, title=None):
+    """Controller-ledger entry for one disconnect recovery (M26 slice 2, #210).
+
+    Flagged fleet_remote_recovery so routing-weight / advice-accuracy /
+    eval / backfill computations skip it, like the other fleet bookkeeping
+    records. `final` marks a disposition that needs no further probing
+    (recovered / finished, or lost-with-redispatch); a non-final `lost`
+    is re-probed by the next `fleet recover`, each probe leaving its own
+    trace instead of silently ageing out. Returns the ledger line number.
+    """
+    entry = {"id": f"fleet-recovery-{uuid.uuid4().hex[:8]}",
+             "run_id": run_id, "ts": NOW(),
+             "title": f"fleet {runner} remote recovery: {title or run_id}",
+             "status": "recovered", "host": runner,
+             "fleet_remote_recovery": True, "disposition": disposition,
+             "reason": reason, "remote_state": remote_state,
+             "redispatch": redispatch, "recovered_final": bool(final)}
+    try:
+        append_ledger(entry)
+    except OSError as error:
+        print(f"openswarm: warning: could not record remote recovery for "
+              f"fleet {runner} run {run_id} in ledger: {error}", file=sys.stderr)
+        return None
+    return ledger_run_lines().get(run_id or entry["id"])
+
+
+def fleet_recovery_entries(entries=None):
+    """run_id -> latest recovery entry, from controller-ledger entries."""
+    latest = {}
+    for entry in (entries if entries is not None else fleet_read_ledger_entries()):
+        if entry.get("fleet_remote_recovery") and entry.get("run_id"):
+            latest[entry["run_id"]] = entry
+    return latest
+
+
+def fleet_dispatch_many_plan(hosts, backend, repo, remaining):
+    """Assign as many of `remaining` card names as current spare capacity
+    allows: runners that offer the backend and map the repo, least-loaded
+    first (active + already assigned this wave, then name), one card per
+    runner per pass so the load spreads instead of piling onto the first
+    runner. Returns (assignments, per-runner state) where assignments is
+    a list of (card_name, host); runners with no spare capacity are
+    listed in the state with their active/capacity so a zero-assignment
+    wave can fail loudly instead of waiting silently.
+    """
+    states = []
+    for host in hosts:
+        if host.get("backends") is not None and backend not in host["backends"]:
+            states.append({"name": host["name"], "eligible": False,
+                           "reason": f"does not offer backend {backend!r}",
+                           "active": None, "capacity": host.get("capacity")})
+            continue
+        if repo not in (host.get("repos") or {}):
+            states.append({"name": host["name"], "eligible": False,
+                           "reason": f"has no repository mapping for {repo!r}",
+                           "active": None, "capacity": host.get("capacity")})
+            continue
+        try:
+            snapshot = fleet_dispatch_snapshot(host)
+        except FleetDispatchError as error:
+            states.append({"name": host["name"], "eligible": False,
+                           "reason": str(error), "active": None,
+                           "capacity": host.get("capacity")})
+            continue
+        active = len(snapshot.get("active_runs") or [])
+        capacity = host.get("capacity")
+        states.append({"name": host["name"], "eligible": True, "host": host,
+                       "active": active, "capacity": capacity, "assigned": 0})
+    assignments = []
+    queue = list(remaining)
+    while queue:
+        open_states = [st for st in states if st["eligible"]
+                       and (st["capacity"] is None
+                            or st["active"] + st["assigned"] < st["capacity"])]
+        if not open_states:
+            break
+        open_states.sort(key=lambda st: (st["active"] + st["assigned"], st["name"]))
+        state = open_states[0]
+        assignments.append((queue.pop(0), state["host"]))
+        state["assigned"] += 1
+    return assignments, states
+
+
+def fleet_dispatch_many_record(cards, distribution):
+    """One flagged summary ledger entry for a dispatch-many run (M26 slice 2, #210)."""
+    entry = {"id": f"fleet-dispatch-many-{uuid.uuid4().hex[:8]}",
+             "run_id": f"fleet-dispatch-many-{uuid.uuid4().hex[:8]}",
+             "ts": NOW(), "title": "fleet dispatch-many: "
+             f"{len(cards)} cards across {len(distribution)} runners",
+             "status": "dispatched", "fleet_dispatch_many": True,
+             "cards": cards, "distribution": distribution}
+    try:
+        append_ledger(entry)
+    except OSError as error:
+        print(f"openswarm: warning: could not record dispatch-many summary "
+              f"in ledger: {error}", file=sys.stderr)
+        return None
+    return ledger_run_lines().get(entry["run_id"])
+
+
+def cmd_fleet_dispatch_many(args, policy=None):
+    """Fan task cards out across registered runners, capacity-aware.
+
+    Cards come from a directory (one file per card, filename order). Each
+    card may declare its own acceptance command on a `verify:` line
+    (stripped before transfer); a batch-level --verify applies to cards
+    without one. Assignment is least-loaded-first within each wave and
+    never exceeds a runner's capacity; a wave dispatches concurrently and
+    the next wave starts only after the previous wave's runs finish, so
+    spare capacity is re-read, never assumed. A card that no runner can
+    take (backend not offered, no repo mapping, unreachable, or every
+    runner at capacity) fails the command loudly with the per-runner
+    reason — nothing is silently queued, dropped, or run locally. The
+    command exits non-zero when any card failed; per-card outcomes and
+    the runner distribution go to the summary JSON and one flagged
+    ledger entry.
+    """
+    cards_dir = os.path.abspath(args.cards_dir)
+    if not os.path.isdir(cards_dir):
+        raise FleetDispatchError(
+            f"cards directory {args.cards_dir!r} is not a directory; "
+            f"pass a directory with one task card per file")
+    names = sorted(path for path in os.listdir(cards_dir)
+                   if os.path.isfile(os.path.join(cards_dir, path)))
+    if not names:
+        raise FleetDispatchError(
+            f"cards directory {args.cards_dir!r} contains no files; "
+            f"add one task card per file")
+    cards = {}
+    for name in names:
+        path = os.path.join(cards_dir, name)
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except OSError as exc:
+            raise FleetDispatchError(
+                f"cannot read task card {path!r} ({exc}); fix the path") from exc
+        if not raw.strip():
+            raise FleetDispatchError(
+                f"task card {path!r} is empty; write the task before dispatching")
+        text = raw.decode("utf-8", errors="replace")
+        verify = parse_card_verify(text)
+        if verify is None:
+            verify = args.verify
+        cards[name] = {"raw": strip_card_verify(raw), "verify": verify}
+    hosts = list(fleet_config().values())
+    timeout = args.timeout if args.timeout is not None else 900
+    backends_content = None
+    if args.backends_file:
+        try:
+            with open(args.backends_file, "rb") as fh:
+                backends_content = fh.read()
+        except OSError as exc:
+            raise FleetDispatchError(
+                f"cannot read backends file {args.backends_file!r} ({exc}); "
+                f"fix the path") from exc
+    results, distribution = [], {}
+    remaining = list(names)
+    wave = 0
+    while remaining:
+        wave += 1
+        assignments, states = fleet_dispatch_many_plan(
+            hosts, args.backend, args.repo, remaining)
+        if not assignments:
+            detail = "; ".join(
+                f"{st['name']}: {st['reason']}" if not st["eligible"] else
+                f"{st['name']}: at capacity ({st['active']}/{st['capacity']} active)"
+                for st in states)
+            raise FleetDispatchError(
+                f"dispatch-many wave {wave}: no runner can take the remaining "
+                f"{len(remaining)} card(s) ({', '.join(remaining)}); {detail}; "
+                f"wait for runs to finish, raise a capacity in fleet.json, or "
+                f"fix the runner — nothing was queued or run locally")
+        remaining = [name for name in remaining
+                     if name not in {card for card, _ in assignments}]
+
+        def dispatch_one(item):
+            name, host = item
+            spec = cards[name]
+            try:
+                summary = fleet_dispatch_once(
+                    host, spec["raw"], repo=args.repo, backend=args.backend,
+                    verify=spec["verify"], timeout=timeout,
+                    backends_content=backends_content,
+                    card_file=os.path.join(cards_dir, name), relay=False)
+                return {"card": name, "runner": host["name"], "ok": summary["ok"],
+                        "remote_run_id": summary["remote_run_id"],
+                        "remote_status": summary["remote_status"],
+                        "verify_rc": summary["verify_rc"],
+                        "remote_rc": summary["remote_rc"],
+                        "remote_run_dir": summary["remote_run_dir"],
+                        "ledger_line": summary["ledger_line"],
+                        "entry_id": summary["entry_id"],
+                        "fetch_error": summary.get("fetch_error")}
+            except FleetDispatchError as error:
+                return {"card": name, "runner": host["name"], "ok": False,
+                        "error": str(error), "remote_run_id": None,
+                        "remote_status": None, "verify_rc": None,
+                        "remote_rc": None, "remote_run_dir": None,
+                        "ledger_line": None, "entry_id": None,
+                        "fetch_error": None}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(assignments)) as pool:
+            for outcome in pool.map(dispatch_one, assignments):
+                results.append(outcome)
+                distribution[outcome["runner"]] = distribution.get(outcome["runner"], 0) + 1
+    ok = all(row["ok"] for row in results)
+    summary_line = fleet_dispatch_many_record(results, distribution)
+    summary = {"ok": ok, "cards": results, "distribution": distribution,
+               "waves": wave, "ledger_line": summary_line}
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    if not ok:
+        raise SystemExit(1)
+
+
+def fleet_recover_probe(host, run_id):
+    """Probe one outstanding remote run: (disposition, reason, remote_state, result).
+
+    Dispositions: `lost` (runner unreachable or the run no longer readable
+    on it — outcome unknown, non-final), `recovered` (remote run_digest
+    reports the run dead: its runner pid is gone, identity-checked — the
+    M11/M12 dead verdict, final), `finished` (remote run reached a
+    terminal state, final; the fetched result rides along), or
+    `still-running` (runner alive, run not terminal — nothing to do).
+    """
+    try:
+        fleet_dispatch_snapshot(host)
+    except FleetDispatchError as error:
+        return ("lost", f"runner {host['name']!r} unreachable: {error}", None, None)
+    try:
+        info = host_json(host, ["fleet", "_run-info", run_id], timeout=20)
+    except (ValueError, RuntimeError, KeyError) as error:
+        return ("lost", f"remote run {run_id} no longer readable on "
+                f"{host['name']!r}: {error}", None, None)
+    state = info.get("state")
+    if state in FLEET_TERMINAL_REMOTE_STATES:
+        if state == "dead":
+            return ("recovered",
+                    f"remote run {run_id} is dead on {host['name']!r} "
+                    f"(runner process gone, pid identity checked); it can never resume",
+                    state, info.get("result"))
+        return ("finished",
+                f"remote run {run_id} reached terminal state {state!r} on "
+                f"{host['name']!r}", state, info.get("result"))
+    return ("still-running",
+            f"remote run {run_id} is still {state!r} on {host['name']!r}; "
+            f"nothing to recover", state, None)
+
+
+def fleet_redispatch_runner(hosts, exclude, backend, repo):
+    """Least-loaded reachable runner with spare capacity, excluding `exclude`.
+
+    Returns (host, snapshot) or (None, reason): a redispatch never lands
+    on the runner that lost the run, never exceeds capacity, and never
+    falls back to local when no other runner can take the task.
+    """
+    candidates = []
+    for host in (hosts.values() if isinstance(hosts, dict) else hosts):
+        if host["name"] == exclude:
+            continue
+        if host.get("backends") is not None and backend not in host["backends"]:
+            continue
+        if repo not in (host.get("repos") or {}):
+            continue
+        try:
+            snapshot = fleet_dispatch_snapshot(host)
+        except FleetDispatchError:
+            continue
+        active = len(snapshot.get("active_runs") or [])
+        capacity = host.get("capacity")
+        if capacity is not None and active >= capacity:
+            continue
+        candidates.append((active, host["name"], host))
+    if not candidates:
+        return None, (f"no other runner can take the task (every registered runner "
+                      f"other than {exclude!r} is unreachable, does not offer "
+                      f"backend {backend!r}, has no mapping for {repo!r}, or is "
+                      f"at capacity)")
+    candidates.sort()
+    return candidates[0][2], None
+
+
+def fleet_redispatch_once(hosts, entry, timeout):
+    """Re-dispatch a lost/recovered task to another runner (M26 slice 2, #210).
+
+    The card, verify command, and base come from the original dispatch
+    record (card_file / verify_cmd / remote_base), so nothing is guessed.
+    Returns (redispatch_summary, error): the new dispatch summary, or an
+    error string when the card is gone or no runner can take the task.
+    """
+    card_file = entry.get("card_file")
+    if not card_file or not os.path.isfile(card_file):
+        return None, (f"original card file {card_file!r} is no longer available; "
+                      f"re-dispatch needs the card — pass it explicitly with "
+                      f"`fleet recover <run-id> --card-file <path>`")
+    try:
+        with open(card_file, "rb") as fh:
+            card = fh.read()
+    except OSError as exc:
+        return None, f"cannot read original card file {card_file!r} ({exc})"
+    backend = entry.get("backend")
+    repo = entry.get("remote_repo")
+    target, reason = fleet_redispatch_runner(hosts, entry.get("host"), backend, repo)
+    if target is None:
+        return None, reason
+    try:
+        summary = fleet_dispatch_once(
+            target, strip_card_verify(card), repo=repo, backend=backend,
+            verify=entry.get("verify_cmd"), base=entry.get("remote_base"),
+            timeout=timeout, card_file=card_file, relay=False)
+    except FleetDispatchError as error:
+        return None, str(error)
+    return {"runner": target["name"], "remote_run_id": summary["remote_run_id"],
+            "remote_status": summary["remote_status"],
+            "verify_rc": summary["verify_rc"], "ok": summary["ok"],
+            "ledger_line": summary["ledger_line"],
+            "entry_id": summary["entry_id"],
+            "fetch_error": summary.get("fetch_error")}, None
+
+
+def cmd_fleet_recover(args, policy=None):
+    """Recover outstanding remote dispatches after a disconnect (M26 slice 2, #210).
+
+    Scan mode (no run id): every controller dispatch record whose remote
+    outcome never came back and that has no final recovery entry yet is
+    probed on its runner — lost (unreachable / run unreadable, non-final),
+    recovered (remote run dead, M11/M12 semantics, final), finished
+    (remote run terminal, final), or still-running (reported, untouched).
+    A dispatch whose remote run id was never recorded (the transport died
+    before the id came back) cannot be probed from the ledger: it is
+    listed as skipped with the explicit `fleet recover <run-id>` pointer.
+    Explicit mode (one run id + --runner): probe that run directly, even
+    without a dispatch record. --redispatch re-dispatches a lost /
+    recovered task to another runner with spare capacity, reusing the
+    original card / verify / base from the dispatch record (explicit mode
+    needs --card-file/--repo/--backend instead); a failed redispatch
+    leaves the disposition in place with the reason attached — the task
+    is never silently dropped. Recovery is always explicit ledger
+    bookkeeping, never a silent fix-up.
+    """
+    hosts = fleet_config()
+    timeout = args.timeout if args.timeout is not None else 900
+    entries = fleet_read_ledger_entries()
+    recoveries = fleet_recovery_entries(entries)
+    outcomes = []
+
+    def recover_one(run_id, runner_name, dispatch_entry):
+        if runner_name not in hosts:
+            outcome = {"run_id": run_id, "runner": runner_name,
+                       "disposition": "lost",
+                       "reason": f"runner {runner_name!r} is no longer registered; "
+                                 f"the task was not re-dispatched",
+                       "ledger_line": None, "recovered_final": False,
+                       "redispatch": None}
+            outcomes.append(outcome)
+            return
+        host = hosts[runner_name]
+        disposition, reason, state, result = fleet_recover_probe(host, run_id)
+        if disposition == "still-running":
+            outcomes.append({"run_id": run_id, "runner": runner_name,
+                             "disposition": disposition, "reason": reason,
+                             "ledger_line": None, "recovered_final": False,
+                             "redispatch": None})
+            return
+        redispatch, redispatch_error = None, None
+        final = disposition in FLEET_RECOVERY_FINAL
+        if args.redispatch and disposition in ("lost", "recovered"):
+            if dispatch_entry is None:
+                redispatch_error = ("explicit recover needs --card-file/--repo/--backend "
+                                    "to re-dispatch; pass them to re-queue this task")
+            else:
+                redispatch, redispatch_error = fleet_redispatch_once(hosts, dispatch_entry, timeout)
+                if redispatch is not None and redispatch.get("ok"):
+                    final = True
+        if redispatch_error is not None:
+            reason = reason + f"; redispatch failed: {redispatch_error}"
+        title = (dispatch_entry or {}).get("title")
+        line = fleet_record_remote_recovery(
+            run_id, runner_name, disposition, reason, remote_state=state,
+            redispatch=redispatch, final=final, title=title)
+        outcomes.append({"run_id": run_id, "runner": runner_name,
+                         "disposition": disposition, "reason": reason,
+                         "ledger_line": line, "recovered_final": final,
+                         "redispatch": redispatch,
+                         "remote_result": result if disposition == "finished" else None})
+
+    if args.run_id:
+        if not args.runner:
+            raise FleetDispatchError(
+                "explicit recover needs --runner <name>: the run id alone does not "
+                "say which runner to probe")
+        dispatch_entry = None
+        for entry in entries:
+            if entry.get("fleet_remote_dispatch") and (
+                    entry.get("remote_run_id") == args.run_id
+                    or entry.get("run_id") == args.run_id):
+                dispatch_entry = dict(entry)
+                break
+        if dispatch_entry is not None and dispatch_entry.get("host") != args.runner:
+            raise FleetDispatchError(
+                f"run {args.run_id} was dispatched to runner "
+                f"{dispatch_entry.get('host')!r}, not {args.runner!r}; probe it "
+                f"on its own runner")
+        if dispatch_entry is None and args.redispatch:
+            if not (args.card_file and args.repo and args.backend):
+                raise FleetDispatchError(
+                    "explicit recover --redispatch for a run with no dispatch record "
+                    "needs --card-file, --repo, and --backend")
+            dispatch_entry = {"host": args.runner, "backend": args.backend,
+                              "remote_repo": args.repo,
+                              "remote_base": args.base,
+                              "verify_cmd": args.verify,
+                              "card_file": args.card_file,
+                              "title": f"fleet {args.runner} remote dispatch: {args.run_id}"}
+        recover_one(args.run_id, args.runner, dispatch_entry)
+    else:
+        for entry in entries:
+            if not entry.get("fleet_remote_dispatch"):
+                continue
+            # The authoritative remote id is remote_run_id: append_ledger
+            # backfills a missing run_id from the entry id, so run_id alone
+            # cannot tell a real remote run from an idless dispatch.
+            run_id = entry.get("remote_run_id")
+            if not run_id:
+                outcomes.append({"run_id": None, "runner": entry.get("host"),
+                                 "disposition": "skipped",
+                                 "reason": "no remote run id was recorded (the transport died "
+                                           "before the run id came back); probe it directly with "
+                                           "`fleet recover <run-id> --runner <name>` once the id "
+                                           "is known from the runner",
+                                 "ledger_line": None, "recovered_final": False,
+                                 "redispatch": None})
+                continue
+            latest = recoveries.get(run_id)
+            if latest is not None and latest.get("recovered_final"):
+                continue
+            if args.runner and entry.get("host") != args.runner:
+                continue
+            if (entry.get("remote_result") or {}).get("status"):
+                continue
+            recover_one(run_id, entry.get("host"), entry)
+    summary = {"ok": True, "recovered": outcomes}
+    if getattr(args, "json", False):
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+    else:
+        for outcome in outcomes:
+            line = outcome.get("ledger_line")
+            print(f"{outcome.get('run_id') or '-'}  {outcome.get('runner')}  "
+                  f"{outcome['disposition']}"
+                  f"{'  ledger:' + str(line) if line is not None else ''}")
+            print(f"  {outcome['reason']}")
+            if outcome.get("redispatch"):
+                redis = outcome["redispatch"]
+                print(f"  redispatched to {redis['runner']} run {redis.get('remote_run_id')} "
+                      f"status={redis.get('remote_status')} verify_rc={redis.get('verify_rc')}")
+    return summary
 
 
 def batch_plan(cards_dir):
@@ -17776,6 +18344,29 @@ def main():
     fp.add_argument("--backends-file", help="custom-backends JSON transferred to the runner and forwarded as --backends-file")
     fp.add_argument("--timeout", type=float, default=900, help="seconds to wait for the remote run (default 900)")
     fp.add_argument("--json", action="store_true", help="print only the dispatch summary JSON (the remote run output is still relayed)")
+    fp = fleet_sub.add_parser("dispatch-many", help="fan task cards out across registered runners, capacity-aware (M26 slice 2, #210)")
+    fp.add_argument("--cards-dir", required=True, help="directory with one task card per file (filename order)")
+    fp.add_argument("--repo", required=True, help="repository name from each runner's fleet.json repos mapping")
+    fp.add_argument("--backend", required=True, help="backend id each runner must offer (fleet.json backends)")
+    fp.add_argument("--verify", help="acceptance command for cards without their own `verify:` line")
+    fp.add_argument("--base", help="base commit for the remote worktrees (default: each runner's HEAD)")
+    fp.add_argument("--backends-file", help="custom-backends JSON transferred to each runner and forwarded as --backends-file")
+    fp.add_argument("--timeout", type=float, default=900, help="seconds to wait for each remote run (default 900)")
+    fp.add_argument("--json", action="store_true", help="print only the fan-out summary JSON")
+    fp = fleet_sub.add_parser("recover", help="recover outstanding remote dispatches after a disconnect (M26 slice 2, #210)")
+    fp.add_argument("run_id", nargs="?", help="one remote run id to probe directly (scan mode when omitted)")
+    fp.add_argument("--runner", help="runner to probe (required in explicit mode; scan-mode filter otherwise)")
+    fp.add_argument("--redispatch", action="store_true",
+                    help="re-dispatch a lost/recovered task to another runner with spare capacity, "
+                         "reusing the original card / verify / base from the dispatch record "
+                         "(explicit mode needs --card-file/--repo/--backend)")
+    fp.add_argument("--card-file", help="task card for an explicit-mode redispatch with no dispatch record")
+    fp.add_argument("--repo", help="repository for an explicit-mode redispatch with no dispatch record")
+    fp.add_argument("--backend", help="backend for an explicit-mode redispatch with no dispatch record")
+    fp.add_argument("--verify", help="acceptance command for an explicit-mode redispatch with no dispatch record")
+    fp.add_argument("--base", help="base commit for an explicit-mode redispatch with no dispatch record")
+    fp.add_argument("--timeout", type=float, default=900, help="seconds to wait for a redispatched remote run (default 900)")
+    fp.add_argument("--json", action="store_true")
     fp = fleet_sub.add_parser("exec")
     fp.add_argument("--timeout", type=float, default=None,
                     help="seconds; default 300, none for `watch`")
