@@ -295,6 +295,7 @@ Grouped by what the command does. `openswarm <command> --help` lists every flag.
 | `lane launchd-plist` | Print an uninstalled LaunchAgent plist for a lane. | `$XS lane launchd-plist C1` |
 | `lane systemd-unit` | Print an uninstalled systemd unit for a lane. | `$XS lane systemd-unit K1` |
 | `batch` | Queue task cards across fleet hosts and collect their branches. | `$XS batch --repo project --cards ./cards --hosts worker,sandbox --per-host 1 --backend pi --budget-minutes 20 --detach` |
+| `batch --health-gate` | Pre-dispatch health gate per card (M25, #202; off by default): probe each card's selected backend before dispatch; an unhealthy backend blocks just that card (`blocked/health-gate`, no exec attempt, never rerouted). `--no-health-gate` forces it off, `--skip-health-gate` bypasses it for the batch (bypass recorded). | `$XS batch --health-gate --repo project --cards ./cards --hosts worker,sandbox` |
 | `batch status` | Show the state of one batch. | `$XS batch status <batch-id>` |
 | `bus init` | Create the bus labels, issue template, and protocol README. | `$XS bus init acme/openswarm-bus` |
 | `bus status` | Show open bus issues with their executor and age. | `$XS bus status --json` |

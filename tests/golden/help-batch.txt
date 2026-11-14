@@ -4,7 +4,8 @@ usage: openswarm batch [-h] [--repo REPO] [--cards CARDS] [--hosts HOSTS]
                        [--model MODEL] [--effort EFFORT] [--verify VERIFY]
                        [--budget-minutes BUDGET_MINUTES]
                        [--backends-file BACKENDS_FILE] [--verify-evalid]
-                       [--evalid-bin EVALID_BIN] [--base BASE]
+                       [--evalid-bin EVALID_BIN] [--health-gate]
+                       [--no-health-gate] [--skip-health-gate] [--base BASE]
                        [--scope {repo,host}] [--detach]
                        [--card-type CARD_TYPE] [--rework-of REWORK_OF]
                        [--paths PATHS [PATHS ...]]
@@ -41,6 +42,14 @@ options:
                         to a bin/xflow.js checkout (run via node); overrides
                         EVALID_BIN, xflow on PATH, and the sibling ../evalid
                         checkout on the executor host
+  --health-gate         enable the pre-dispatch backend health gate for this
+                        batch (M25, #202): probe each card's selected backend
+                        before dispatch and refuse an unhealthy one (the card
+                        is blocked, no exec attempt, never rerouted)
+  --no-health-gate      disable the pre-dispatch backend health gate for this
+                        batch even when routing.health_gate.enabled is true
+  --skip-health-gate    bypass the health gate for this batch; the bypass is
+                        recorded on each card's summary row (M25, #202)
   --base BASE
   --scope {repo,host}   task scope (repo by default; host for authorized host
                         operations)
