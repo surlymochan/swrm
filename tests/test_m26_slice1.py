@@ -56,7 +56,10 @@ class M26Slice1Tests(unittest.TestCase):
 
     def task_file(self, text="Write the proof file.\n"):
         path = self.root / "task.md"
-        path.write_text(text)
+        # Bytes, not text: on Windows, write_text() would translate \n to
+        # \r\n and the dispatch (which transfers bytes verbatim) would then
+        # carry \r\n — the assertion below must see the exact bytes.
+        path.write_bytes(text.encode())
         return path
 
     def ledger_entries(self):
