@@ -23,6 +23,19 @@ def update(kind, **fields):
 
 
 class WatchTests(unittest.TestCase):
+    def test_compacted_pi_progress_and_native_final_message(self):
+        fixture = pathlib.Path(__file__).parent / "fixtures" / "pi_cumulative_sanitized.jsonl"
+        codec, messages = xs.PiEventCompactor(), xs.WatchMessages()
+        rows = []
+        with fixture.open() as stream:
+            for line in stream:
+                rows.extend(messages.feed(codec.encode(json.loads(line))))
+        self.assertEqual(rows[:2], [("msg", "Checking"), ("msg", " changes")])
+        self.assertIn(("cmd", "git status --short"), rows)
+        final = next(text for kind, text in rows if kind == "msg" and text.startswith('{"status"'))
+        self.assertEqual(json.loads(final)["status"], "partial")
+        self.assertEqual(json.loads(final)["followups"], ["verify commit receipt"])
+
     def test_pi_only_emits_completed_assistant_messages(self):
         messages = xs.WatchMessages()
         self.assertEqual(messages.feed({"type": "message_update", "assistantMessageEvent": {
@@ -180,6 +193,20 @@ class WakeRegressionTests(unittest.TestCase):
         with mock.patch.object(xs, "watch_wait_for_change", side_effect=InterruptedError("idle")):
             with self.assertRaises(InterruptedError):
                 self.wake()
+
+    def test_compacted_pi_updates_keep_wake_cursor_and_error_delivery(self):
+        codec = xs.PiEventCompactor()
+        message = {"role": "assistant", "content": [{"type": "text", "text": "progress"}]}
+        update = codec.encode({"type": "message_update", "message": message})
+        path = self.run_fixture(events=[update, {"type": "error", "error": "cancelled; receipt unknown"}])
+        self.assertIn("ERROR: cancelled; receipt unknown", self.wake())
+        saved = json.loads(self.cursor.read_text())
+        self.assertEqual(next(iter(saved["files"].values()))["offset"], path.stat().st_size)
+        with path.open("a") as stream:
+            stream.write(json.dumps({"type": "error", "error": "later evidence"}) + "\n")
+        second = self.wake()
+        self.assertIn("ERROR: later evidence", second)
+        self.assertNotIn("cancelled", second)
 
     def test_same_inode_truncation_and_regrowth(self):
         for replacement in ("short", "regrown" * 100):
