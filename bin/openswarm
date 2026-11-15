@@ -17155,7 +17155,7 @@ INTAKE_OWN_BOT = "openswarm[bot]"
 INTAKE_POLICY_VERSION = 1
 INTAKE_DECISIONS = ("accept", "stop", "ignore", "unavailable")
 INTAKE_STRENGTHS = ("explicit", "inferred")
-INTAKE_ACCEPT_MODES = ("off", "shadow", "on")
+INTAKE_ACCEPT_MODES = ("off", "shadow", "on", "active")
 INTAKE_TICKET_STATES = ("open", "ended")
 INTAKE_ASSIGNMENT_STATES = ("pending", "running", "ended")
 
@@ -17289,6 +17289,37 @@ def validate_intake_policy(policy):
         if timeout is not None and (not isinstance(timeout, (int, float))
                                     or isinstance(timeout, bool) or timeout <= 0):
             raise ValueError(f"intake policy assessment.timeout_seconds must be a positive number, got {timeout!r}")
+    # M28 slice 1 (#232): active-mode scope and per-thread caps. Both
+    # blocks are optional; absent means "no active scope configured"
+    # (active mode dispatches nothing) and "no caps" respectively.
+    active_scope = policy.get("active_scope")
+    if active_scope is not None:
+        if not isinstance(active_scope, dict):
+            raise ValueError("intake policy active_scope must be an object")
+        repos = active_scope.get("repos")
+        if repos is not None:
+            if not isinstance(repos, list) or not all(isinstance(r, str) and r for r in repos):
+                raise ValueError("intake policy active_scope.repos must be a list of non-empty strings")
+            for repo in repos:
+                parts = repo.split("/")
+                if len(parts) != 2 or not all(p.strip() for p in parts):
+                    raise ValueError(f"intake policy active_scope.repos entry must be owner/name, got {repo!r}")
+        users = active_scope.get("users")
+        if users is not None:
+            if not isinstance(users, list) or not all(isinstance(u, str) and u for u in users):
+                raise ValueError("intake policy active_scope.users must be a list of non-empty strings")
+    caps = policy.get("caps")
+    if caps is not None:
+        if not isinstance(caps, dict):
+            raise ValueError("intake policy caps must be an object")
+        max_dispatches = caps.get("max_dispatches_per_thread")
+        if max_dispatches is not None and (not isinstance(max_dispatches, int)
+                                           or isinstance(max_dispatches, bool) or max_dispatches < 1):
+            raise ValueError(f"intake policy caps.max_dispatches_per_thread must be a positive integer, got {max_dispatches!r}")
+        max_budget = caps.get("max_budget_minutes_per_thread")
+        if max_budget is not None and (not isinstance(max_budget, (int, float))
+                                       or isinstance(max_budget, bool) or max_budget <= 0):
+            raise ValueError(f"intake policy caps.max_budget_minutes_per_thread must be a positive number, got {max_budget!r}")
     return policy
 
 
@@ -17534,12 +17565,16 @@ def transition_intake_ticket(ticket, to_state, reason="", now=None):
     return updated
 
 
-def new_intake_assignment(ticket, executor, now=None):
+def new_intake_assignment(ticket, executor, now=None, budget_minutes=None):
     """An Assignment binds one Ticket to one Executor instance. Slice 1
     never creates one (shadow core); the constructor exists so slice 2
-    reuses the same id/state rules instead of inventing new ones."""
+    reuses the same id/state rules instead of inventing new ones.
+    budget_minutes (M28 slice 1, #232) records the wall-clock budget
+    allocated to this dispatch, so the per-thread caps can sum what a
+    thread has already spent; assignments created before this field
+    existed carry no value and count as the dispatch default."""
     ts = now if now is not None else time.time()
-    return {
+    assignment = {
         "id": intake_assignment_id(ticket["id"], executor),
         "ticket_id": ticket["id"],
         "executor": executor,
@@ -17548,6 +17583,9 @@ def new_intake_assignment(ticket, executor, now=None):
         "history": [{"ts": ts, "from": None, "to": "pending",
                      "reason": "created"}],
     }
+    if budget_minutes is not None:
+        assignment["budget_minutes"] = budget_minutes
+    return assignment
 
 
 def transition_intake_assignment(assignment, to_state, reason="", now=None):
@@ -17836,9 +17874,14 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
     Decision is the final one (gate_decision preserves the Gate outcome).
 
     Real dispatch happens only when all of these hold: final decision is
-    accept, policy accept_mode is "on", the Trigger is not draft_only,
-    and a dispatch_runner was passed (intake poll passes the real one;
-    plain ingest stays shadow and dispatches nothing). After a dispatch
+    accept, policy accept_mode is "on" or "active", the Trigger is not
+    draft_only, and a dispatch_runner was passed (intake poll passes the
+    real one; plain ingest stays shadow and dispatches nothing). In
+    active mode (M28 slice 1, #232) three further gates apply before any
+    Assignment exists: the Trigger must be inside the allowlisted scope
+    (active_scope repos + authorized accounts; outside stays shadow with
+    a ledger trace) and inside the per-thread caps, and the M24/M25
+    health gate must not block the effective backend. After a dispatch
     (success or failure) the Channel posts the result back to the source
     thread when a channel_poster was passed; a Channel failure is
     recorded, never raised. State is saved at each mutation point (not
@@ -17922,11 +17965,28 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
         save_intake_state(state, data_dir)
         result["ticket_id"] = ticket["id"]
         result["mandate_id"] = mandate["id"]
-        dispatchable = (decision["accept_mode"] == "on"
+        if decision["accept_mode"] == "active":
+            # M28 slice 1 (#232): active mode dispatches only inside the
+            # allowlisted scope (repo + authorized account, both must
+            # hold). The scope verdict is recorded for every accepted
+            # Trigger in active mode, runner or not; outside the scope
+            # the Ticket stays shadow -- no run, ledger trace.
+            scope_ok, scope_reason = intake_active_scope_check(trigger, policy)
+            result["active_scope"] = {"in_scope": scope_ok, "reason": scope_reason}
+            if not scope_ok:
+                append_intake_ledger({"kind": "active_scope_shadow", "trigger_id": trigger["id"],
+                                      "ticket_id": ticket["id"],
+                                      "thread": intake_thread_key(trigger["thread"]),
+                                      "author": trigger["author"],
+                                      "reason": scope_reason}, data_dir)
+                result["dispatch_note"] = (f"active mode: outside allowlisted scope "
+                                           f"({scope_reason}); Ticket only, no dispatch (shadow)")
+                return result
+        dispatchable = (decision["accept_mode"] in ("on", "active")
                         and not decision["draft_only"]
                         and dispatch_runner is not None)
         if not dispatchable:
-            if decision["accept_mode"] != "on":
+            if decision["accept_mode"] not in ("on", "active"):
                 result["dispatch_note"] = (f"accept_mode is {decision['accept_mode']}: "
                                            "Ticket only, no dispatch")
             elif decision["draft_only"]:
@@ -17934,6 +17994,37 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
             else:
                 result["dispatch_note"] = "no dispatch runner passed: Ticket only, no dispatch"
             return result
+        # M28 slice 1 (#232): per-thread caps -- a thread that already
+        # used its dispatch count or budget gets no new run.
+        dispatch_cfg = intake_dispatch_config(policy)
+        caps_ok, caps_reason, caps_usage = intake_caps_check(
+            trigger["thread"], state, policy, dispatch_cfg["budget_minutes"])
+        if not caps_ok:
+            append_intake_ledger({"kind": "cap_blocked", "trigger_id": trigger["id"],
+                                  "ticket_id": ticket["id"],
+                                  "thread": intake_thread_key(trigger["thread"]),
+                                  "reason": caps_reason, "usage": caps_usage}, data_dir)
+            result["cap_blocked"] = True
+            result["caps"] = caps_usage
+            result["dispatch_note"] = f"dispatch cap reached: {caps_reason}; Ticket only, no dispatch"
+            return result
+        # M28 slice 1 (#232): health-gate pre-check (M24/M25 reuse) --
+        # an unhealthy backend blocks the dispatch before any Assignment
+        # or run exists. The run child would refuse the same backend,
+        # but only after creating both.
+        gate_record, gate_blocked = intake_health_gate_check(
+            policy, backend=dispatch_cfg["backend"])
+        if gate_blocked:
+            append_intake_ledger({"kind": "intake_health_gate_blocked", "trigger_id": trigger["id"],
+                                  "ticket_id": ticket["id"],
+                                  "thread": intake_thread_key(trigger["thread"]),
+                                  "health_gate": gate_record}, data_dir)
+            result["health_gate_blocked"] = True
+            result["health_gate"] = gate_record
+            result["dispatch_note"] = f"health gate blocked dispatch: {gate_record.get('reason')}"
+            return result
+        if gate_record is not None:
+            result["health_gate"] = gate_record
         try:
             dispatch = intake_dispatch(ticket, trigger, decision, policy=policy,
                                        data_dir=data_dir, dispatch_runner=dispatch_runner,
@@ -18059,6 +18150,12 @@ def cmd_intake_policy(args, data_dir=None):
               f"scopes={','.join(policy['scopes'])}")
         print(f"  allowlist users={','.join(policy['allowlist']['users']) or '-'} "
               f"bots={','.join(policy['allowlist']['bots']) or '-'}")
+        scope = intake_active_scope(policy)
+        print(f"  active_scope repos={','.join(scope['repos']) or '-'} "
+              f"users={','.join(scope['users']) or '-'}")
+        caps = (policy.get("caps") or {})
+        print(f"  caps max_dispatches_per_thread={caps.get('max_dispatches_per_thread') or '-'} "
+              f"max_budget_minutes_per_thread={caps.get('max_budget_minutes_per_thread') or '-'}")
         for key, value in policy["admission"].items():
             print(f"  admission {key} -> {value}")
         print(f"  money_draft_only={policy.get('money_draft_only', True)}")
@@ -18640,17 +18737,26 @@ def intake_dispatch(ticket, trigger, decision, policy=None, data_dir=None,
     success; raises ValueError on runner failure (the caller records it
     as dispatch_failed). dispatch_runner replaces the subprocess runner
     (tests inject a fake); it receives (ticket, trigger, decision, policy,
-    data_dir, cwd) and returns {run_id, status, result}."""
+    data_dir, cwd) and returns {run_id, status, result}. One Ticket
+    dispatches at most once (M28 slice 1, #232): a second call for a
+    Ticket that already has an Assignment raises ValueError before
+    creating anything, so a re-delivered Trigger can never
+    double-dispatch."""
     policy = policy or default_intake_policy()
     cfg = intake_dispatch_config(policy)
     executor = cfg["backend"] or "routed"
     state = load_intake_state(data_dir)
-    assignment = new_intake_assignment(ticket, executor)
+    if any(a.get("ticket_id") == ticket["id"] for a in state.get("assignments") or []):
+        raise ValueError(f"ticket {ticket['id']} already has an assignment; "
+                         "refusing a second dispatch")
+    assignment = new_intake_assignment(ticket, executor,
+                                       budget_minutes=cfg["budget_minutes"])
     state["assignments"].append(assignment)
     save_intake_state(state, data_dir)
     append_intake_ledger({"kind": "assignment_created", "trigger_id": trigger["id"],
                           "ticket_id": ticket["id"], "assignment_id": assignment["id"],
-                          "executor": executor}, data_dir)
+                          "executor": executor,
+                          "budget_minutes": cfg["budget_minutes"]}, data_dir)
     running = transition_intake_assignment(assignment, "running",
                                            reason=f"dispatching via {executor}")
     state["assignments"] = [running if a["id"] == assignment["id"] else a
@@ -18658,7 +18764,8 @@ def intake_dispatch(ticket, trigger, decision, policy=None, data_dir=None,
     save_intake_state(state, data_dir)
     append_intake_ledger({"kind": "dispatch_started", "trigger_id": trigger["id"],
                           "ticket_id": ticket["id"], "assignment_id": assignment["id"],
-                          "executor": executor}, data_dir)
+                          "executor": executor,
+                          "budget_minutes": cfg["budget_minutes"]}, data_dir)
     runner = dispatch_runner or run_openswarm_run
     try:
         outcome = runner(ticket, trigger, decision, policy, data_dir, cwd)
@@ -18818,6 +18925,122 @@ def cmd_intake_poll(args, data_dir=None):
               f"run={((result.get('dispatch') or {}).get('run_id')) or '-'}")
     return out
 
+
+
+# ---------------------------------------------------------------- intake M28 slice 1 (#232): active-mode core
+#
+# accept_mode=active is the controlled rollout of real dispatch: it
+# dispatches only inside an allowlisted scope (repo + authorized
+# account, both must hold), under per-thread caps, and only when the
+# M24/M25 health gate does not block the effective backend. Anything
+# outside the scope stays shadow -- Ticket + sealed Mandate, no run --
+# with a ledger trace. accept_mode=on keeps its M27 meaning (dispatch
+# anything accepted; the operator's explicit choice) and is not
+# scope-gated, but caps and the health-gate pre-check apply to both
+# dispatching modes. No new subcommand: `intake policy` prints the new
+# blocks, `intake poll` / `intake ingest` pick them up through ingest.
+
+def intake_active_scope(policy):
+    """Effective active scope: repos must be listed explicitly (an empty
+    list means nothing is active -- active mode with no scope configured
+    dispatches nothing); users default to the intake allowlist users
+    when the block omits them. Repo comparison is case-insensitive,
+    like GitHub's own owner/name matching."""
+    scope = (policy or {}).get("active_scope") or {}
+    repos = scope.get("repos") or []
+    users = scope.get("users")
+    if users is None:
+        users = (policy.get("allowlist") or {}).get("users") or []
+    return {"repos": [r.lower() for r in repos],
+            "users": list(users)}
+
+
+def intake_active_scope_check(trigger, policy):
+    """Allowlist-scope gate for accept_mode=active: both conditions must
+    hold -- the thread repo is listed in active_scope.repos AND the
+    author is an authorized account in active_scope.users (default: the
+    intake allowlist users). Returns (ok, reason)."""
+    scope = intake_active_scope(policy)
+    repo = trigger["thread"]["repo"]
+    author = trigger["author"]
+    if repo.lower() not in scope["repos"]:
+        return False, f"repo {repo} is not in active_scope.repos"
+    if author.lower() not in {u.lower() for u in scope["users"]}:
+        return False, f"author {author} is not in active_scope.users"
+    return True, f"repo {repo} and author {author} are in the active scope"
+
+
+def intake_caps_check(thread, state, policy, budget_minutes):
+    """Per-thread dispatch caps (M28 slice 1, #232): at most
+    caps.max_dispatches_per_thread dispatches on one thread, and at
+    most caps.max_budget_minutes_per_thread allocated budget minutes in
+    total on it. The budget counted is the allocation recorded on each
+    Assignment at creation (not the wall clock actually spent -- the
+    conservative, predictable measure); assignments created before the
+    field existed count as the dispatch default. A missing caps block
+    (or a missing key inside it) means that cap is off. Returns
+    (allowed, reason, usage)."""
+    caps = (policy or {}).get("caps") or {}
+    if not caps:
+        return True, "no caps configured", {"dispatches": 0, "budget_minutes": 0,
+                                            "max_dispatches_per_thread": None,
+                                            "max_budget_minutes_per_thread": None}
+    key = intake_thread_key(thread)
+    tickets = {t["id"]: t for t in state.get("tickets") or []}
+    dispatches = 0
+    spent = 0
+    for assignment in state.get("assignments") or []:
+        ticket = tickets.get(assignment.get("ticket_id"))
+        if ticket is None or intake_thread_key(ticket["thread"]) != key:
+            continue
+        dispatches += 1
+        allocated = assignment.get("budget_minutes")
+        spent += allocated if isinstance(allocated, (int, float)) else INTAKE_DISPATCH_BUDGET_MINUTES
+    usage = {"dispatches": dispatches, "budget_minutes": spent,
+             "max_dispatches_per_thread": caps.get("max_dispatches_per_thread"),
+             "max_budget_minutes_per_thread": caps.get("max_budget_minutes_per_thread")}
+    limit_n = caps.get("max_dispatches_per_thread")
+    if limit_n is not None and dispatches >= limit_n:
+        return False, (f"{dispatches} dispatch(es) already on {key} "
+                       f"(max {limit_n})"), usage
+    limit_b = caps.get("max_budget_minutes_per_thread")
+    if limit_b is not None and spent + budget_minutes > limit_b:
+        return False, (f"{spent}m already spent on {key}; one more dispatch "
+                       f"({budget_minutes}m) would exceed max {limit_b}m"), usage
+    return True, f"caps ok for {key} ({dispatches} dispatch(es), {spent}m spent)", usage
+
+
+def intake_health_gate_check(policy, backend=None):
+    """Pre-dispatch health gate for intake (M28 slice 1, #232). Reuses
+    the M24/M25 gate (apply_health_gate) and the swrm policy.json
+    routing.health_gate config -- the same config and the same probe the
+    `openswarm run` child applies after routing. When the gate is off
+    (shipped default), returns (None, False) and dispatch proceeds
+    exactly as before. When on, the effective backend is probed: an
+    explicitly configured dispatch backend, or the backend route()
+    picks for the default run profile ({"type": "impl", "difficulty": 3},
+    the profile the run child uses). When routing finds no backend (ok
+    False), there is nothing to gate: returns (None, False) and the run
+    child refuses as unroutable, as today. Returns (record, blocked);
+    blocked is True only for unhealthy, or unknown with
+    on_unknown=block."""
+    swrm_policy = load_policy()
+    cfg = health_gate_config(swrm_policy)
+    if not cfg["enabled"]:
+        return None, False
+    dispatch_cfg = intake_dispatch_config(policy)
+    if backend is None:
+        backend = dispatch_cfg["backend"]
+    st = get_state(swrm_policy)
+    if backend is None:
+        custom_backends = load_custom_backends(swrm_policy, explicit=dispatch_cfg["backends_file"])
+        decision = route({"type": "impl", "difficulty": 3}, st, swrm_policy,
+                         custom_backends=custom_backends)
+        if not decision.get("ok"):
+            return None, False
+        backend = decision["backend"]
+    args = argparse.Namespace(health_gate=False, no_health_gate=False, skip_health_gate=False)
+    return apply_health_gate(backend, st, swrm_policy, args, stage="intake")
 
 
 # ---------------------------------------------------------------- CLI
@@ -20191,7 +20414,7 @@ def main():
     ip.add_argument("--trigger-file", required=True, help="JSON file with one Trigger object")
     ip.add_argument("--policy-file", help="intake policy JSON to use instead of $OPENSWARM_HOME/intake-policy.json")
     ip.add_argument("--model-command", nargs="+", help="model hook command (overrides policy assessment.command and $OPENSWARM_ASSESS_CMD)")
-    ip = intake_sub.add_parser("poll", help="poll a GitHub repo for new issues/comments and ingest them (Gate + Assessment; accept + mode on dispatches via `run` and posts back)")
+    ip = intake_sub.add_parser("poll", help="poll a GitHub repo for new issues/comments and ingest them (Gate + Assessment; accept + mode on/active dispatches via `run` and posts back)")
     ip.add_argument("--repo", required=True, help="owner/name to poll")
     ip.add_argument("--issue", type=int, help="restrict the poll to one issue thread")
     ip.add_argument("--pr", type=int, help="restrict the poll to one PR thread")
@@ -20204,7 +20427,7 @@ def main():
     ip.add_argument("--backends-file", help="custom backends config JSON for dispatch (overrides policy dispatch.backends_file)")
     ip.add_argument("--verify", help="acceptance command for dispatch runs (overrides policy dispatch.verify)")
     ip.add_argument("--budget-minutes", type=float, help="wall-clock budget per dispatch run in minutes (overrides policy dispatch.budget_minutes)")
-    ip.add_argument("--no-dispatch", action="store_true", help="never dispatch, even in accept_mode on (Ticket only)")
+    ip.add_argument("--no-dispatch", action="store_true", help="never dispatch, even in accept_mode on/active (Ticket only)")
     ip.add_argument("--no-channel", action="store_true", help="do not post results back to the source thread")
     ip.add_argument("--cwd", help="repo checkout the dispatch runs work from (default: current directory)")
     ip.add_argument("--json", action="store_true")
