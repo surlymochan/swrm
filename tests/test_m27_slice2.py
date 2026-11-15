@@ -198,6 +198,49 @@ class M27Slice2Tests(unittest.TestCase):
         self.assertTrue(seen.get("thread"))
         self.assertEqual(len(out["triggers"]), 1)
 
+    def test_thread_restricted_poll_leaves_repo_cursor_untouched(self):
+        # A full poll owns the repo-wide cursor.
+        xs.poll_github_source("surlymochan/swrm",
+                              fetcher=lambda r, s: [event(205, body="repo wide task",
+                                                          number=10,
+                                                          updated="2026-11-15T03:01:00Z")],
+                              data_dir=str(self.data))
+        before = xs.load_intake_state(str(self.data))["cursors"]["surlymochan/swrm"]
+        self.assertEqual(before["since"], "2026-11-15T03:01:00Z")
+        # A thread-restricted poll sees a newer event but must not move
+        # the repo-wide cursor: other threads updated before it would
+        # be skipped by the next full poll.
+        out = xs.poll_github_source("surlymochan/swrm",
+                                    fetcher=lambda r, s: [event(206, body="scoped task",
+                                                                number=11,
+                                                                updated="2026-11-15T09:00:00Z")],
+                                    data_dir=str(self.data), thread=("issue", 11))
+        self.assertEqual(len(out["triggers"]), 1)
+        after = xs.load_intake_state(str(self.data))["cursors"]["surlymochan/swrm"]
+        self.assertEqual(after, before)
+        self.assertEqual(after["since"], "2026-11-15T03:01:00Z")
+        self.assertEqual(out["cursor"], before)
+        # A full poll still advances it.
+        out = xs.poll_github_source("surlymochan/swrm",
+                                    fetcher=lambda r, s: [event(207, body="newer repo wide task",
+                                                                number=12,
+                                                                updated="2026-11-15T10:00:00Z")],
+                                    data_dir=str(self.data))
+        self.assertEqual(out["cursor"]["since"], "2026-11-15T10:00:00Z")
+        self.assertEqual(
+            xs.load_intake_state(str(self.data))["cursors"]["surlymochan/swrm"]["since"],
+            "2026-11-15T10:00:00Z")
+
+    def test_thread_restricted_poll_creates_no_repo_cursor(self):
+        out = xs.poll_github_source("surlymochan/swrm",
+                                    fetcher=lambda r, s: [event(208, body="scoped task",
+                                                                number=13,
+                                                                updated="2026-11-15T09:00:00Z")],
+                                    data_dir=str(self.data), thread=("issue", 13))
+        self.assertEqual(len(out["triggers"]), 1)
+        self.assertEqual(out["cursor"]["since"], "")
+        self.assertEqual(xs.load_intake_state(str(self.data))["cursors"], {})
+
     # -- Assessment ---------------------------------------------------------
 
     def test_assessment_never_overrides_gate_ignore(self):
