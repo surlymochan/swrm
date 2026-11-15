@@ -18919,10 +18919,20 @@ def cmd_intake_poll(args, data_dir=None):
           f"{polled['duplicates']} duplicate(s); cursor since={polled['cursor']['since'] or '-'}")
     for result in results:
         decision = result.get("decision") or {}
-        print(f"{result['trigger_id']}  {decision.get('decision') or 'duplicate':<11} "
-              f"ticket={result.get('ticket_id') or '-'} "
-              f"dispatched={result.get('dispatched')} "
-              f"run={((result.get('dispatch') or {}).get('run_id')) or '-'}")
+        line = (f"{result['trigger_id']}  {decision.get('decision') or 'duplicate':<11} "
+                f"ticket={result.get('ticket_id') or '-'} "
+                f"dispatched={result.get('dispatched')} "
+                f"run={((result.get('dispatch') or {}).get('run_id')) or '-'}")
+        # M28 slice 2 (#235): why a Trigger did not dispatch -- the
+        # active-scope shadow reason, a cap block, a health-gate block
+        # or the Ticket-only reason -- belongs on the same line, so an
+        # operator sees it without opening the ledger. Appended only
+        # when the ingest recorded a note; a dispatched Trigger has
+        # none.
+        note = result.get("dispatch_note")
+        if note:
+            line += f"  note={note}"
+        print(line)
     return out
 
 
