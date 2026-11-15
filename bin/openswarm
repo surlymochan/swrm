@@ -22,7 +22,8 @@ Subcommands:
   batch            queue task cards across fleet hosts and collect their branches
   verify-remote    verify a fleet run on another host in a temporary worktree
   bus              initialize or inspect a GitHub issue bus repository
-  intake           SuperAgent autonomy layer (M27): policy, ingest, replay, tickets, decisions
+  intake           SuperAgent autonomy layer (M27): policy, ingest, replay, tickets, decisions, close
+  attention        list Tickets needing attention: open, ended awaiting review, stale (read-only)
   bus-worker       run the reference GitHub issue bus executor
   watch            stream actionable events (progress, risk, stalls) for one or more runs
   runs / report    snapshot of recent runs / compact scheduled check-in
@@ -17169,9 +17170,33 @@ INTAKE_COMMITMENT = re.compile(
     r"(对外承诺|承诺.*(?:交付|完成|保证)|代表.*承诺|"
     r"\bpromise to\b|\bguarantee\b|\bcommit to (?:deliver|ship|complete)\b)",
     re.IGNORECASE)
-INTAKE_STOP = re.compile(
-    r"(?im)(^|\n)\s*(stop|halt|停止|别做了|取消任务|不要做了)\b|@openswarm\s+stop\b",
+INTAKE_STOP_LINE = re.compile(
+    r"^(?:@openswarm\s+)?(stop|halt|停止|别做了|取消任务|不要做了)(?![A-Za-z0-9_])",
     re.IGNORECASE)
+
+
+def intake_is_human_stop(body):
+    """Standalone-stop rule (slice 3, #228; tightens slice 1): a stop
+    counts only when it is its own instruction on a line -- a line that
+    starts (after whitespace) with `@openswarm stop`, or with a bare stop
+    word -- and the line is not quoted (`>`), not a table row (`|`), and
+    not inside a fenced code block. Slice 2's real-data case (a table
+    quoting `@openswarm stop` inside an evidence comment, gh comment
+    6878371088) no longer stops work; a quoted or tabulated mention is
+    a report of a stop, not a stop."""
+    in_fence = False
+    for raw_line in (body or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("```") or line.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if line.startswith(">") or line.startswith("|"):
+            continue
+        if INTAKE_STOP_LINE.search(line):
+            return True
+    return False
 
 
 def intake_paths(data_dir=None):
@@ -17363,7 +17388,7 @@ def intake_gate_decide(trigger, policy):
                 "draft_only": False, "policy_version": policy["version"],
                 "trigger_id": trigger["id"], "accept_mode": mode}
     listed = author_lower in allow_users
-    if listed and INTAKE_STOP.search(trigger["body"]):
+    if listed and intake_is_human_stop(trigger["body"]):
         return {"decision": "stop", "strength": None,
                 "rules": ["human-stop"],
                 "reason": f"listed author {author} issued a stop for this thread",
@@ -17414,7 +17439,8 @@ def intake_assignment_id(ticket_id, executor):
 
 def new_intake_ticket(trigger, decision, now=None):
     """Create a Ticket for an accepted Trigger. Status open; ended only via
-    transition_intake_ticket (human stop, slice 1) or verify close (later)."""
+    transition_intake_ticket (human stop, slice 1; operator verify close,
+    slice 3 via `intake close`)."""
     ts = now if now is not None else time.time()
     ticket_id = intake_ticket_id(trigger["id"])
     return {
@@ -17446,8 +17472,35 @@ def new_intake_mandate(ticket, trigger, decision, now=None):
         "rules": list(decision["rules"]),
         "source_identity": trigger["author"],
         "created_ts": ts,
+        "status": "active",
+        "withdrawn_ts": None,
+        "withdrawn_reason": None,
         "_sealed": True,
     }
+
+
+def intake_mandate_status(mandate):
+    """Lifecycle status of a Mandate. Mandates sealed before slice 3
+    carry no status field; they were created active and are read as such."""
+    return (mandate or {}).get("status") or "active"
+
+
+def withdraw_intake_mandate(mandate, reason="", now=None):
+    """Withdraw a sealed Mandate (human stop, slice 3). This is a
+    lifecycle transition, not a scope edit: the seal still forbids
+    changing policy_version / scope / strength / rules /
+    source_identity -- only the status moves active -> withdrawn, once.
+    Withdrawing twice is refused so a re-delivered stop cannot rewrite
+    the record. A withdrawn Mandate can never resume its Ticket; a later
+    task on the same thread opens a new Ticket with a new Mandate."""
+    if intake_mandate_status(mandate) == "withdrawn":
+        raise ValueError(f"mandate {mandate.get('id')} is already withdrawn")
+    ts = now if now is not None else time.time()
+    updated = dict(mandate)
+    updated["status"] = "withdrawn"
+    updated["withdrawn_ts"] = ts
+    updated["withdrawn_reason"] = reason
+    return updated
 
 
 def intake_update_mandate(mandate, **changes):
@@ -17463,9 +17516,10 @@ def intake_update_mandate(mandate, **changes):
 
 def transition_intake_ticket(ticket, to_state, reason="", now=None):
     """Ticket state machine: open -> ended -> open (resume). Anything else
-    is refused. The resume *path* (Subscription fan-out) lands in slice 3;
-    the transition itself is validated here so slice 3 cannot reopen a
-    Ticket that was never open."""
+    is refused. The resume path is Subscription fan-out (slice 3,
+    `intake_try_resume`): only an ended Ticket with an active Mandate
+    reopens, and only on a human follow-up that passes the policy
+    re-check."""
     allowed = {"open": ("ended",), "ended": ("open",)}
     current = ticket.get("status")
     if to_state not in allowed.get(current, ()):
@@ -17567,15 +17621,214 @@ def intake_ledger_entries(data_dir=None, kind=None):
     return entries
 
 
+# ---------------------------------------------------------------- intake slice 3 (M27 #228): Subscription resume / stop + attention
+#
+# A Ticket subscribes to its source Thread. A human follow-up on the
+# thread of an *ended* Ticket resumes that Ticket under its existing
+# Mandate (same ticket id, same mandate id, no new Eval, no new Ticket)
+# after the current policy is re-checked; a human stop withdraws the
+# Mandate and the Ticket takes no further messages. Bot / CI messages
+# are context only and never resume. Resume reopens the Ticket only --
+# it creates no new Assignment; the follow-up text is on the ledger for
+# the next dispatch. Closing a Ticket on verify evidence is the
+# operator path (`intake close`); a stop is the human path.
+
+def intake_actionable_body(body):
+    """Body minus the bot mention, stripped. The resume floor: a
+    follow-up shorter than this is a greeting, not a task (same 10-char
+    floor as the default Assessment)."""
+    return re.sub(r"(?i)@openswarm\b", "", body or "").strip()
+
+
+def intake_resume_check(ticket, mandate, trigger, policy):
+    """Policy re-check for a resume (slice 3): the ended Ticket's
+    Mandate is reused only when it is still active, the author is a
+    human the *current* policy still admits for this thread, the thread
+    kind is still in scope, accept_mode is not off, and the follow-up
+    carries an actionable task. Returns (ok, reason, rules_checked).
+    This is a re-check of the sealed Mandate against the live policy,
+    not a fresh Eval: no new Decision is written, no Assessment runs."""
+    rules = []
+    if ticket is None or mandate is None:
+        return False, "no ended Ticket with a Mandate on this thread", rules
+    if intake_mandate_status(mandate) != "active":
+        return False, f"mandate {mandate.get('id')} is {intake_mandate_status(mandate)}", rules
+    if trigger.get("author_is_bot"):
+        return False, "bot messages are context only and never resume a Ticket", rules
+    if policy.get("accept_mode") == "off":
+        return False, "intake accept_mode is off", ["accept-mode-off"]
+    rules.append("mandate-active")
+    author_lower = (trigger.get("author") or "").lower()
+    if author_lower not in {u.lower() for u in policy["allowlist"]["users"]}:
+        return False, f"author {trigger.get('author')} is no longer on the intake allowlist", rules
+    rules.append("author-still-allowlisted")
+    if trigger["thread"]["kind"] not in policy["scopes"]:
+        return False, f"thread kind {trigger['thread']['kind']} is outside the intake scopes", rules
+    rules.append("scope-still-admitted")
+    if len(intake_actionable_body(trigger.get("body") or "")) < INTAKE_ASSESS_MIN_BODY_CHARS:
+        return False, "follow-up carries no actionable task (empty or only a bot mention)", rules
+    rules.append("follow-up-actionable")
+    return True, (f"mandate {mandate['id']} still active under policy v{policy['version']}; "
+                  f"author {trigger['author']} still allowlisted"), rules
+
+
+def intake_resume_ticket(ticket, mandate, trigger, policy, data_dir=None, now=None):
+    """Resume an ended Ticket under its existing Mandate. Writes two
+    ledger entries (subscription_followup with the follow-up excerpt and
+    the policy re-check, ticket_resumed with the state transition) and
+    saves state. Returns the reopened Ticket."""
+    state = load_intake_state(data_dir)
+    stored = next((t for t in state["tickets"] if t["id"] == ticket["id"]), None)
+    if stored is None:
+        raise ValueError(f"no intake ticket {ticket['id']} in state")
+    ok, reason, rules = intake_resume_check(stored, mandate, trigger, policy)
+    if not ok:
+        raise ValueError(f"cannot resume ticket {ticket['id']}: {reason}")
+    reopened = transition_intake_ticket(
+        stored, "open",
+        reason=f"human follow-up {trigger['id']}: {reason}", now=now)
+    state["tickets"] = [reopened if t["id"] == stored["id"] else t
+                        for t in state["tickets"]]
+    state["triggers_seen"][trigger["id"]] = stored["id"]
+    save_intake_state(state, data_dir)
+    append_intake_ledger({"kind": "subscription_followup", "trigger_id": trigger["id"],
+                          "ticket_id": stored["id"], "mandate_id": mandate["id"],
+                          "thread": intake_thread_key(trigger["thread"]),
+                          "author": trigger["author"],
+                          "policy_version": policy["version"],
+                          "rules_checked": rules,
+                          "body_excerpt": (trigger.get("body") or "")[:200],
+                          "reason": reason}, data_dir)
+    append_intake_ledger({"kind": "ticket_resumed", "trigger_id": trigger["id"],
+                          "ticket_id": stored["id"], "mandate_id": mandate["id"],
+                          "thread": intake_thread_key(trigger["thread"]),
+                          "policy_version": policy["version"],
+                          "reason": reason}, data_dir)
+    return reopened
+
+
+def intake_close_ticket(ticket_id, reason="", evidence=None, data_dir=None, now=None):
+    """Operator close (slice 3): end an open Ticket on verify evidence.
+    The Mandate stays active, so a later human follow-up can still
+    resume this Ticket -- closing is the verify path, withdrawing (human
+    stop) is the only path that retires the Mandate. Closing an already
+    ended Ticket, or an unknown id, is refused."""
+    state = load_intake_state(data_dir)
+    ticket = next((t for t in state["tickets"] if t["id"] == ticket_id), None)
+    if ticket is None:
+        raise ValueError(f"no intake ticket {ticket_id}")
+    closed = transition_intake_ticket(
+        ticket, "ended", reason=reason or "operator close (verify evidence attached)",
+        now=now)
+    state["tickets"] = [closed if t["id"] == ticket_id else t
+                        for t in state["tickets"]]
+    save_intake_state(state, data_dir)
+    append_intake_ledger({"kind": "ticket_ended", "ticket_id": ticket_id,
+                          "thread": intake_thread_key(ticket["thread"]),
+                          "reason": closed["history"][-1]["reason"],
+                          "via": "close", "evidence": evidence}, data_dir)
+    return closed
+
+
+def intake_attention_tickets(state=None, data_dir=None, now=None, stale_days=7):
+    """Attention buckets (slice 3, read-only: loads state, writes
+    nothing). open = Tickets awaiting work; ended_unreviewed = ended
+    Tickets not yet reviewed (there is no review marker yet, so every
+    ended Ticket is listed with its close reason); stale = open Tickets
+    older than stale_days, plus ended Tickets ended that long ago
+    without review. Each row carries the Mandate status and the latest
+    Assignment status, so a reviewer can tell withdrawn from active at
+    a glance."""
+    if state is None:
+        state = load_intake_state(data_dir)
+    ts = now if now is not None else time.time()
+    cutoff = ts - stale_days * 86400
+    mandates = {m["ticket_id"]: m for m in state.get("mandates") or []}
+    assignments = {}
+    for assignment in state.get("assignments") or []:
+        assignments.setdefault(assignment["ticket_id"], []).append(assignment)
+    buckets = {"open": [], "ended_unreviewed": [], "stale": []}
+    for ticket in state.get("tickets") or []:
+        ticket_assignments = assignments.get(ticket["id"]) or []
+        row = {"ticket_id": ticket["id"],
+               "thread": intake_thread_key(ticket["thread"]),
+               "status": ticket["status"],
+               "mandate_id": ticket["mandate_id"],
+               "mandate_status": intake_mandate_status(mandates.get(ticket["id"])),
+               "source_identity": ticket.get("source_identity"),
+               "created_ts": ticket.get("created_ts"),
+               "ended_ts": ticket.get("ended_ts"),
+               "last_reason": (ticket.get("history") or [{}])[-1].get("reason"),
+               "assignments": len(ticket_assignments),
+               "latest_assignment_status": (ticket_assignments[-1].get("status")
+                                            if ticket_assignments else None)}
+        if ticket["status"] == "open":
+            buckets["open"].append(row)
+            if (ticket.get("created_ts") or 0) < cutoff:
+                stale = dict(row)
+                stale["stale_reason"] = f"open for over {stale_days}d"
+                buckets["stale"].append(stale)
+        elif ticket["status"] == "ended":
+            buckets["ended_unreviewed"].append(row)
+            if (ticket.get("ended_ts") or 0) < cutoff:
+                stale = dict(row)
+                stale["stale_reason"] = f"ended over {stale_days}d ago, unreviewed"
+                buckets["stale"].append(stale)
+    buckets["open"].sort(key=lambda r: r["created_ts"] or 0)
+    buckets["ended_unreviewed"].sort(key=lambda r: r["ended_ts"] or 0)
+    buckets["stale"].sort(key=lambda r: r["created_ts"] or 0)
+    buckets["counts"] = {key: len(buckets[key])
+                         for key in ("open", "ended_unreviewed", "stale")}
+    buckets["stale_days"] = stale_days
+    return buckets
+
+
+def intake_try_resume(trigger, gate, policy, state, data_dir=None, now=None):
+    """Subscription resume attempt, called from ingest right after the
+    Gate (before Assessment): a human follow-up on the thread of an
+    ended Ticket resumes that Ticket under its existing Mandate -- no
+    new Eval, no new Ticket, no new Mandate, no dispatch. Returns the
+    ingest result dict on resume, else None to fall through to the
+    normal path. Resume needs an ended Ticket with an active Mandate
+    and no open Ticket on the same thread (an open Ticket means the
+    thread already has live work; the follow-up goes through the normal
+    path instead of guessing which Ticket it belongs to)."""
+    thread_key = intake_thread_key(trigger["thread"])
+    if any(t["status"] == "open" and intake_thread_key(t["thread"]) == thread_key
+           for t in state.get("tickets") or []):
+        return None
+    ended = [t for t in state.get("tickets") or []
+             if t["status"] == "ended" and intake_thread_key(t["thread"]) == thread_key]
+    if not ended:
+        return None
+    target = max(ended, key=lambda t: t.get("ended_ts") or 0)
+    mandate = next((m for m in state.get("mandates") or []
+                    if m["ticket_id"] == target["id"]), None)
+    ok, reason, _rules = intake_resume_check(target, mandate, trigger, policy)
+    if not ok:
+        return None
+    reopened = intake_resume_ticket(target, mandate, trigger, policy,
+                                    data_dir=data_dir, now=now)
+    return {"duplicate": False, "trigger_id": trigger["id"],
+            "decision": gate, "ticket_id": reopened["id"],
+            "mandate_id": mandate["id"],
+            "assessment": {"verdict": "accept",
+                           "reason": f"resumed under existing mandate: {reason}",
+                           "source": "subscription"},
+            "dispatched": False, "resumed": True}
+
+
 def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
                           assess=True, model_command=None, assess_timeout=120,
                           dispatch_runner=None, channel_poster=None,
                           dispatch_cwd=None):
-    """Ingest one Trigger end to end: dedup -> Gate -> Assessment -> Decision
+    """Ingest one Trigger end to end: dedup -> Gate -> Subscription
+    resume (slice 3: a human follow-up on an ended Ticket's thread
+    resumes it under its Mandate, no new Eval) -> Assessment -> Decision
     ledger -> Ticket + sealed Mandate on accept, or end the thread's open
-    Ticket on a human stop. Idempotent: a repeated delivery of the same
-    Trigger id returns the original Ticket and writes only a
-    duplicate_skipped ledger line.
+    Ticket and withdraw its Mandate on a human stop. Idempotent: a repeated
+    delivery of the same Trigger id returns the original Ticket and writes
+    only a duplicate_skipped ledger line.
 
     Assessment runs on every Gate accept (assess=False keeps the slice 1
     Gate-only behaviour for callers that need it); it can only downgrade
@@ -17615,6 +17868,11 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
                           "author_is_bot": trigger["author_is_bot"],
                           "mentioned_bot": trigger["mentioned_bot"]}, data_dir)
     gate = intake_gate_decide(trigger, policy)
+    if gate["decision"] == "accept":
+        resumed = intake_try_resume(trigger, gate, policy, state,
+                                    data_dir=data_dir, now=now)
+        if resumed is not None:
+            return resumed
     assessment = None
     if assess and gate["decision"] == "accept":
         assessment = intake_assess_trigger(trigger, gate, state=state, data_dir=data_dir,
@@ -17720,12 +17978,49 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
             seen[trigger["id"]] = target["id"]
             append_intake_ledger({"kind": "ticket_ended", "trigger_id": trigger["id"],
                                   "ticket_id": target["id"], "thread": thread_key,
-                                  "reason": "human stop"}, data_dir)
+                                  "reason": "human stop", "via": "stop"}, data_dir)
             result["ticket_id"] = target["id"]
             result["stopped"] = True
         else:
-            seen[trigger["id"]] = None
-            result["stopped"] = False
+            # No open Ticket: a stop can still retire the Mandate of an
+            # already-ended Ticket on this thread, so the Ticket takes no
+            # further messages (a later follow-up opens a new Ticket).
+            ended_target = None
+            ended_on_thread = [t for t in state["tickets"]
+                               if t["status"] == "ended"
+                               and intake_thread_key(t["thread"]) == thread_key]
+            if ended_on_thread:
+                candidate = max(ended_on_thread, key=lambda t: t.get("ended_ts") or 0)
+                mandate = next((m for m in state["mandates"]
+                                if m["ticket_id"] == candidate["id"]), None)
+                if mandate is not None and intake_mandate_status(mandate) == "active":
+                    ended_target = candidate
+            if ended_target is not None:
+                target = ended_target
+                seen[trigger["id"]] = target["id"]
+                result["ticket_id"] = target["id"]
+                result["stopped"] = True
+            else:
+                seen[trigger["id"]] = None
+                result["stopped"] = False
+        if target is not None:
+            # A human stop withdraws the Mandate (slice 3): the Ticket
+            # takes no further messages, and no follow-up can resume it.
+            mandate = next((m for m in state["mandates"]
+                            if m["ticket_id"] == target["id"]), None)
+            if mandate is not None and intake_mandate_status(mandate) == "active":
+                withdrawn = withdraw_intake_mandate(
+                    mandate, reason=f"human stop via {trigger['id']}", now=now)
+                state["mandates"] = [withdrawn if m["id"] == mandate["id"] else m
+                                     for m in state["mandates"]]
+                append_intake_ledger({"kind": "mandate_withdrawn",
+                                      "trigger_id": trigger["id"],
+                                      "ticket_id": target["id"],
+                                      "mandate_id": mandate["id"],
+                                      "thread": thread_key,
+                                      "reason": "human stop"}, data_dir)
+                result["mandate_withdrawn"] = True
+                result["mandate_id"] = mandate["id"]
         save_intake_state(state, data_dir)
     else:
         seen[trigger["id"]] = None
@@ -17853,6 +18148,55 @@ def cmd_intake_tickets(args, data_dir=None):
     for ticket in tickets:
         print(f"{ticket['id']}  {ticket['status']:<6} {intake_thread_key(ticket['thread'])}  "
               f"trigger={ticket['trigger_id']} mandate={ticket['mandate_id']}")
+
+
+def cmd_intake_close(args, data_dir=None):
+    """Operator close: end one open Ticket on verify evidence. The
+    Mandate stays active, so a later human follow-up can still resume
+    the Ticket (only a human stop withdraws a Mandate)."""
+    closed = intake_close_ticket(args.ticket, reason=args.reason or "",
+                                 evidence=args.evidence, data_dir=data_dir)
+    print(json.dumps({"ok": True, "ticket_id": closed["id"],
+                      "status": closed["status"],
+                      "thread": intake_thread_key(closed["thread"]),
+                      "mandate_id": closed["mandate_id"],
+                      "reason": closed["history"][-1]["reason"]},
+                     ensure_ascii=False))
+
+
+def cmd_attention(args, data_dir=None):
+    """Read-only attention list: open Tickets (needs work), ended
+    Tickets awaiting review, and stale ones. Loads state only; writes
+    nothing (no state save, no ledger append)."""
+    buckets = intake_attention_tickets(data_dir=data_dir,
+                                       stale_days=args.stale_days)
+    if args.json:
+        print(json.dumps({"ok": True, **buckets}, indent=2, ensure_ascii=False))
+        return
+    counts = buckets["counts"]
+    print(f"attention: {counts['open']} open, {counts['ended_unreviewed']} ended unreviewed, "
+          f"{counts['stale']} stale (>{buckets['stale_days']}d)")
+    for label, key in (("open -- needs work", "open"),
+                       ("ended -- awaiting review", "ended_unreviewed"),
+                       ("stale", "stale")):
+        rows = buckets[key]
+        print(f"\n[{label}] ({len(rows)})")
+        if not rows:
+            print("  -")
+            continue
+        for row in rows:
+            age = ""
+            if row["created_ts"]:
+                age = f" created {iso(row['created_ts'])}"
+            ended = (f" ended {iso(row['ended_ts'])}"
+                     if row["ended_ts"] else "")
+            assign = (f" assignments={row['assignments']}"
+                      + (f"({row['latest_assignment_status']})"
+                         if row["latest_assignment_status"] else ""))
+            print(f"  {row['ticket_id']}  {row['thread']}  "
+                  f"mandate={row['mandate_status']}{age}{ended}{assign}")
+            if row["last_reason"]:
+                print(f"    last: {row['last_reason'][:160]}")
 
 
 def cmd_intake_decisions(args, data_dir=None):
@@ -19874,6 +20218,14 @@ def main():
     ip = intake_sub.add_parser("decisions", help="list Gate Decisions from the append-only intake ledger")
     ip.add_argument("--n", type=int, default=20, help="most recent N decisions (default: 20)")
     ip.add_argument("--json", action="store_true")
+    ip = intake_sub.add_parser("close", help="end one open Ticket on verify evidence (Mandate stays active, so a later human follow-up can still resume it)")
+    ip.add_argument("--ticket", required=True, help="ticket id, e.g. tkt-0123456789ab")
+    ip.add_argument("--reason", help="why the Ticket is ended (default: operator close)")
+    ip.add_argument("--evidence", help="evidence pointer recorded in the ledger, e.g. a run id or result.json path")
+
+    sp = sub.add_parser("attention", help="list Tickets needing attention: open, ended awaiting review, stale (read-only; M27 slice 3, #228)")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--stale-days", type=int, default=7, help="age in days past which a Ticket counts as stale (default: 7)")
 
     sp = sub.add_parser("lane", help="manage resident executor lanes")
     lane_sub = sp.add_subparsers(dest="lane_cmd", required=True)
@@ -20095,6 +20447,14 @@ def main():
                 cmd_intake_tickets(a)
             elif a.intake_cmd == "decisions":
                 cmd_intake_decisions(a)
+            elif a.intake_cmd == "close":
+                cmd_intake_close(a)
+        except (ValueError, OSError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
+            sys.exit(2)
+    elif a.cmd == "attention":
+        try:
+            cmd_attention(a)
         except (ValueError, OSError) as error:
             print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
             sys.exit(2)
