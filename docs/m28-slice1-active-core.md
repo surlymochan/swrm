@@ -130,6 +130,5 @@ unroutable defers to the run path, gate-off unchanged), and the
   default, so the cost is zero until an operator enables it.
 - Caps count allocations, not elapsed time: a run that finishes early
   still counts its full allocated budget against the thread.
-- Slice 2 (#233, not yet opened at slice-1 time) owns the real
-  allowlisted-scope evidence: ≥2 real GitHub issues dispatched end
+- Slice 2 (#234) owns the real allowlisted-scope evidence: ≥2 real GitHub issues dispatched end
   to end, plus the unlisted-ignore and stop/withdraw cases.
