@@ -256,7 +256,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm fleet runners` | List registered runners with declared backends, capacity, and live reachability (M26 slice 1, #207). | `openswarm fleet runners --json` |
 | `openswarm fleet dispatch` | Dispatch one task card to a named runner: card + worktree spec go over, the remote backend runs, result/verify/ledger pointers come back into the controller ledger (M26 slice 1, #207). | `openswarm fleet dispatch worker --repo project --task-file ./task.md --backend codex --verify 'pytest -q'` |
 | `openswarm fleet dispatch-many` | Fan a directory of task cards out across registered runners, capacity-aware and least-loaded-first, in waves (M26 slice 2, #210). | `openswarm fleet dispatch-many --cards-dir ./cards --repo project --backend pi` |
-| `openswarm intake` | SuperAgent autonomy layer (M27 slice 1 #213 + slice 2 #224): deterministic Gate admission of GitHub Triggers into Tickets with sealed Mandates, Assessment second layer, and — in accept mode `on` — real dispatch through `run` with the result posted back to the source thread (`intake poll`); shadow mode still dispatches nothing. | `openswarm intake poll --repo surlymochan/swrm --dry-run` |
+| `openswarm intake` | SuperAgent autonomy layer (M27 slice 1 #213 + slice 2 #224 + slice 3 #228): deterministic Gate admission of GitHub Triggers into Tickets with sealed Mandates, Assessment second layer, and — in accept mode `on` — real dispatch through `run` with the result posted back to the source thread (`intake poll`); shadow mode still dispatches nothing. Slice 3 adds Subscription resume of ended Tickets under the same Mandate, human stop withdrawing the Mandate, operator close on verify evidence, and the read-only `attention` list. | `openswarm intake poll --repo surlymochan/swrm --dry-run` |
 | `openswarm fleet recover` | Recover outstanding remote dispatches after a disconnect: lost / recovered / finished / still-running verdicts in the controller ledger, `--redispatch` re-queues a lost task on another runner (M26 slice 2, #210). | `openswarm fleet recover --redispatch` |
 | `openswarm fleet ledger pull` | Merge the host ledgers into one fleet ledger file. | `openswarm fleet ledger pull --hosts worker,sandbox` |
 | `openswarm run --rework-of` | Resume an earlier run's task as a rework, linked in the ledger as `rework_of`. | `openswarm run --rework-of <run-id> --cwd ~/code/myrepo --task-file /tmp/task.md` |
@@ -913,7 +913,7 @@ Cursor CLI is a fourth executor, opt-in only (`--backend cursor`).
 
 | Path | What |
 | --- | --- |
-| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `lane`, `batch`, `bus`, `bus-worker`, `verify-remote`, `intake`, `watch`, `runs`, `resume`, `report`, `budget`, `stop`, `fleet`, `consult`, `review`, `compare`, `regress`, `routing`, `lessons`, `patterns`, `retro`, `ingest-claude`, `ledger` |
+| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `lane`, `batch`, `bus`, `bus-worker`, `verify-remote`, `intake`, `attention`, `watch`, `runs`, `resume`, `report`, `budget`, `stop`, `fleet`, `consult`, `review`, `compare`, `regress`, `routing`, `lessons`, `patterns`, `retro`, `ingest-claude`, `ledger` |
 | `SKILL.md` | Claude Code skill: the planner's operating manual |
 | `policy.json` | Defaults: thresholds, difficulty map, model caps, local data sources |
 | `backends/*.json` | One manifest per executor: invocation, quota source, data boundary |
