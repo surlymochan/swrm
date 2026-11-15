@@ -19043,6 +19043,109 @@ def intake_health_gate_check(policy, backend=None):
     return apply_health_gate(backend, st, swrm_policy, args, stage="intake")
 
 
+# ---------------------------------------------------------------- intake M28 slice 2 (#234): real-rollout evidence check
+#
+# The slice-2 acceptance is evidence, not mechanism: the live runs in the
+# isolated $OPENSWARM_HOME leave their record in the append-only intake
+# ledger, and this checker validates that record against epic #231
+# acceptance ①–⑤ without trusting any executor self-report. It reads
+# ledger entries only (kind + ticket/run ids + ordering); whether the
+# dispatched runs' PRs exist and their branches pass verify is checked
+# by the operator against GitHub and recorded in
+# docs/m28-slice2-real-evidence.md, never inferred from this function.
+
+def intake_m28_slice2_evidence_check(entries, state=None, policy=None):
+    """Validate one slice-2 rollout record. `entries` is the intake ledger
+    in append order; `state` (optional) is the intake state for ticket ->
+    thread mapping; `policy` (optional) is the intake policy whose caps
+    the run was under. Returns {"ok", "checks", "failures"} where checks
+    maps each acceptance item to {"ok", "detail"}. A missing item is a
+    failure, never a pass: the checker cannot see the outside world, so
+    it only certifies what the ledger itself proves."""
+    entries = list(entries or [])
+    checks = {}
+
+    def check(name, ok, detail):
+        checks[name] = {"ok": bool(ok), "detail": detail}
+        return bool(ok)
+
+    finished = [e for e in entries if e.get("kind") == "dispatch_finished" and e.get("run_id")]
+    dispatched_tickets = {e.get("ticket_id") for e in finished if e.get("ticket_id")}
+    assigned = {}
+    for e in entries:
+        if e.get("kind") == "assignment_created" and e.get("ticket_id"):
+            assigned.setdefault(e["ticket_id"], []).append(e)
+    started = {e.get("ticket_id") for e in entries if e.get("kind") == "dispatch_started"}
+    check("dispatched_at_least_two",
+          len(dispatched_tickets) >= 2 and dispatched_tickets <= set(assigned)
+          and dispatched_tickets <= started,
+          f"{len(dispatched_tickets)} ticket(s) dispatched with a run id "
+          f"({sorted(dispatched_tickets)}); each needs assignment_created + "
+          "dispatch_started")
+    posted_runs = {e.get("run_id") for e in entries
+                   if e.get("kind") == "channel_posted" and e.get("run_id")}
+    missing_channel = sorted({e.get("run_id") for e in finished} - posted_runs)
+    check("channel_posted_per_dispatch", not missing_channel,
+          "every dispatched run has a channel_posted entry" if not missing_channel
+          else f"no channel_posted for run(s) {missing_channel}")
+    shadows = [e for e in entries if e.get("kind") == "active_scope_shadow"]
+    check("scope_shadow", len(shadows) >= 1,
+          f"{len(shadows)} active_scope_shadow entr(ies) (out-of-scope stays shadow)")
+    ignores = [e for e in entries if e.get("kind") == "decision"
+               and e.get("decision") == "ignore"]
+    check("gate_ignore", len(ignores) >= 1,
+          f"{len(ignores)} decision=ignore entr(ies) (unauthorized trigger ignored, zero run)")
+    withdraws = [(i, e) for i, e in enumerate(entries)
+                 if e.get("kind") == "mandate_withdrawn"]
+    check("mandate_withdrawn", len(withdraws) >= 1,
+          f"{len(withdraws)} mandate_withdrawn entr(ies) (stop/withdraw retires the Mandate)")
+    after_withdraw = []
+    for i, e in withdraws:
+        ticket = e.get("ticket_id")
+        for later in entries[i + 1:]:
+            if (later.get("kind") == "dispatch_finished"
+                    and later.get("ticket_id") == ticket):
+                after_withdraw.append(ticket)
+    check("no_dispatch_after_withdraw", not after_withdraw,
+          "no dispatch_finished after a mandate_withdrawn on the same ticket"
+          if not after_withdraw
+          else f"dispatch_finished after withdraw for ticket(s) {sorted(set(after_withdraw))}")
+    doubled = sorted(t for t, xs in assigned.items() if len(xs) > 1)
+    check("one_assignment_per_ticket", not doubled,
+          "at most one assignment_created per ticket (idempotent dispatch)"
+          if not doubled
+          else f"second assignment_created for ticket(s) {doubled}")
+    caps = (policy or {}).get("caps") or {}
+    max_n = caps.get("max_dispatches_per_thread")
+    max_b = caps.get("max_budget_minutes_per_thread")
+    if not caps or (max_n is None and max_b is None):
+        check("caps_respected", True, "no caps configured in policy; nothing to exceed")
+    else:
+        threads = {}
+        for t in (state or {}).get("tickets") or []:
+            threads[t.get("id")] = intake_thread_key(t["thread"]) if t.get("thread") else None
+        for e in entries:
+            if e.get("kind") == "ticket_created" and e.get("ticket_id") and e.get("thread"):
+                threads.setdefault(e["ticket_id"], e["thread"])
+        per_thread = {}
+        for ticket, xs in assigned.items():
+            key = threads.get(ticket) or ticket
+            count = len(xs)
+            budget = sum(x.get("budget_minutes")
+                         if isinstance(x.get("budget_minutes"), (int, float))
+                         else INTAKE_DISPATCH_BUDGET_MINUTES for x in xs)
+            old_c, old_b = per_thread.get(key, (0, 0))
+            per_thread[key] = (old_c + count, old_b + budget)
+        over = [f"{k}: {c} dispatch(es)/{b}m" for k, (c, b) in sorted(per_thread.items())
+                if (max_n is not None and c > max_n)
+                or (max_b is not None and b > max_b)]
+        check("caps_respected", not over,
+              f"per-thread usage {per_thread} within caps {caps}" if not over
+              else f"cap exceeded on {over}")
+    failures = sorted(name for name, c in checks.items() if not c["ok"])
+    return {"ok": not failures, "checks": checks, "failures": failures}
+
+
 # ---------------------------------------------------------------- CLI
 
 def profile_from_args(a):
