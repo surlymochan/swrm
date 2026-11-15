@@ -12,6 +12,7 @@ the subprocess `run` path with the echo custom backend.
 import json
 import os
 import pathlib
+import re
 import shutil
 import stat
 import subprocess
@@ -499,6 +500,53 @@ class M27Slice2Tests(unittest.TestCase):
         self.assertEqual(state["cursors"]["surlymochan/swrm"]["since"],
                          "2026-11-15T03:02:00Z")
         self.assertEqual(state["tickets"], [])
+
+
+class GhArgvCmdQuotingTests(unittest.TestCase):
+    """_gh_argv .bat/.cmd route (M27 slice 2, #227): the Windows legs of
+    run 43663137668 split a gh api URL at cmd.exe because list2cmdline
+    left the `&` unquoted. The route must return one string with every
+    token double-quoted inside cmd's outer /c quotes."""
+
+    URL = "repos/surlymochan/swrm/issues?state=all&sort=updated&direction=desc&per_page=100"
+
+    def _quoted_tokens(self, command):
+        # Strip cmd's outer /c quotes, then split the inner command into
+        # its quoted tokens ("" inside a token is one literal quote).
+        inner = command[len("cmd.exe /c \""):-1]
+        return [t.replace('""', '"') for t in
+                re.findall(r'"((?:[^"]|"")*)"', inner)]
+
+    def test_bat_route_returns_quoted_string_with_url_as_one_token(self):
+        with mock.patch.object(shutil, "which", return_value="C:\\tools\\gh.bat"), \
+                mock.patch.dict(os.environ, {"COMSPEC": "cmd.exe"}):
+            command = xs._gh_argv("gh", ["api", self.URL])
+        self.assertIsInstance(command, str)
+        self.assertTrue(command.startswith('cmd.exe /c "'))
+        self.assertTrue(command.endswith('"'))
+        tokens = self._quoted_tokens(command)
+        self.assertEqual(tokens, ["C:\\tools\\gh.bat", "api", self.URL])
+        self.assertIn("&", tokens[2])
+
+    def test_bat_route_doubles_embedded_quotes_in_body(self):
+        body = 'body=say "hi" & bye'
+        with mock.patch.object(shutil, "which", return_value="C:\\tools\\gh.CMD"), \
+                mock.patch.dict(os.environ, {"COMSPEC": "cmd.exe"}):
+            command = xs._gh_argv("gh", ["api", "repos/x/y/issues/1/comments",
+                                         "-f", body])
+        self.assertIsInstance(command, str)
+        self.assertIn('""hi""', command)
+        tokens = self._quoted_tokens(command)
+        self.assertEqual(tokens, ["C:\\tools\\gh.CMD", "api",
+                                  "repos/x/y/issues/1/comments", "-f", body])
+
+    def test_exe_and_unresolved_routes_stay_lists(self):
+        with mock.patch.object(shutil, "which", return_value="/usr/bin/gh"):
+            self.assertEqual(xs._gh_argv("gh", ["api", self.URL]),
+                             ["/usr/bin/gh", "api", self.URL])
+        with mock.patch.object(shutil, "which", return_value=None):
+            self.assertEqual(xs._gh_argv("gh", ["api", self.URL]),
+                             ["gh", "api", self.URL])
 
 
 class M27Slice2EchoDispatchTests(unittest.TestCase):

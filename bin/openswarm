@@ -17995,19 +17995,37 @@ def github_event_to_trigger(event, repo, thread_kinds=None):
     }
 
 
+def _cmd_quote(token):
+    """Quote one token for cmd.exe: wrap in double quotes, doubling any
+    embedded double quote (the cmd convention). Keeps cmd metacharacters
+    such as & inside a gh api URL literal instead of splitting the
+    command (M27 slice 2, #227)."""
+    return '"' + str(token).replace('"', '""') + '"'
+
+
 def _gh_argv(gh_cmd, args):
-    """Build the argv for a `gh api ...` invocation.
+    """Build the command for a `gh api ...` invocation.
 
     Windows list-form subprocess goes through CreateProcess, which only
     resolves .exe -- a gh.bat/gh.cmd shim on PATH is silently skipped and
     the real gh.exe runs instead (M27 slice 2, #227: poll --dry-run hit
     the real gh on the Windows legs). Resolve with shutil.which, which
-    honours PATHEXT, and route a .bat/.cmd through COMSPEC /c. POSIX is
-    unchanged: the resolved path runs directly.
+    honours PATHEXT, and route a .bat/.cmd through COMSPEC /c.
+
+    The .bat route returns one string, not a list: list form is rebuilt
+    by list2cmdline, which leaves a `gh api` URL's unquoted `&` for
+    cmd.exe to split into separate commands (run 43663137668: `sort:
+    cannot read: '=updated'`). Every token is double-quoted and the whole
+    command is wrapped in cmd's outer /c quotes (cmd /c ""<bat>" "api"
+    "<url>"") so & and friends stay literal; subprocess passes the
+    string verbatim to CreateProcess. A `"` inside an argument (e.g. a
+    channel body) is doubled, never silently dropped. POSIX and the
+    direct-.exe route are unchanged: the resolved path runs as a list.
     """
     resolved = shutil.which(gh_cmd)
     if resolved and resolved.lower().endswith((".bat", ".cmd")):
-        return [os.environ.get("COMSPEC", "cmd.exe"), "/c", resolved, *args]
+        inner = " ".join(_cmd_quote(token) for token in [resolved, *args])
+        return f'{os.environ.get("COMSPEC", "cmd.exe")} /c "{inner}"'
     if resolved:
         return [resolved, *args]
     return [gh_cmd, *args]
