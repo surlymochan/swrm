@@ -151,3 +151,5 @@ end to end, CLI smoke for all five subcommands).
   **not** ported.
 - The resume transition is validated in the model, but no resume path
   exists yet (slice 3, Subscription).
+- Slice 2 (M27 #224: GitHub Source + Assessment + real dispatch + Channel)
+  is in flight: [#224](https://github.com/surlymochan/swrm/issues/224).
