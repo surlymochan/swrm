@@ -9,6 +9,8 @@ dispatch/channel failure recording, assessment downgrade), policy
 validation for the new blocks, and one real end-to-end dispatch through
 the subprocess `run` path with the echo custom backend.
 """
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -457,6 +459,50 @@ class M27Slice2Tests(unittest.TestCase):
             no_dispatch=False, no_channel=False, cwd=None, json=False)
         with self.assertRaises(ValueError):
             xs.cmd_intake_poll(args, data_dir=str(self.data))
+
+    def test_cli_poll_prints_dispatch_note_for_out_of_scope_trigger(self):
+        # M28 slice 2 (#235): the per-trigger line carries the dispatch
+        # note, so an operator sees at a glance why a Trigger did not
+        # dispatch -- here the active-mode shadow outside the
+        # allowlisted scope.
+        import argparse
+        policy = xs.default_intake_policy()
+        policy["accept_mode"] = "active"
+        policy["active_scope"] = {"repos": ["surlymochan/evalid"],
+                                  "users": ["surlymochan"]}
+        policy_file = os.path.join(self.tmp.name, "intake-policy.json")
+        with open(policy_file, "w") as f:
+            json.dump(policy, f)
+        trigger = trig("d1", body="please fix the flaky test in fleet dispatch", number=10)
+        polled = {"repo": "surlymochan/swrm", "triggers": [trigger], "skipped_own": 0,
+                  "duplicates": 0, "cursor": {"since": "2026-11-15T03:00:00Z"}}
+        args = argparse.Namespace(
+            repo="surlymochan/swrm", issue=None, pr=None, since=None, limit=100,
+            dry_run=False, policy_file=policy_file, model_command=None, backend=None,
+            backends_file=None, verify=None, budget_minutes=None,
+            no_dispatch=True, no_channel=True, cwd=None, json=False)
+        buffer = io.StringIO()
+        with mock.patch.object(xs, "poll_github_source", return_value=polled), \
+                contextlib.redirect_stdout(buffer):
+            out = xs.cmd_intake_poll(args, data_dir=str(self.data))
+        result = out["results"][0]
+        self.assertFalse(result["dispatched"])
+        note = result["dispatch_note"]
+        self.assertIn("outside allowlisted scope", note)
+        self.assertIn("not in active_scope.repos", note)
+        lines = [line for line in buffer.getvalue().splitlines()
+                 if line.startswith("d1 ")]
+        self.assertEqual(len(lines), 1)
+        line = lines[0]
+        # the existing fields keep their order; the note is appended last
+        self.assertTrue(line.startswith("d1  accept "))
+        self.assertIn("ticket=" + result["ticket_id"], line)
+        self.assertIn("dispatched=False", line)
+        self.assertIn("run=-", line)
+        self.assertLess(line.index("ticket="), line.index("dispatched="))
+        self.assertLess(line.index("dispatched="), line.index("run="))
+        self.assertLess(line.index("run="), line.index("note="))
+        self.assertIn("note=" + note, line)
 
     def test_cli_poll_dry_run_with_fake_gh(self):
         bindir = os.path.join(self.tmp.name, "bin")
