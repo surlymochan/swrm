@@ -64,16 +64,44 @@ smoke (`attention --json`, `intake close`, text output).
 
 ## Real acceptance evidence (2026-11-15, controlled repo surlymochan/swrm, accept mode=on)
 
-Probe issue + follow-up + stop, all posted as @surlymochan via `gh`,
-polled with `intake poll --issue N` against an isolated
-`$OPENSWARM_HOME` (echo backend, so the dispatch is real but writes
-nothing to the repo):
+Probe issue #229 (temporary, now closed), all comments posted as
+@surlymochan via `gh`, polled with `intake poll --issue 229` against
+an isolated `$OPENSWARM_HOME` (echo backend, so the dispatch is real
+but writes nothing to the repo). Ticket `tkt-99876ab42595`, Mandate
+`mnd-ab3f93ccef3f`, policy v1, accept_mode=on.
 
-- TODO: fill in after the acceptance run (probe issue number, ticket id,
-  run id, ledger seq numbers, comment ids). Evidence dir:
-  `~/workspace/scratch/ownrepo-1115-swrm-m27s3-evidence/`
-  (ledger + state + poll outputs). Evidence comment on #228 carries
-  the ledger lines and review pointers.
+- Accept + dispatch (poll 1): issue body trigger
+  `github:issue:6401318030` -> accept / explicit -> run
+  `20261115-072546-80c516` status `done` (backend echo, branch
+  `openswarm/20261115-072546-80c516`, commit `9e0e8a7517`,
+  `echo-output.txt` on the branch) -> Channel comment
+  `6891044123`. Ledger seq 1-8.
+- Operator close: `intake close --ticket tkt-99876ab42595` with
+  `--evidence runs/20261115-072546-80c516/result.json` -> ticket
+  `ended`, Mandate still `active`. Ledger seq 9 (`ticket_ended`,
+  `via: close`).
+- Resume (poll 2): human follow-up comment `6891047609`
+  ("@openswarm follow-up: the echo output is on file; please resume
+  this ticket ...") -> `resumed: True`, same ticket, same Mandate,
+  `dispatched: False`, **no new Decision entry** (decision entries
+  total still 1). Ledger seq 10 `trigger_received`, 11
+  `subscription_followup` (rules checked: `mandate-active`,
+  `author-still-allowlisted`, `scope-still-admitted`,
+  `follow-up-actionable`), 12 `ticket_resumed`. Ticket back to `open`.
+- Stop (poll 3): human stop comment `6891050729` ("@openswarm stop")
+  -> decision `stop`, `stopped: True`, `mandate_withdrawn: True`.
+  Ledger seq 13-16 (`trigger_received`, `decision`,
+  `ticket_ended` `via: stop`, `mandate_withdrawn`). Ticket `ended`,
+  Mandate `withdrawn`.
+- `openswarm attention` after the run: `0 open, 1 ended unreviewed,
+  0 stale`, the ended row showing `mandate=withdrawn`,
+  `assignments=1(ended)`.
+- Probe issue #229 closed afterwards (comment `6891055398`).
+- Evidence dir: `~/workspace/scratch/ownrepo-1115-swrm-m27s3-evidence/`
+  (ledger + state + `poll1-accept-dispatch.json`,
+  `poll2-resume.json`, `poll3-stop.json`). Evidence comment on #228
+  carries the same numbers with review pointers. Full-suite result is
+  recorded in that #228 comment, not claimed here.
 
 ## Epic #212 acceptance status after this slice
 
@@ -82,5 +110,7 @@ nothing to the repo):
   acceptance run through the initial dispatch).
 - ③ Resume / stop cases >= 1 each: this slice (see evidence above).
 - ④ accept_mode defaults to shadow (built-in policy v1, verified by
-  `intake policy` on a fresh home); full suite green; release v0.4.46
-  notes the MIT source and the close-on-verify divergence.
+  `intake policy` on a fresh home: `accept_mode=shadow`); full-suite
+  result is recorded in the evidence comment on #228; release v0.4.46
+  notes the MIT source and the close-on-verify divergence (release is
+  a main-wheel step after this PR merges, not part of this PR).
