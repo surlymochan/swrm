@@ -17995,6 +17995,24 @@ def github_event_to_trigger(event, repo, thread_kinds=None):
     }
 
 
+def _gh_argv(gh_cmd, args):
+    """Build the argv for a `gh api ...` invocation.
+
+    Windows list-form subprocess goes through CreateProcess, which only
+    resolves .exe -- a gh.bat/gh.cmd shim on PATH is silently skipped and
+    the real gh.exe runs instead (M27 slice 2, #227: poll --dry-run hit
+    the real gh on the Windows legs). Resolve with shutil.which, which
+    honours PATHEXT, and route a .bat/.cmd through COMSPEC /c. POSIX is
+    unchanged: the resolved path runs directly.
+    """
+    resolved = shutil.which(gh_cmd)
+    if resolved and resolved.lower().endswith((".bat", ".cmd")):
+        return [os.environ.get("COMSPEC", "cmd.exe"), "/c", resolved, *args]
+    if resolved:
+        return [resolved, *args]
+    return [gh_cmd, *args]
+
+
 def fetch_github_events(repo, since=None, gh_cmd="gh", limit=100, thread=None):
     """Fetch issue + comment events for a repo via `gh api` (one page each,
     newest first). thread=(kind, number) restricts the fetch to a single
@@ -18002,8 +18020,8 @@ def fetch_github_events(repo, since=None, gh_cmd="gh", limit=100, thread=None):
     threads). Returns raw events sorted by updated_at. Raises ValueError
     when gh fails or returns non-JSON."""
     def _api(path):
-        proc = subprocess.run([gh_cmd, "api", path], capture_output=True,
-                              text=True, timeout=120)
+        proc = subprocess.run(_gh_argv(gh_cmd, ["api", path]), capture_output=True,
+                              text=True, encoding="utf-8", timeout=120)
         if proc.returncode != 0:
             raise ValueError(f"gh api {path} failed: {proc.stderr.strip()[:300]}")
         try:
@@ -18343,9 +18361,9 @@ def intake_channel_body(ticket, trigger, dispatch):
 def post_intake_channel(repo, number, body, gh_cmd="gh"):
     """Post one comment to a GitHub issue/PR via gh api. Returns the
     created comment object. Raises ValueError when gh fails."""
-    proc = subprocess.run([gh_cmd, "api", f"repos/{repo}/issues/{number}/comments",
-                           "-f", f"body={body}"],
-                          capture_output=True, text=True, timeout=60)
+    proc = subprocess.run(_gh_argv(gh_cmd, ["api", f"repos/{repo}/issues/{number}/comments",
+                                            "-f", f"body={body}"]),
+                          capture_output=True, text=True, encoding="utf-8", timeout=60)
     if proc.returncode != 0:
         raise ValueError(f"gh post comment failed: {proc.stderr.strip()[:300]}")
     try:

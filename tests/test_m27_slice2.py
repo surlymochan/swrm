@@ -434,7 +434,7 @@ class M27Slice2Tests(unittest.TestCase):
         if env_extra:
             env.update(env_extra)
         return subprocess.run([sys.executable, str(HERE.parent / "bin" / "openswarm"), *argv],
-                              capture_output=True, text=True, env=env)
+                              capture_output=True, text=True, encoding="utf-8", env=env)
 
     def test_cli_assess_prints_verdict_without_state_change(self):
         trigger_file = os.path.join(self.tmp.name, "trigger.json")
@@ -471,11 +471,13 @@ class M27Slice2Tests(unittest.TestCase):
                   f"comments = {json.dumps(comments)}\n"
                   "print(json.dumps(comments if 'issues/comments' in path else issues))\n")
         if os.name == "nt":
-            # Windows cannot execute an extensionless shebang script:
-            # PATHEXT only resolves .COM/.EXE/.BAT/.CMD (etc.), so the
-            # product's plain ["gh", "api", ...] call never finds it.
-            # Ship the fake as gh.py plus a gh.bat shim instead; the
-            # product side is untouched and still calls plain "gh".
+            # Windows cannot execute an extensionless shebang script, and
+            # list-form subprocess (CreateProcess) only resolves .exe, so
+            # a bare ["gh", "api", ...] call never reaches a gh.bat shim
+            # and silently runs the real gh.exe instead (#227). Ship the
+            # fake as gh.py plus a gh.bat shim; the product resolves gh
+            # via shutil.which and routes a .bat/.cmd through COMSPEC /c,
+            # so this test still proves poll really shells out to gh.
             with open(os.path.join(bindir, "gh.py"), "w") as f:
                 f.write(script)
             with open(os.path.join(bindir, "gh.bat"), "w") as f:
@@ -564,7 +566,7 @@ class M27Slice2EchoDispatchTests(unittest.TestCase):
         branch = saved.get("branch")
         self.assertTrue(branch)
         shown = subprocess.run(["git", "show", f"{branch}:echo-output.txt"], cwd=self.cwd,
-                               capture_output=True, text=True, check=True).stdout
+                               capture_output=True, text=True, encoding="utf-8", check=True).stdout
         self.assertIn("add a file echo-output.txt", shown)
         state = xs.load_intake_state(str(self.data))
         self.assertEqual(state["assignments"][0]["status"], "ended")

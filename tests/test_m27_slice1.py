@@ -325,7 +325,7 @@ class M27Slice1Tests(unittest.TestCase):
         env = dict(os.environ, PYTHONCOERCECLOCALE="0", LC_ALL="C", LANG="C")
         env.pop("PYTHONUTF8", None)
         proc = subprocess.run([sys.executable, "-X", "utf8=0", str(script_path), str(self.data)],
-                              capture_output=True, text=True, env=env,
+                              capture_output=True, text=True, encoding="utf-8", env=env,
                               cwd=str(HERE.parent), timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("non-ascii round-trip OK", proc.stdout)
@@ -384,7 +384,7 @@ class M27Slice1Tests(unittest.TestCase):
     def run_cli(self, *argv):
         env = dict(os.environ, OPENSWARM_HOME=str(self.data))
         proc = subprocess.run([sys.executable, str(HERE.parent / "bin" / "openswarm"), *argv],
-                              capture_output=True, text=True, env=env, timeout=60)
+                              capture_output=True, text=True, encoding="utf-8", env=env, timeout=60)
         return proc
 
     def test_cli_policy_init_show_and_replay_check(self):
