@@ -18524,9 +18524,11 @@ def poll_github_source(repo, since=None, limit=100, fetcher=None, data_dir=None,
     """Poll the GitHub Source: fetch -> translate -> drop already-ingested
     Trigger ids (dedup lives in triggers_seen, so a re-poll is safe).
     The read cursor (max updated_at seen) is persisted in intake state, so
-    a restart never replays the window. Ingest is left to the caller so
-    --dry-run can inspect the Triggers first. Returns {repo, triggers,
-    skipped_own, duplicates, cursor}."""
+    a restart never replays the window. A thread-restricted poll (--issue
+    N / --pr N) only saw one thread, so it never moves the repo-wide
+    cursor: advancing it would hide other threads updated before it. Ingest
+    is left to the caller so --dry-run can inspect the Triggers first.
+    Returns {repo, triggers, skipped_own, duplicates, cursor}."""
     state = load_intake_state(data_dir)
     seen = state["triggers_seen"]
     if since is None:
@@ -18552,10 +18554,16 @@ def poll_github_source(repo, since=None, limit=100, fetcher=None, data_dir=None,
             continue
         triggers.append(trigger)
     cursors = state.setdefault("cursors", {})
-    cursors[repo] = {"since": max_updated, "last_poll_ts": time.time()}
-    save_intake_state(state, data_dir)
+    if thread is None:
+        cursors[repo] = {"since": max_updated, "last_poll_ts": time.time()}
+        save_intake_state(state, data_dir)
+        cursor = cursors[repo]
+    else:
+        # Thread-restricted poll: the repo-wide cursor stays exactly as
+        # it was, and the caller sees the unchanged one.
+        cursor = cursors.get(repo) or {"since": since or "", "last_poll_ts": None}
     return {"repo": repo, "triggers": triggers, "skipped_own": skipped,
-            "duplicates": dups, "cursor": cursors[repo]}
+            "duplicates": dups, "cursor": cursor}
 
 
 # -- Assessment ----------------------------------------------------------
