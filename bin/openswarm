@@ -17156,6 +17156,7 @@ INTAKE_POLICY_VERSION = 1
 INTAKE_DECISIONS = ("accept", "stop", "ignore", "unavailable")
 INTAKE_STRENGTHS = ("explicit", "inferred")
 INTAKE_ACCEPT_MODES = ("off", "shadow", "on", "active")
+INTAKE_DISPATCH_MODES = ("run", "batch")
 INTAKE_TICKET_STATES = ("open", "ended")
 INTAKE_ASSIGNMENT_STATES = ("pending", "running", "ended")
 
@@ -17285,6 +17286,15 @@ def validate_intake_policy(policy):
             value = dispatch.get(key)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f"intake policy dispatch.{key} must be a non-empty string or null")
+        # M30 slice 1 (#247): dispatch mode. "run" is the shipped
+        # default (one `openswarm run` per Mandate); "batch" routes an
+        # accepted Mandate through the batch path instead. "fleet"
+        # arrives with slice 2 and is refused until then, so a typo
+        # cannot silently select an unimplemented path.
+        mode = dispatch.get("mode", "run")
+        if mode not in INTAKE_DISPATCH_MODES:
+            raise ValueError(f"intake policy dispatch.mode must be one of "
+                             f"{sorted(INTAKE_DISPATCH_MODES)}, got {mode!r}")
         budget = dispatch.get("budget_minutes")
         if budget is not None and (not isinstance(budget, (int, float))
                                    or isinstance(budget, bool) or budget <= 0):
@@ -18031,7 +18041,7 @@ def intake_try_resume(trigger, gate, policy, state, data_dir=None, now=None):
 def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
                           assess=True, model_command=None, assess_timeout=120,
                           dispatch_runner=None, channel_poster=None,
-                          dispatch_cwd=None):
+                          dispatch_cwd=None, batch_runner=None):
     """Ingest one Trigger end to end: dedup -> Gate -> Subscription
     resume (slice 3: a human follow-up on an ended Ticket's thread
     resumes it under its Mandate, no new Eval) -> Assessment -> Decision
@@ -18052,9 +18062,12 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
 
     Real dispatch happens only when all of these hold: final decision is
     accept, policy accept_mode is "on" or "active", the Trigger is not
-    draft_only, and a dispatch_runner was passed (intake poll passes the
-    real one; plain ingest stays shadow and dispatches nothing). In
-    active mode (M28 slice 1, #232) three further gates apply before any
+    draft_only, and a dispatch runner was passed (intake poll passes the
+    real one; plain ingest stays shadow and dispatches nothing). With
+    policy.dispatch.mode "batch" (M30 slice 1, #247) the dispatch goes
+    through intake_dispatch_batch instead of intake_dispatch: the
+    Mandate becomes batch cards, dispatched in M4 topo order through
+    execute_batch. In active mode (M28 slice 1, #232) three further gates apply before any
     Assignment exists: the Trigger must be inside the allowlisted scope
     (active_scope repos + authorized accounts; outside stays shadow with
     a ledger trace) and inside the per-thread caps, and the M24/M25
@@ -18063,7 +18076,9 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
     thread when a channel_poster was passed; a Channel failure is
     recorded, never raised. State is saved at each mutation point (not
     once at the end) so a dispatch that saves state mid-flight cannot
-    have its Assignment clobbered by a stale in-memory copy."""
+    have its Assignment clobbered by a stale in-memory copy. Batch
+    dispatches do not post to the Channel yet (slice 2): the batch
+    summary is the record, and the result notes that instead."""
     trigger = normalize_trigger(raw_trigger)
     if policy is None:
         policy, _source = load_intake_policy(data_dir=data_dir)
@@ -18195,9 +18210,16 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
                 result["dispatch_note"] = (f"active mode: outside allowlisted scope "
                                            f"({scope_reason}); Ticket only, no dispatch (shadow)")
                 return result
+        # M30 slice 1 (#247): the dispatch runner depends on the mode
+        # -- "run" takes dispatch_runner, "batch" takes batch_runner.
+        # A missing runner for the configured mode means Ticket only,
+        # exactly like a missing single-run runner today.
+        dispatch_cfg = intake_dispatch_config(policy)
+        mode = dispatch_cfg["mode"]
+        runner = dispatch_runner if mode == "run" else batch_runner
         dispatchable = (decision["accept_mode"] in ("on", "active")
                         and not decision["draft_only"]
-                        and dispatch_runner is not None)
+                        and runner is not None)
         if not dispatchable:
             if decision["accept_mode"] not in ("on", "active"):
                 result["dispatch_note"] = (f"accept_mode is {decision['accept_mode']}: "
@@ -18209,7 +18231,7 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
             return result
         # M28 slice 1 (#232): per-thread caps -- a thread that already
         # used its dispatch count or budget gets no new run.
-        dispatch_cfg = intake_dispatch_config(policy)
+        # (dispatch_cfg was computed above for the mode check.)
         caps_ok, caps_reason, caps_usage = intake_caps_check(
             trigger["thread"], state, policy, dispatch_cfg["budget_minutes"])
         if not caps_ok:
@@ -18239,16 +18261,33 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
         if gate_record is not None:
             result["health_gate"] = gate_record
         try:
-            dispatch = intake_dispatch(ticket, trigger, decision, policy=policy,
-                                       data_dir=data_dir, dispatch_runner=dispatch_runner,
-                                       cwd=dispatch_cwd)
-            result["dispatched"] = True
-            result["dispatch"] = dispatch
+            if mode == "batch":
+                dispatch = intake_dispatch_batch(ticket, trigger, decision, policy=policy,
+                                                 data_dir=data_dir, batch_runner=batch_runner,
+                                                 cwd=dispatch_cwd)
+                result["dispatched"] = True
+                result["dispatch"] = dispatch
+                result["dispatch_mode"] = "batch"
+            else:
+                dispatch = intake_dispatch(ticket, trigger, decision, policy=policy,
+                                           data_dir=data_dir, dispatch_runner=dispatch_runner,
+                                           cwd=dispatch_cwd)
+                result["dispatched"] = True
+                result["dispatch"] = dispatch
+                result["dispatch_mode"] = "run"
         except ValueError as error:
-            # intake_dispatch already ended the Assignment and wrote the
-            # dispatch_failed ledger entry; record the outcome here only.
+            # intake_dispatch / intake_dispatch_batch already ended the
+            # Assignment and wrote the dispatch_failed ledger entry;
+            # record the outcome here only.
             result["dispatch_error"] = str(error)[:500]
             result["dispatch_note"] = f"dispatch failed: {error}"
+            return result
+        if mode == "batch":
+            # M30 slice 1 (#247): no Channel post for a batch dispatch
+            # yet -- the batch summary is the record (slice 2 adds the
+            # completion post). The note keeps the poll line honest.
+            result["channel_note"] = ("batch dispatch: no channel post in slice 1; "
+                                      "see batch summary for card outcomes")
             return result
         if channel_poster is not None:
             try:
@@ -18377,7 +18416,7 @@ def cmd_intake_policy(args, data_dir=None):
             print(f"  admission {key} -> {value}")
         print(f"  money_draft_only={policy.get('money_draft_only', True)}")
         dispatch = intake_dispatch_config(policy)
-        print(f"  dispatch backend={dispatch['backend'] or 'routed (no --backend)'} "
+        print(f"  dispatch mode={dispatch['mode']} backend={dispatch['backend'] or 'routed (no --backend)'} "
               f"budget_minutes={dispatch['budget_minutes']} "
               f"backends_file={dispatch['backends_file'] or '-'} verify={dispatch['verify'] or '-'}")
         assess_cfg = intake_assessment_config(policy)
@@ -18563,7 +18602,10 @@ def intake_dispatch_config(policy):
     return {"backend": cfg.get("backend"),
             "backends_file": cfg.get("backends_file"),
             "verify": cfg.get("verify"),
-            "budget_minutes": budget}
+            "budget_minutes": budget,
+            # M30 slice 1 (#247): "run" (default) or "batch". A missing
+            # key means "run": shipped behaviour is unchanged.
+            "mode": cfg.get("mode", "run")}
 
 
 def intake_assessment_config(policy):
@@ -19022,6 +19064,283 @@ def intake_dispatch(ticket, trigger, decision, policy=None, data_dir=None,
             "status": outcome.get("status"), "result": outcome.get("result")}
 
 
+# ---------------------------------------------------------------- intake M30 slice 1 (#247): batch path
+#
+# An accepted Mandate can be dispatched as a batch instead of a single
+# run when policy.dispatch.mode is "batch" (explicit opt-in; shipped
+# default stays "run"). Card generation is deterministic and
+# inspectable: an unchecked checklist in the Trigger body becomes one
+# card per item, chained in order (each card depends_on the previous
+# one, so M4 topo order / stacked branches / failure blocking apply
+# unchanged); a body without a checklist becomes a single card carrying
+# the same task text the single-run path hands the executor. The batch
+# itself runs through execute_batch (the same code path as `openswarm
+# batch`), so per-card weighted/quota routing (M7/M18) and the M25
+# health gate apply card by card; a blocked card never starts an exec
+# attempt and its M4 dependents block like any other non-done
+# dependency. Idempotency mirrors intake_dispatch: one Ticket dispatches
+# to batch at most once.
+
+INTAKE_BATCH_MAX_CARDS = 10
+INTAKE_CHECKLIST_RE = re.compile(r"^[ \t]*- \[ \] (.+?)[ \t]*$", re.MULTILINE)
+
+
+def _intake_card_slug(text):
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:32] or "task"
+
+
+def intake_batch_cards(ticket, trigger):
+    """Split one accepted Mandate's task text into batch cards.
+
+    Returns [{"name", "text", "depends_on"}] in dispatch order. An
+    unchecked `- [ ]` checklist in the Trigger body becomes one card
+    per item, each depending on the previous item (sequential chain);
+    checked `- [x]` items are already done and skipped. A body with no
+    checklist becomes a single card with the full task text. Card names
+    are 01/02/...-prefixed so the filenames sort in topo order. Raises
+    ValueError for an empty body or more than INTAKE_BATCH_MAX_CARDS
+    items -- the operator splits the Mandate instead of the code
+    silently truncating work."""
+    body = (trigger or {}).get("body") or ""
+    if not body.strip():
+        raise ValueError(f"intake batch for ticket {ticket['id']}: empty task body; "
+                         "no cards to generate")
+    items = [m.group(1).strip() for m in INTAKE_CHECKLIST_RE.finditer(body)]
+    items = [item for item in items if item]
+    if len(items) > INTAKE_BATCH_MAX_CARDS:
+        raise ValueError(f"intake batch for ticket {ticket['id']}: {len(items)} checklist "
+                         f"items exceed the {INTAKE_BATCH_MAX_CARDS}-card cap; "
+                         "split the Mandate instead of dispatching a partial batch")
+    task_text = intake_dispatch_task_text(ticket, trigger)
+    cards = []
+    if not items:
+        return [{"name": "01-task.md", "text": task_text, "depends_on": []}]
+    used = set()
+    for i, item in enumerate(items):
+        slug = _intake_card_slug(item)
+        name = f"{i + 1:02d}-{slug}.md"
+        n = 2
+        while name in used:
+            name = f"{i + 1:02d}-{slug}-{n}.md"
+            n += 1
+        used.add(name)
+        deps = [cards[-1]["name"]] if cards else []
+        text = (f"<!-- intake ticket {ticket['id']} · card {i + 1} of {len(items)} "
+                f"· mandate {ticket.get('mandate_id')} -->\n")
+        if deps:
+            text += f"depends_on: {deps[0]}\n"
+        text += f"\n{task_text}Task step {i + 1}/{len(items)}:\n{item}\n"
+        cards.append({"name": name, "text": text, "depends_on": deps})
+    return cards
+
+
+def intake_write_batch_cards(ticket, trigger, cards_dir):
+    """Write the cards for one Mandate under cards_dir. Refuses to
+    overwrite a non-empty cards directory: a re-delivered Trigger must
+    never silently rebuild cards under an already-dispatched batch.
+    Returns the card list from intake_batch_cards."""
+    cards = intake_batch_cards(ticket, trigger)
+    if os.path.exists(cards_dir) and os.listdir(cards_dir):
+        raise ValueError(f"intake batch cards directory {cards_dir} already exists; "
+                         "refusing to overwrite dispatched cards")
+    os.makedirs(cards_dir, exist_ok=True)
+    for card in cards:
+        with open(os.path.join(cards_dir, card["name"]), "w", encoding="utf-8") as f:
+            f.write(card["text"])
+    return cards
+
+
+def intake_batch_card_outcomes(summary):
+    """Per-card outcome rows from a batch summary (or [] when the runner
+    returned no summary). Pure: the intake ledger mirrors these rows
+    verbatim, so a blocked card's record is checkable without opening
+    the batch summary. A blocked card carries its blocked reason and
+    (when the M25 gate blocked it) the health_gate record; run_id stays
+    None for a card that was never dispatched."""
+    if not isinstance(summary, dict):
+        return []
+    outcomes = []
+    for row in summary.get("cards") or []:
+        outcomes.append({
+            "card": row.get("card"),
+            "status": row.get("status"),
+            "blocked": row.get("status") == "blocked",
+            "health_gate": row.get("health_gate"),
+            "reason": (row.get("blocked_reason") or row.get("summary") or ""),
+            "run_id": row.get("run_id"),
+        })
+    return outcomes
+
+
+def intake_dispatch_batch(ticket, trigger, decision, policy=None, data_dir=None,
+                          batch_runner=None, cwd=None):
+    """Create an Assignment for an accepted Ticket and dispatch it as a
+    batch. Mirrors intake_dispatch: one Ticket dispatches at most once
+    (a second call raises before creating anything); the Assignment
+    moves pending -> running -> ended and a runner failure still ends
+    it with the reason. Cards are generated from the Mandate and written
+    under <OPENSWARM_HOME>/intake-batches/<ticket_id>/cards/ before the
+    runner starts, so the card set is on disk even if the runner fails.
+    Returns {assignment, batch_id, status, summary} on success; raises
+    ValueError on runner failure (the caller records it as
+    batch_dispatch_failed). batch_runner replaces the default runner
+    (tests inject a fake); it receives (ticket, trigger, decision,
+    policy, data_dir, cards_dir, cwd) and returns {batch_id, status,
+    summary?}."""
+    policy = policy or default_intake_policy()
+    cfg = intake_dispatch_config(policy)
+    if cfg["mode"] != "batch":
+        raise ValueError(f"intake batch dispatch requires dispatch.mode=batch, "
+                         f"got {cfg['mode']!r}")
+    executor = "batch"
+    state = load_intake_state(data_dir)
+    if any(a.get("ticket_id") == ticket["id"] for a in state.get("assignments") or []):
+        raise ValueError(f"ticket {ticket['id']} already has an assignment; "
+                         "refusing a second dispatch")
+    base_dir = os.path.dirname(intake_paths(data_dir)["state"])
+    cards_dir = os.path.join(base_dir, "intake-batches", safe_id(ticket["id"]), "cards")
+    assignment = new_intake_assignment(ticket, executor,
+                                       budget_minutes=cfg["budget_minutes"])
+    state["assignments"].append(assignment)
+    save_intake_state(state, data_dir)
+    append_intake_ledger({"kind": "assignment_created", "trigger_id": trigger["id"],
+                          "ticket_id": ticket["id"], "assignment_id": assignment["id"],
+                          "executor": executor,
+                          "budget_minutes": cfg["budget_minutes"]}, data_dir)
+    running = transition_intake_assignment(assignment, "running",
+                                           reason="dispatching as batch")
+    state["assignments"] = [running if a["id"] == assignment["id"] else a
+                            for a in state["assignments"]]
+    save_intake_state(state, data_dir)
+
+    def _fail(error):
+        state = load_intake_state(data_dir)
+        failed = transition_intake_assignment(
+            next(a for a in state["assignments"] if a["id"] == assignment["id"]),
+            "ended", reason=f"batch dispatch failed: {error}")
+        state["assignments"] = [failed if a["id"] == assignment["id"] else a
+                                for a in state["assignments"]]
+        save_intake_state(state, data_dir)
+        append_intake_ledger({"kind": "batch_dispatch_failed", "trigger_id": trigger["id"],
+                              "ticket_id": ticket["id"], "assignment_id": assignment["id"],
+                              "error": str(error)[:500]}, data_dir)
+
+    try:
+        cards = intake_write_batch_cards(ticket, trigger, cards_dir)
+        plan = batch_plan(cards_dir)
+    except ValueError as error:
+        _fail(error)
+        raise
+    append_intake_ledger({"kind": "intake_batch_created", "trigger_id": trigger["id"],
+                          "ticket_id": ticket["id"], "assignment_id": assignment["id"],
+                          "cards": [c["name"] for c in cards],
+                          "order": plan["order"], "cards_dir": cards_dir}, data_dir)
+    append_intake_ledger({"kind": "batch_dispatch_started", "trigger_id": trigger["id"],
+                          "ticket_id": ticket["id"], "assignment_id": assignment["id"],
+                          "executor": executor,
+                          "budget_minutes": cfg["budget_minutes"],
+                          "cards": [c["name"] for c in cards]}, data_dir)
+    runner = batch_runner or run_openswarm_batch
+    try:
+        outcome = runner(ticket, trigger, decision, policy, data_dir, cards_dir, cwd)
+        if not isinstance(outcome, dict) or not outcome.get("batch_id"):
+            raise ValueError(f"batch runner returned no batch_id: {str(outcome)[:200]}")
+    except ValueError as error:
+        _fail(error)
+        raise
+    ended = transition_intake_assignment(running, "ended",
+                                         reason=f"batch {outcome['batch_id']}: {outcome.get('status')}")
+    state = load_intake_state(data_dir)
+    state["assignments"] = [ended if a["id"] == assignment["id"] else a
+                            for a in state["assignments"]]
+    save_intake_state(state, data_dir)
+    append_intake_ledger({"kind": "batch_dispatch_finished", "trigger_id": trigger["id"],
+                          "ticket_id": ticket["id"], "assignment_id": assignment["id"],
+                          "batch_id": outcome["batch_id"], "status": outcome.get("status")},
+                         data_dir)
+    summary = outcome.get("summary")
+    for row in intake_batch_card_outcomes(summary):
+        append_intake_ledger({"kind": "intake_batch_card_result", "trigger_id": trigger["id"],
+                              "ticket_id": ticket["id"], "batch_id": outcome["batch_id"],
+                              **row}, data_dir)
+    return {"assignment": ended, "batch_id": outcome["batch_id"],
+            "status": outcome.get("status"), "summary": summary}
+
+
+def run_openswarm_batch(ticket, trigger, decision, policy, data_dir, cards_dir, cwd):
+    """Default batch runner: build the batch in-process (the same spec
+    and summary construction `openswarm batch` uses) on the local host
+    and run execute_batch, so per-card weighted/quota routing (M7/M18)
+    and the M25 health gate apply exactly as they do for a CLI batch.
+    The repo checkout is the poll --cwd when given, else the local
+    host's mapping for the thread repo (which falls back to the process
+    working directory). Raises ValueError when no checkout or base
+    commit can be resolved, so the caller records a dispatch failure
+    instead of dispatching into the void. An explicitly configured
+    dispatch backend is passed through as the batch backend -- and is
+    gated per card by the M25 health gate exactly like a routed pick,
+    never exempt."""
+    cfg = intake_dispatch_config(policy)
+    repo = trigger["thread"]["repo"]
+    repo_path = (os.path.realpath(cwd) if cwd else None)
+    if repo_path is None:
+        hosts = fleet_config()
+        local = fleet_host("local", hosts)
+        if local["kind"] != "local":
+            raise ValueError("fleet host 'local' must have kind local")
+        repo_path = os.path.realpath(os.path.expanduser(host_repo(local, repo, local=True)))
+    proc = subprocess.run(["git", "rev-parse", "--verify", "HEAD^{commit}"],
+                          capture_output=True, text=True, cwd=repo_path, timeout=60)
+    if proc.returncode != 0:
+        raise ValueError(f"intake batch: cannot resolve base commit in {repo_path}: "
+                         f"{proc.stderr.strip()[:200]}")
+    base = proc.stdout.strip()
+    swrm_policy = load_policy()
+    hosts = fleet_config()
+    local = fleet_host("local", hosts)
+    if local["kind"] != "local":
+        raise ValueError("fleet host 'local' must have kind local")
+    plan = batch_plan(cards_dir)
+    minutes = cfg["budget_minutes"]
+    backend = cfg["backend"]
+    try:
+        check_budget(swrm_policy, [(backend, minutes)] * len(plan["cards"]))
+    except BudgetExceeded as error:
+        raise ValueError(f"intake batch budget check failed: {error.detail}") from error
+    bid = new_run_id()
+    spec = {"id": bid, "repo": repo, "repo_path": repo_path, "base": base, "local": local,
+            "hosts": {"local": local},
+            "repos": {"local": repo_path},
+            "per_host": 1, "backend": backend,
+            "provider": execution_provider(backend, None, swrm_policy),
+            "backend_explicit": bool(backend),
+            "backends_file": cfg["backends_file"],
+            "concurrency": (swrm_policy.get("concurrency")
+                            if isinstance(swrm_policy.get("concurrency"), dict) else {}),
+            "model": None, "effort": None, "card_type": None, "rework_of": None,
+            "paths": [], "verify": cfg["verify"],
+            "verify_evalid": False, "evalid_bin": None, "scope": "repo",
+            "health_gate": False, "no_health_gate": False, "skip_health_gate": False,
+            "budget_minutes": minutes, "poll_seconds": 2}
+    summary = {"id": bid, "repo": repo, "base": base, "scope": "repo",
+               "state": "queued", "started": NOW(), "plan": plan["cards"], "cards": [
+                   {"card": entry["card"],
+                    "path": os.path.join(os.path.abspath(cards_dir), entry["card"]),
+                    "host": "local", "state": "queued", "status": "queued",
+                    "depends_on": entry["depends_on"], "order": entry["order"],
+                    "verify_evalid": False, "verify_evalid_verdict": None,
+                    "verify_rc": None, "branch": None, "commit": None, "seconds": None,
+                    "summary": ""}
+                   for entry in plan["cards"]]}
+    directory = os.path.join(DATA, "batches", bid)
+    jsave(os.path.join(directory, "spec.json"), spec)
+    batch_save(summary)
+    rc = execute_batch(spec, summary)
+    return {"batch_id": bid, "status": summary.get("state"),
+            "summary": summary, "exit_code": rc}
+
+
 # -- Channel -------------------------------------------------------------
 
 def intake_channel_body(ticket, trigger, dispatch):
@@ -19129,7 +19448,8 @@ def cmd_intake_poll(args, data_dir=None):
                 model_command=command, assess_timeout=cfg["timeout_seconds"],
                 dispatch_runner=None if args.no_dispatch else run_openswarm_run,
                 channel_poster=None if args.no_channel else post_intake_channel,
-                dispatch_cwd=args.cwd)
+                dispatch_cwd=args.cwd,
+                batch_runner=None if args.no_dispatch else run_openswarm_batch)
             results.append(result)
     out = {"ok": True, "repo": args.repo,
            "triggers_found": len(polled["triggers"]),
@@ -19147,7 +19467,8 @@ def cmd_intake_poll(args, data_dir=None):
         line = (f"{result['trigger_id']}  {decision.get('decision') or 'duplicate':<11} "
                 f"ticket={result.get('ticket_id') or '-'} "
                 f"dispatched={result.get('dispatched')} "
-                f"run={((result.get('dispatch') or {}).get('run_id')) or '-'}")
+                f"run={((result.get('dispatch') or {}).get('run_id')) or '-'} "
+                f"batch={((result.get('dispatch') or {}).get('batch_id')) or '-'}")
         # M28 slice 2 (#235): why a Trigger did not dispatch -- the
         # active-scope shadow reason, a cap block, a health-gate block
         # or the Ticket-only reason -- belongs on the same line, so an
@@ -19531,6 +19852,94 @@ def intake_m29_slice2_evidence_check(entries, state=None, policy=None, prs=None)
         check("caps_respected", not over,
               f"per-thread usage {per_thread} within caps {caps}" if not over
               else f"cap exceeded on {over}")
+    failures = sorted(name for name, c in checks.items() if not c["ok"])
+    return {"ok": not failures, "checks": checks, "failures": failures}
+
+
+# ---------------------------------------------------------------- intake M30 slice 1 (#247): batch evidence check
+#
+# Validates one batch-dispatch record against epic #246 acceptance
+# ①/④ (batch half): every batch dispatch has one Assignment, cards
+# generated in topo order, a batch_dispatch_finished (or _failed) for
+# every batch_dispatch_started, a per-card result for every generated
+# card, and no exec attempt behind a blocked card. `entries` is the
+# intake ledger in append order; `state` (optional) is the intake
+# state; `policy` (optional) is the intake policy. Returns {"ok",
+# "checks", "failures"}, mirroring the M28/M29 checkers. Real-run
+# evidence (≥2 batch runs with ≥1 blocked + ≥1 allowed) is slice 2's
+# job; this checker is the mechanism's record validator.
+
+def intake_m30_slice1_evidence_check(entries, state=None, policy=None):
+    entries = list(entries or [])
+    checks = {}
+
+    def check(name, ok, detail):
+        checks[name] = {"ok": bool(ok), "detail": detail}
+        return bool(ok)
+
+    assigned = {}
+    for e in entries:
+        if e.get("kind") == "assignment_created" and e.get("ticket_id"):
+            assigned.setdefault(e["ticket_id"], []).append(e)
+    doubled = sorted(t for t, xs in assigned.items() if len(xs) > 1)
+    check("one_assignment_per_ticket", not doubled,
+          "at most one assignment_created per ticket (idempotent dispatch)"
+          if not doubled
+          else f"second assignment_created for ticket(s) {doubled}")
+    created = {}
+    for e in entries:
+        if e.get("kind") == "intake_batch_created" and e.get("ticket_id"):
+            created.setdefault(e["ticket_id"], []).append(e)
+    check("batch_cards_created",
+          bool(created) and all(e.get("cards") for xs in created.values() for e in xs),
+          f"{len(created)} ticket(s) with intake_batch_created entries "
+          f"({sorted(created)})" if created
+          else "no intake_batch_created entry")
+    topo_ok = True
+    topo_detail = ""
+    for ticket, xs in created.items():
+        for e in xs:
+            cards = e.get("cards") or []
+            order = e.get("order") or []
+            if sorted(order) != sorted(cards) or len(order) != len(cards):
+                topo_ok = False
+                topo_detail = (f"ticket {ticket}: order {order} does not cover "
+                               f"cards {cards}")
+    check("batch_cards_topo_order", topo_ok,
+          "every intake_batch_created order covers exactly its cards"
+          if topo_ok else topo_detail)
+    started = {e.get("ticket_id") for e in entries
+               if e.get("kind") == "batch_dispatch_started"}
+    finished = {e.get("ticket_id") for e in entries
+                if e.get("kind") == "batch_dispatch_finished" and e.get("batch_id")}
+    failed = {e.get("ticket_id") for e in entries
+              if e.get("kind") == "batch_dispatch_failed"}
+    unfinished = sorted((started - finished) - failed)
+    check("batch_started_without_finish", not unfinished,
+          "every batch_dispatch_started has a batch_dispatch_finished or "
+          "batch_dispatch_failed"
+          if not unfinished
+          else f"batch_dispatch_started with no finish/failure for ticket(s) {unfinished}")
+    results = {}
+    for e in entries:
+        if e.get("kind") == "intake_batch_card_result" and e.get("ticket_id"):
+            results.setdefault(e["ticket_id"], []).append(e)
+    missing_cards = []
+    for ticket, xs in created.items():
+        expected = {c for e in xs for c in (e.get("cards") or [])}
+        got = {r.get("card") for r in results.get(ticket, [])}
+        if expected - got:
+            missing_cards.append(f"{ticket}: {sorted(expected - got)}")
+    check("card_result_per_card", not missing_cards,
+          "every generated card has an intake_batch_card_result"
+          if not missing_cards
+          else f"cards without a result: {missing_cards}")
+    blocked_with_run = sorted({r.get("card") for rs in results.values() for r in rs
+                               if r.get("blocked") and r.get("run_id")})
+    check("blocked_card_no_exec", not blocked_with_run,
+          "no blocked card carries a run_id (blocked before any exec attempt)"
+          if not blocked_with_run
+          else f"blocked card(s) with a run_id (exec attempt after block): {blocked_with_run}")
     failures = sorted(name for name, c in checks.items() if not c["ok"])
     return {"ok": not failures, "checks": checks, "failures": failures}
 
