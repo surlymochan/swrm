@@ -128,7 +128,7 @@ for the shipped default, which already allowlists evalid per-repo):
 }
 ```
 
-## Not covered here (slice 2)
+## Not covered here — Slice 2 (#244)
 
 Real evalid issues dispatched end to end (intake -> Mandate ->
 real run -> PR opened + Channel reply, ledger-verified), the
