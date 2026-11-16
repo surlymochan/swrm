@@ -17218,12 +17218,24 @@ def default_intake_policy():
     gives an inferred candidate (Assessment in slice 2 refines it); an
     unlisted author who does not mention the bot is ignored. Bots never get
     an explicit mandate.
+
+    Per-repo overrides (M29 slice 1, #242): `repo_policies` maps one repo
+    (owner/name) to its own allowlist and policy version. A repo with no
+    entry uses the global allowlist and version, so the swrm behaviour
+    below is unchanged; `surlymochan/evalid` is allowlisted per-repo so
+    the second own repo can go active under its own policy version.
     """
     return {
         "version": 1,
         "accept_mode": "shadow",
         "scopes": ["issue", "pr"],
         "allowlist": {"users": ["surlymochan"], "bots": []},
+        "repo_policies": {
+            "surlymochan/evalid": {
+                "version": 1,
+                "allowlist": {"users": ["surlymochan"], "bots": []},
+            },
+        },
         "admission": {
             "listed_mentioned": "explicit",
             "listed_unmentioned": "inferred",
@@ -17308,6 +17320,40 @@ def validate_intake_policy(policy):
         if users is not None:
             if not isinstance(users, list) or not all(isinstance(u, str) and u for u in users):
                 raise ValueError("intake policy active_scope.users must be a list of non-empty strings")
+    # M29 slice 1 (#242): per-repo overrides. Keys are owner/name
+    # (case-insensitive); each entry may carry its own policy version
+    # and its own allowlist (users/bots). Unknown keys are refused so a
+    # typo cannot silently widen admission.
+    repo_policies = policy.get("repo_policies")
+    if repo_policies is not None:
+        if not isinstance(repo_policies, dict):
+            raise ValueError("intake policy repo_policies must be an object keyed by owner/name")
+        for repo, entry in repo_policies.items():
+            if not isinstance(repo, str):
+                raise ValueError(f"intake policy repo_policies key must be owner/name, got {repo!r}")
+            parts = repo.split("/")
+            if len(parts) != 2 or not all(p.strip() for p in parts):
+                raise ValueError(f"intake policy repo_policies key must be owner/name, got {repo!r}")
+            if not isinstance(entry, dict):
+                raise ValueError(f"intake policy repo_policies[{repo!r}] must be an object")
+            for key in entry:
+                if key not in ("version", "allowlist"):
+                    raise ValueError(f"intake policy repo_policies[{repo!r}] has unknown key {key!r}")
+            version = entry.get("version")
+            if version is not None and (not isinstance(version, int)
+                                        or isinstance(version, bool) or version < 1):
+                raise ValueError(f"intake policy repo_policies[{repo!r}].version "
+                                 f"must be a positive integer, got {version!r}")
+            allowlist = entry.get("allowlist")
+            if allowlist is not None:
+                if not isinstance(allowlist, dict):
+                    raise ValueError(f"intake policy repo_policies[{repo!r}].allowlist "
+                                     "must be an object with users/bots lists")
+                for key in ("users", "bots"):
+                    users = allowlist.get(key)
+                    if not isinstance(users, list) or not all(isinstance(u, str) and u for u in users):
+                        raise ValueError(f"intake policy repo_policies[{repo!r}].allowlist.{key} "
+                                         "must be a list of non-empty strings")
     caps = policy.get("caps")
     if caps is not None:
         if not isinstance(caps, dict):
@@ -17336,6 +17382,33 @@ def load_intake_policy(path=None, data_dir=None):
             raise ValueError(f"cannot read intake policy {target}: {error}")
         return validate_intake_policy(policy), "file"
     return default_intake_policy(), "default"
+
+
+def intake_policy_for_repo(policy, repo):
+    """Effective intake policy for one repo (M29 slice 1, #242).
+
+    A `repo_policies` entry for the repo (matched case-insensitively)
+    overrides the global policy version and allowlist for that repo
+    only; every other block (admission, active_scope, caps, dispatch,
+    assessment) stays global. A repo with no entry gets the policy
+    unchanged (same object), so the swrm behaviour is byte-identical
+    to the pre-M29 policy. The returned policy is a fresh copy: the
+    caller's policy is never mutated."""
+    validate_intake_policy(policy)
+    entries = (policy or {}).get("repo_policies") or {}
+    entry = None
+    for key, value in entries.items():
+        if key.lower() == (repo or "").lower():
+            entry = value
+            break
+    if entry is None:
+        return policy
+    effective = copy.deepcopy(policy)
+    if entry.get("version") is not None:
+        effective["version"] = entry["version"]
+    if entry.get("allowlist") is not None:
+        effective["allowlist"] = copy.deepcopy(entry["allowlist"])
+    return effective
 
 
 def normalize_trigger(raw):
@@ -17378,6 +17451,103 @@ def normalize_trigger(raw):
 
 def intake_thread_key(thread):
     return f"{thread['repo']}#{thread['number']} ({thread['kind']})"
+
+
+# ---------------------------------------------------------------- cross-repo dedup (M29 slice 1, #242)
+#
+# One source Trigger must create at most one Mandate, even when the
+# same instruction reaches two repos (e.g. the same issue text filed
+# in surlymochan/swrm and in surlymochan/evalid, or a second issue
+# that just points at the first one). Identity is content, not
+# delivery: the dedup keys of a Trigger are its (author, normalized
+# body) hash and the repo#number references its body cites; when a
+# Ticket is created its own thread is additionally registered as a
+# repo#number reference, so a later Trigger citing that issue resolves
+# to the same Mandate. The scope is cross-repo only: within one repo
+# two distinct threads with identical text are distinct work items,
+# and same-repo re-delivery is already covered by the Trigger-id
+# dedup. The bot mention is stripped before normalizing, so "@openswarm fix X" and
+# "fix X" from the same author are the same source; different authors
+# are different sources even with identical text. Keys are recorded in
+# intake state (`content_seen`) when a Ticket is created and consulted
+# on every later Gate accept before any new Ticket exists. A key whose
+# Mandate was withdrawn (human stop) no longer dedups: the stop retired
+# that Mandate, so a later task opens a new Ticket, as slice 3 defines.
+
+INTAKE_REF_RE = re.compile(r"\b([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)#(\d+)\b")
+
+
+def intake_normalized_body(body):
+    """Body minus the bot mention, whitespace-collapsed, case-folded."""
+    text = re.sub(r"(?i)@openswarm\b", "", body or "")
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def intake_content_key(trigger):
+    """Content key of a Trigger, or None when the body carries no
+    actionable text (then only the Trigger-id dedup applies)."""
+    body = intake_normalized_body(trigger.get("body") or "")
+    if not body:
+        return None
+    author = (trigger.get("author") or "").lower()
+    return "text:" + hashlib.sha1(f"{author}\n{body}".encode()).hexdigest()[:16]
+
+
+def intake_dedup_keys(trigger):
+    """Dedup keys a Trigger claims on lookup: its content key and the
+    repo#number references cited in its body. The Trigger's own thread
+    is deliberately NOT a lookup key: a follow-up comment on a live
+    thread (different body, no citation) must keep the slice-3
+    behaviour of going through the normal path, not be swallowed as a
+    duplicate of its own thread's Ticket."""
+    keys = []
+    content = intake_content_key(trigger)
+    if content is not None:
+        keys.append(content)
+    for ref_repo, ref_num in INTAKE_REF_RE.findall(trigger.get("body") or ""):
+        keys.append(f"ref:{ref_repo.lower()}#{ref_num}")
+    return sorted(set(keys))
+
+
+def intake_register_keys(trigger):
+    """Dedup keys recorded when a Ticket is created: the lookup keys
+    plus the Ticket's own thread as a repo#number reference, so a later
+    Trigger in another repo that cites this issue by reference resolves
+    to the same Mandate."""
+    keys = intake_dedup_keys(trigger)
+    thread = trigger.get("thread") or {}
+    repo = thread.get("repo")
+    number = thread.get("number")
+    if isinstance(repo, str) and repo.strip() and isinstance(number, int):
+        keys = sorted(set(keys) | {f"ref:{repo.strip().lower()}#{number}"})
+    return keys
+
+
+def intake_find_duplicate_ticket(trigger, state):
+    """Cross-repo dedup lookup: the (ticket_id, dedup_key) of an
+    existing Ticket that already covers this Trigger's source, or None.
+    Only a Ticket whose Mandate is still active dedups; a withdrawn
+    Mandate means the stop retired that work, so a later task is new.
+    Only Tickets in a *different* repo dedup: within one repo two
+    distinct threads with identical text are distinct work items
+    (M27 slice 3 opens two such Tickets), and the same-repo
+    re-delivery case is already covered by the Trigger-id dedup."""
+    seen = (state or {}).get("content_seen") or {}
+    tickets = {t["id"]: t for t in (state or {}).get("tickets") or []}
+    mandates = {m["ticket_id"]: m for m in (state or {}).get("mandates") or []}
+    repo = ((trigger.get("thread") or {}).get("repo") or "").lower()
+    for key in intake_dedup_keys(trigger):
+        ticket_id = seen.get(key)
+        if ticket_id is None or ticket_id not in tickets:
+            continue
+        ticket = tickets[ticket_id]
+        if ((ticket.get("thread") or {}).get("repo") or "").lower() == repo:
+            continue
+        mandate = mandates.get(ticket_id)
+        if mandate is not None and intake_mandate_status(mandate) != "active":
+            continue
+        return ticket_id, key
+    return None
 
 
 def intake_gate_decide(trigger, policy):
@@ -17607,10 +17777,12 @@ def load_intake_state(data_dir=None):
     state = jload(paths["state"], None)
     if state is None:
         return {"version": 1, "triggers_seen": {}, "tickets": [],
-                "mandates": [], "assignments": [], "cursors": {}}
+                "mandates": [], "assignments": [], "cursors": {},
+                "content_seen": {}}
     if not isinstance(state, dict):
         raise ValueError(f"intake state {paths['state']} is not a JSON object")
     state.setdefault("triggers_seen", {})
+    state.setdefault("content_seen", {})
     state.setdefault("tickets", [])
     state.setdefault("mandates", [])
     state.setdefault("assignments", [])
@@ -17866,7 +18038,12 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
     ledger -> Ticket + sealed Mandate on accept, or end the thread's open
     Ticket and withdraw its Mandate on a human stop. Idempotent: a repeated
     delivery of the same Trigger id returns the original Ticket and writes
-    only a duplicate_skipped ledger line.
+    only a duplicate_skipped ledger line; a Trigger carrying the same
+    source (same author + same text, or a citation of the same issue)
+    in another repo likewise resolves to the first Ticket (M29 slice 1
+    cross-repo dedup) and writes only a cross_repo_duplicate_skipped
+    line. The policy in force is the per-repo effective policy
+    (repo_policies override, M29 slice 1).
 
     Assessment runs on every Gate accept (assess=False keeps the slice 1
     Gate-only behaviour for callers that need it); it can only downgrade
@@ -17891,6 +18068,12 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
     if policy is None:
         policy, _source = load_intake_policy(data_dir=data_dir)
     validate_intake_policy(policy)
+    # M29 slice 1 (#242): the effective policy is per-repo -- a
+    # repo_policies entry overrides the global version and allowlist
+    # for this Trigger's repo only. Everything below (Gate, resume,
+    # Assessment, scope, caps, health gate, dispatch) runs on the
+    # effective policy, so repos stay isolated.
+    policy = intake_policy_for_repo(policy, trigger["thread"]["repo"])
     if model_command is None:
         model_command = resolve_assessment_command(policy)
         assess_cfg = intake_assessment_config(policy)
@@ -17916,6 +18099,30 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
                                     data_dir=data_dir, now=now)
         if resumed is not None:
             return resumed
+        # M29 slice 1 (#242): cross-repo dedup -- the same source
+        # Trigger in a second repo resolves to the Ticket/Mandate the
+        # first delivery created. No new Ticket, no Assessment, no
+        # dispatch; only a cross_repo_duplicate_skipped ledger line.
+        # The Trigger id is recorded against the existing Ticket so a
+        # later re-delivery of this id resolves through the id path.
+        duplicate = intake_find_duplicate_ticket(trigger, state)
+        if duplicate is not None:
+            ticket_id, dedup_key = duplicate
+            seen[trigger["id"]] = ticket_id
+            save_intake_state(state, data_dir)
+            append_intake_ledger({"kind": "cross_repo_duplicate_skipped",
+                                  "trigger_id": trigger["id"],
+                                  "ticket_id": ticket_id,
+                                  "dedup_key": dedup_key,
+                                  "thread": intake_thread_key(trigger["thread"]),
+                                  "author": trigger["author"],
+                                  "reason": "same source Trigger already has a Ticket; "
+                                            "no new Ticket, no duplicate dispatch"},
+                                 data_dir)
+            return {"duplicate": True, "cross_repo_duplicate": True,
+                    "trigger_id": trigger["id"], "ticket_id": ticket_id,
+                    "dedup_key": dedup_key, "decision": None,
+                    "dispatched": False}
     assessment = None
     if assess and gate["decision"] == "accept":
         assessment = intake_assess_trigger(trigger, gate, state=state, data_dir=data_dir,
@@ -17953,6 +18160,12 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
         state["tickets"].append(ticket)
         state["mandates"].append(mandate)
         seen[trigger["id"]] = ticket["id"]
+        # M29 slice 1 (#242): register the source keys so a later
+        # Trigger carrying the same source in another repo dedups to
+        # this Ticket instead of opening a second Mandate.
+        content_seen = state.setdefault("content_seen", {})
+        for key in intake_register_keys(trigger):
+            content_seen[key] = ticket["id"]
         append_intake_ledger({"kind": "ticket_created", "trigger_id": trigger["id"],
                               "ticket_id": ticket["id"], "thread": intake_thread_key(trigger["thread"]),
                               "strength": decision["strength"]}, data_dir)
@@ -18150,6 +18363,10 @@ def cmd_intake_policy(args, data_dir=None):
               f"scopes={','.join(policy['scopes'])}")
         print(f"  allowlist users={','.join(policy['allowlist']['users']) or '-'} "
               f"bots={','.join(policy['allowlist']['bots']) or '-'}")
+        for repo, entry in sorted((policy.get("repo_policies") or {}).items()):
+            entry_users = (entry.get("allowlist") or {}).get("users")
+            print(f"  repo_policy {repo} version={entry.get('version') or policy['version']} "
+                  f"users={','.join(entry_users) if entry_users else '- (global allowlist)'}")
         scope = intake_active_scope(policy)
         print(f"  active_scope repos={','.join(scope['repos']) or '-'} "
               f"users={','.join(scope['users']) or '-'}")
