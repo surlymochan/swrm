@@ -83,3 +83,60 @@ class PiPlatformTests(unittest.TestCase):
                         self.assertEqual(xs.lane_config()[0]['binary'], binary)
                         xs.LaneChild(lane, tmp, policy)
                         self.assertEqual(popen.call_args.args[0][0], binary)
+
+    def test_plan_pi_explicit_wrapper_skips_isolated_identity_check(self):
+        # Issue #249: an explicitly set OPENSWARM_PI_BIN is an
+        # operator-authorized wrapper; plan_pi() admits it under
+        # require_isolation, while the unset default still requires
+        # pi-isolated.
+        wrapper = '/tmp/fake-pi-wrapper/pi_shim.sh'
+        policy = {'difficulty_map': {'3': {'tier': 'test'}},
+                  'pi': {'require_isolation': True, 'provider': 'minimax-cn',
+                         'default_model': 'MiniMax-M3.1-Flash'}}
+        prof = {'difficulty': 3, 'model': 'MiniMax-M3.1-Flash'}
+        with mock.patch.object(xs.sys, 'platform', 'linux'), \
+                mock.patch.object(xs, 'pi_bin', return_value=wrapper), \
+                mock.patch.object(xs, 'breakers', return_value={}), \
+                mock.patch.dict(os.environ, {'OPENSWARM_PI_BIN': wrapper}):
+            decision, reason = xs.plan_pi(prof, {}, policy, True, [])
+            self.assertEqual(decision['backend'], 'pi')
+            self.assertIsNone(reason)
+        # Unset: the same binary is still rejected (default unchanged).
+        with mock.patch.object(xs.sys, 'platform', 'linux'), \
+                mock.patch.object(xs, 'pi_bin', return_value=wrapper), \
+                mock.patch.object(xs, 'breakers', return_value={}), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            decision, reason = xs.plan_pi(prof, {}, policy, True, [])
+            self.assertIsNone(decision)
+            self.assertIn('isolated launcher', reason)
+
+    def test_plan_pi_explicit_wrapper_missing_still_errors(self):
+        # A set-but-missing OPENSWARM_PI_BIN stays an error, not a cue to
+        # fall through to the next binary: pi_bin() returns None and
+        # plan_pi() reports "no working pi binary".
+        policy = {'difficulty_map': {'3': {'tier': 'test'}},
+                  'pi': {'require_isolation': True, 'provider': 'minimax-cn',
+                         'default_model': 'MiniMax-M3.1-Flash'}}
+        prof = {'difficulty': 3, 'model': 'MiniMax-M3.1-Flash'}
+        with mock.patch.dict(os.environ, {'OPENSWARM_PI_BIN': '/nonexistent/pi_shim.sh'},
+                             clear=True):
+            self.assertIsNone(xs.pi_bin())
+            decision, reason = xs.plan_pi(prof, {}, policy, True, [])
+            self.assertIsNone(decision)
+            self.assertIn('no working pi binary', reason)
+
+    def test_plan_pi_explicit_wrapper_model_check_still_applies(self):
+        # The exemption covers only the identity check: a wrapper with a
+        # model the broker does not serve is still refused.
+        wrapper = '/tmp/fake-pi-wrapper/pi_shim.sh'
+        policy = {'difficulty_map': {'3': {'tier': 'test'}},
+                  'pi': {'require_isolation': True, 'provider': 'minimax-cn',
+                         'default_model': 'MiniMax-M3.1-Flash'}}
+        prof = {'difficulty': 3, 'model': 'wrong-model'}
+        with mock.patch.object(xs.sys, 'platform', 'linux'), \
+                mock.patch.object(xs, 'pi_bin', return_value=wrapper), \
+                mock.patch.object(xs, 'breakers', return_value={}), \
+                mock.patch.dict(os.environ, {'OPENSWARM_PI_BIN': wrapper}):
+            decision, reason = xs.plan_pi(prof, {}, policy, True, [])
+            self.assertIsNone(decision)
+            self.assertIn('does not match the broker', reason)
