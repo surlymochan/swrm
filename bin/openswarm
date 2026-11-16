@@ -4732,6 +4732,9 @@ def pi_bin():
 
     OPENSWARM_PI_BIN may be a wrapper that accepts the same flags and prints Pi's `--mode json` events.
     A set OPENSWARM_PI_BIN that is missing or not executable is an error, not a cue to try the next place.
+    An explicitly set OPENSWARM_PI_BIN is an operator-authorized wrapper: plan_pi() skips the
+    pi-isolated identity check for it (the provider/model check still applies). Without an explicit
+    setting, require_isolation still demands bin/pi-isolated.
     """
     env_bin = envvar("PI_BIN")
     if env_bin:
@@ -4761,7 +4764,12 @@ def plan_pi(prof, st, policy, forced, notes):
         known.get("binary") if known is not None and "binary" in known else pi_bin())
     if not binary:
         return None, "no working pi binary"
-    if cfg.get("require_isolation", sys.platform != "darwin"):
+    # Issue #249: an explicitly set OPENSWARM_PI_BIN is an operator-authorized
+    # wrapper (pi_bin() documents it as such), so skip the pi-isolated
+    # identity check for it. Unset, the default still requires the isolated
+    # launcher. The provider/model check below still applies either way.
+    explicit_wrapper = bool(envvar("PI_BIN"))
+    if cfg.get("require_isolation", sys.platform != "darwin") and not explicit_wrapper:
         expected = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pi-isolated")
         if os.path.realpath(binary) != os.path.realpath(expected):
             return None, "pi requires the isolated launcher"
