@@ -92,7 +92,7 @@
       "sources": {}
     },
     "health_gate": {
-      "enabled": false,
+      "enabled": true,
       "timeout_seconds": 10,
       "on_unknown": "allow"
     }

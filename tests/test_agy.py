@@ -97,9 +97,13 @@ class AgyBackend(unittest.TestCase):
         return xs.route(prof, st, policy or POLICY)
 
     def dispatch(self, policy=None, **kw):
+        # M32 (#259): shipped default is now health-gate on; these tests pin
+        # agy behaviour with a fake backend, so pin the gate off explicitly.
+        policy = xs.deep_merge(policy or POLICY,
+                               {"routing": {"health_gate": {"enabled": False, "timeout_seconds": 10, "on_unknown": "allow"}}})
         with contextlib.redirect_stdout(io.StringIO()):
             try:
-                xs.cmd_run(ns(cwd=self.cwd, **kw), policy or POLICY)
+                xs.cmd_run(ns(cwd=self.cwd, **kw), policy)
             except SystemExit as e:
                 return e.code
         self.fail("cmd_run returned without exiting")

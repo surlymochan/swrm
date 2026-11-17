@@ -134,8 +134,10 @@ class FleetTests(unittest.TestCase):
         binary.write_text("#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\nsys.exit(7)\n")
         binary.chmod(0o755)
         self.config([{"name": "local", "kind": "local", "openswarm": str(binary)}])
+        # M32 (#259): shipped default is now health-gate on; this test pins
+        # argument forwarding, so pin the gate off explicitly.
         proc = subprocess.run([sys.executable, str(pathlib.Path(_load.ROOT) / "bin" / "openswarm"),
-                               "fleet", "exec", "local", "--", "run", "--prompt", "$(false); literal"],
+                               "fleet", "exec", "--no-health-gate", "local", "--", "run", "--prompt", "$(false); literal"],
                               env={**xs.os.environ, "OPENSWARM_HOME": str(self.root)}, capture_output=True, text=True)
         self.assertEqual(proc.returncode, 7)
         self.assertEqual(json.loads(proc.stdout), ["run", "--prompt", "$(false); literal"])
@@ -303,7 +305,9 @@ class FleetWeightedRoutingTests(unittest.TestCase):
         off so the fixture state routes (as in test_weighted_routing)."""
         local = {"codex": {"require_default_model": False}}
         if routing:
-            local["routing"] = routing
+            # M32 (#259): shipped default is now health-gate on; these tests
+            # pin weighted-routing forwarding, so pin the gate off explicitly.
+            local["routing"] = {**routing, "health_gate": {"enabled": False, "timeout_seconds": 10, "on_unknown": "allow"}}
         (self.root / "policy.local.json").write_text(json.dumps(local))
 
     def rows_for(self, backend, model, passes, n=8):

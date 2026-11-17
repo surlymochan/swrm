@@ -10,11 +10,11 @@ host exec attempt. An unhealthy backend is refused (ledger
 blocked/health-gate with reason + evidence pointers, exit 2, never
 rerouted); the gate flags live on the fleet exec invocation (before the
 host, like --timeout) and are NOT forwarded to the remote run, whose own
-M24 gate is the executor-side check. The gate is off by default
-(routing.health_gate.enabled=false).
+M24 gate is the executor-side check. The gate is on by default since
+M32 #259 (routing.health_gate.enabled=true).
 
 Pinned behaviour (the tests below pin each one):
-- Gate off (shipped default) changes nothing: no health_gate ledger
+- Gate off changes nothing: no health_gate ledger
   entry, forwarding byte-identical to before, probe state never read,
   custom backends file never loaded.
 - Unhealthy blocks: exit 2, host_run never called, ledger entry status
@@ -86,10 +86,14 @@ UNKNOWN = probe_record("unknown", "codex login status could not be classified", 
 
 class FleetHealthGateUnitTests(unittest.TestCase):
     def test_gate_off_returns_none_without_reading_state(self):
+        # M32 (#259): shipped default is now health-gate on; "gate off" must
+        # be explicit now, not inherited from the shipped default.
+        policy = copy.deepcopy(POLICY)
+        policy["routing"]["health_gate"] = {"enabled": False, "timeout_seconds": 10, "on_unknown": "allow"}
         with mock.patch.object(xs, "get_state", side_effect=AssertionError("state must not be read")):
             self.assertEqual(xs.fleet_health_gate(
                 argparse.Namespace(health_gate=False, no_health_gate=False, skip_health_gate=False),
-                POLICY, "codex"), (None, False))
+                policy, "codex"), (None, False))
 
     def test_no_health_gate_flag_wins_over_enabled_config(self):
         policy = copy.deepcopy(POLICY)
@@ -269,7 +273,9 @@ class FleetHealthGateExecTests(unittest.TestCase):
         self.write_policy(weighted=False)
         with mock.patch.object(xs, "health_probe_backend",
                                side_effect=AssertionError("probe must not run")):
-            code, transport, _ = self.exec_run("--backend", "codex")
+            # M32 (#259): shipped default is now health-gate on; "gate off"
+            # must be explicit now, not inherited from the shipped default.
+            code, transport, _ = self.exec_run("--backend", "codex", no_health_gate=True)
         self.assertEqual(code, 0)
         transport.assert_called_once()
         self.assertEqual(self.gate_entries(), [])
@@ -531,12 +537,14 @@ class FleetHealthGateCliTests(unittest.TestCase):
             return []
         return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
-    def exec_run(self, *extra, health_gate=False):
+    def exec_run(self, *extra, health_gate=False, no_health_gate=False):
         command = ["run", "--task-file", str(self.task), "--card-type", "fix",
                    "--cwd", str(self.root), "--budget-minutes", "5", *extra]
         argv = ["fleet", "exec"]
         if health_gate:
             argv.append("--health-gate")
+        if no_health_gate:
+            argv.append("--no-health-gate")
         argv += ["local", "--", *command]
         return self.run_cli(*argv)
 
@@ -564,7 +572,9 @@ class FleetHealthGateCliTests(unittest.TestCase):
         self.assertEqual(allowed[0]["health_gate"]["verdict"], "healthy")
 
     def test_cli_gate_off_forwards_codex_without_gate_entry(self):
-        proc = self.exec_run("--backend", "codex")
+        # M32 (#259): shipped default is now health-gate on; "gate off" must
+        # be explicit now, not inherited from the shipped default.
+        proc = self.exec_run("--backend", "codex", no_health_gate=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(len(self.start_events()), 1)
         self.assertEqual([e for e in self.ledger_entries() if e.get("fleet_health_gate")], [])

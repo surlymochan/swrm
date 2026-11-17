@@ -27,6 +27,9 @@ class HostScopeTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         self.policy = xs.load_policy()
+        # M32 (#259): shipped default is now health-gate on; these tests pin
+        # scope behaviour, so pin the gate off explicitly.
+        self.policy["routing"]["health_gate"] = {"enabled": False, "timeout_seconds": 10, "on_unknown": "allow"}
 
     def test_wrapped_commands_keep_all_inner_enforcement(self):
         prefixes = ("sudo", "sudo -u operator", "sudo -n -uoperator --",

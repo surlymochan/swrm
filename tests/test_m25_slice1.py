@@ -9,12 +9,12 @@ routed pick. An unhealthy backend blocks just that card (ledger
 blocked/health-gate with reason + evidence pointers, no exec attempt, never
 rerouted); the other cards in the batch are unaffected, and a blocked card
 blocks its M4 dependents like any other non-done dependency. The gate is
-off by default (routing.health_gate.enabled=false); --health-gate /
+on by default since M32 #259 (routing.health_gate.enabled=true); --health-gate /
 --no-health-gate / --skip-health-gate flags ride on the batch spec so a
 resumed or detached batch gates exactly like the batch that created it.
 
 Pinned behaviour (the tests below pin each one):
-- Gate off (shipped default) changes nothing: no health_gate record on any
+- Gate off changes nothing: no health_gate record on any
   row or ledger entry, dispatch byte-identical to before.
 - Unhealthy blocks: row finished/blocked with blocked_by health-gate, no
   run_id, batch_launch never called, ledger entry status blocked with the
@@ -116,8 +116,12 @@ def per_host_probe(*records):
 
 class BatchHealthGateUnitTests(unittest.TestCase):
     def test_gate_off_returns_none_without_reading_state(self):
+        # M32 (#259): shipped default is now health-gate on; "gate off" must
+        # be explicit now, not inherited from the shipped default.
+        policy = copy.deepcopy(POLICY)
+        policy["routing"]["health_gate"] = {"enabled": False, "timeout_seconds": 10, "on_unknown": "allow"}
         with mock.patch.object(xs, "get_state", side_effect=AssertionError("state must not be read")):
-            self.assertEqual(xs.batch_health_gate({}, POLICY, "codex"), (None, False))
+            self.assertEqual(xs.batch_health_gate({}, policy, "codex"), (None, False))
 
     def test_no_health_gate_flag_wins_over_enabled_config(self):
         policy = copy.deepcopy(POLICY)
@@ -192,7 +196,9 @@ class BatchHealthGateTests(test_batch.FakeFleetFixture, unittest.TestCase):
     def test_gate_off_dispatches_without_health_gate_record(self):
         (self.cards / "one.md").write_text("first card")
         (self.cards / "two.md").write_text("second card")
-        rc, summary, _ = self.run_batch()
+        # M32 (#259): shipped default is now health-gate on; "gate off" must
+        # be explicit now, not inherited from the shipped default.
+        rc, summary, _ = self.run_batch(no_health_gate=True)
         self.assertEqual(rc, 0)
         self.assertEqual([row["status"] for row in summary["cards"]], ["done", "done"])
         for row in summary["cards"]:

@@ -10,14 +10,17 @@ tests (55 failures + 9 errors out of 1345): every dispatch-path test that
 assumed the gate-off ambient default now hits the gate with this VM's
 unhealthy codex state. The flip is one value change away, but it needs a
 test-suite migration first — out of scope for this slice, and the criterion
-says the conclusion goes in the issue instead. The shipped default stays
-off (pinned by test_m24_slice1.ConfigValidation.test_shipped_policy_is_disabled).
+says the conclusion goes in the issue instead. That migration is M32 slice
+1 (#259): the shipped default is now on (pinned by
+test_m24_slice1.ConfigValidation.test_shipped_policy_is_enabled), and the
+override test below pins the reverse direction (a local override can turn
+the gate back off).
 
 Pinned behaviour (the tests below pin each one):
 - The flip mechanism works: a policy.local.json-style deep-merge with
-  enabled=true turns the gate on.
-- --health-gate forces the gate on under the shipped default off (the
-  probe runs; a healthy verdict allows, source is the flag).
+  enabled=false turns the gate off (shipped default is now on, M32 #259).
+- --health-gate forces the gate on (the probe runs; a healthy verdict
+  allows, source is the flag).
 - --no-health-gate forces the gate off even when it is enabled by policy
   (no probe runs).
 - --skip-health-gate bypasses the probe when the gate is enabled by
@@ -55,6 +58,15 @@ def enabled_policy():
     return policy
 
 
+def disabled_policy():
+    """POLICY with the gate turned off the way policy.local.json would
+    (M32 #259: shipped default is now on, so the local override direction
+    that matters is off)."""
+    policy = copy.deepcopy(POLICY)
+    policy["routing"]["health_gate"]["enabled"] = False
+    return policy
+
+
 def healthy_record():
     return {"backend": "codex", "verdict": "healthy",
             "reason": "all 3 applicable check(s) passed",
@@ -64,13 +76,16 @@ def healthy_record():
 
 
 class FlipEvaluationTests(unittest.TestCase):
-    def test_policy_local_style_override_can_enable_gate(self):
-        # The flip itself is one value: a deep-merge with enabled=true
-        # (what load_policy does with policy.local.json) turns it on.
-        self.assertFalse(xs.health_gate_config(POLICY)["enabled"])
-        self.assertTrue(xs.health_gate_config(enabled_policy())["enabled"])
+    # M32 (#259): the shipped default flipped to on; this test pins the
+    # new shipped default and the reverse override (it was
+    # test_policy_local_style_override_can_enable_gate).
+    def test_policy_local_style_override_can_disable_gate(self):
+        # The flip itself is one value: a deep-merge with enabled=false
+        # (what load_policy does with policy.local.json) turns it off.
+        self.assertTrue(xs.health_gate_config(POLICY)["enabled"])
+        self.assertFalse(xs.health_gate_config(disabled_policy())["enabled"])
 
-    def test_health_gate_flag_forces_on_under_shipped_default_off(self):
+    def test_health_gate_flag_forces_on(self):
         with mock.patch.object(xs, "health_probe_backend",
                                return_value=healthy_record()):
             record, blocked = xs.apply_health_gate(

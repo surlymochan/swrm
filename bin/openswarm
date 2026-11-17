@@ -5657,12 +5657,12 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
 # state, never start a session, never spend quota, and never read a
 # credential value (only its presence, or a provider error string).
 #
-# Shipped default is enabled=false (routing.health_gate in policy.json):
-# the mechanism is present, behaviour is byte-identical to today until
-# slice 2 decides whether to flip it on (M9/M16/M19 pattern). Enabling is
-# by config or by the --health-gate flag; --no-health-gate forces it off
-# for one run; --skip-health-gate bypasses it for one run and the bypass
-# itself is recorded in the ledger and result.json.
+# Shipped default is enabled=true (routing.health_gate in policy.json,
+# flipped by M32 slice 1, #259, after the default-on full suite went
+# green): the gate runs unless disabled by config or by the
+# --no-health-gate flag; --health-gate forces it on for one run;
+# --skip-health-gate bypasses it for one run and the bypass itself is
+# recorded in the ledger and result.json.
 #
 # Timeout: each backend's whole probe is bounded by timeout_seconds
 # (default 10, configurable 1..120). A probe that cannot finish in time
@@ -5672,7 +5672,7 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
 # set). The posture is pinned by tests, not by the dispatch path.
 #
 # Policy shape (policy.json, routing.health_gate):
-#   {"enabled": false, "timeout_seconds": 10, "on_unknown": "allow"}
+#   {"enabled": true, "timeout_seconds": 10, "on_unknown": "allow"}
 # Fleet exec forwarding (M25 slice 2, #204) gates a forwarded `run` on its
 # effective backend before any host exec attempt; the gate only runs in
 # cmd_run's single-dispatch path (initial pick + fallback re-route), in
@@ -8565,7 +8565,7 @@ def cmd_run(args, policy, custom_backends=None):
                            "decision": decision, "scope": scope, "error_class": "health_gate_blocked",
                            "summary": error[:300],
                            "card_type": card_type, "rework_of": rework_of,
-                           **exec_pass_fields(False, False, bool(args.verify), None),
+                           **exec_pass_fields(False, False, bool(getattr(args, "verify", None)), None),
                            **routing_fields})
             jsave(f"{rdir}/result.json", out)
             print(json.dumps(out, indent=2, ensure_ascii=False))

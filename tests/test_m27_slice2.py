@@ -90,6 +90,15 @@ def fake_channel():
     return poster
 
 
+def gate_off_swrm_policy():
+    # M32 (#259): shipped default is now health-gate on; the on-mode
+    # dispatch tests below pin dispatch with a fake runner, so pin the
+    # gate off explicitly.
+    return xs.deep_merge(xs.load_policy(),
+                         {"routing": {"health_gate": {"enabled": False, "timeout_seconds": 10, "on_unknown": "allow"}}})
+
+
+
 class M27Slice2Tests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="openswarm-m27s2-")
@@ -363,8 +372,9 @@ class M27Slice2Tests(unittest.TestCase):
         policy = self.on_policy(accept_mode="on")
         runner = fake_runner()
         channel = fake_channel()
-        result = self.ingest(trig("b2"), policy=policy, dispatch_runner=runner,
-                             channel_poster=channel)
+        with mock.patch.object(xs, "load_policy", return_value=gate_off_swrm_policy()):
+            result = self.ingest(trig("b2"), policy=policy, dispatch_runner=runner,
+                                 channel_poster=channel)
         self.assertTrue(result["dispatched"])
         self.assertEqual(result["dispatch"]["run_id"], "20261115-030000-abcdef")
         self.assertEqual(result["dispatch"]["status"], "done")
@@ -399,8 +409,9 @@ class M27Slice2Tests(unittest.TestCase):
 
         def failing(ticket, trigger, decision, policy, data_dir, cwd):
             raise ValueError("executor exploded")
-        result = self.ingest(trig("b4"), policy=policy, dispatch_runner=failing,
-                             channel_poster=fake_channel())
+        with mock.patch.object(xs, "load_policy", return_value=gate_off_swrm_policy()):
+            result = self.ingest(trig("b4"), policy=policy, dispatch_runner=failing,
+                                 channel_poster=fake_channel())
         self.assertFalse(result["dispatched"])
         self.assertIn("dispatch_error", result)
         state = xs.load_intake_state(str(self.data))
@@ -414,8 +425,9 @@ class M27Slice2Tests(unittest.TestCase):
 
         def failing_poster(repo, number, body):
             raise ValueError("gh is down")
-        result = self.ingest(trig("b5"), policy=policy, dispatch_runner=fake_runner(),
-                             channel_poster=failing_poster)
+        with mock.patch.object(xs, "load_policy", return_value=gate_off_swrm_policy()):
+            result = self.ingest(trig("b5"), policy=policy, dispatch_runner=fake_runner(),
+                                 channel_poster=failing_poster)
         self.assertTrue(result["dispatched"])
         self.assertIn("channel_error", result)
         kinds = [e["kind"] for e in xs.intake_ledger_entries(str(self.data))]

@@ -83,7 +83,9 @@ class FleetExecGuardTests(unittest.TestCase):
             self.addCleanup(patch.stop)
 
     def namespace(self, *run_args):
-        return argparse.Namespace(fleet_cmd="exec", host="local", timeout=300,
+        # M32 (#259): shipped default is now health-gate on; these tests pin
+        # verify-evalid guard/record behaviour, so pin the gate off explicitly.
+        return argparse.Namespace(fleet_cmd="exec", host="local", timeout=300, no_health_gate=True,
                                   args=["--", "run", *run_args])
 
     def run_exec(self, namespace, host_run=None, host_json=None):
@@ -401,7 +403,9 @@ class FleetVerifyEvalidEndToEndTests(unittest.TestCase):
         command = ["run", "--task-file", str(self.task), "--card-type", "fix",
                    "--cwd", str(self.repo), "--base", self.base,
                    "--budget-minutes", "5", *extra]
-        return self.run_cli("fleet", "exec", "local", "--", *command)
+        # M32 (#259): shipped default is now health-gate on; these tests pin
+        # verify-evalid recording, so pin the gate off explicitly.
+        return self.run_cli("fleet", "exec", "--no-health-gate", "local", "--", *command)
 
     def start_events(self):
         path = self.root / "calls.jsonl"

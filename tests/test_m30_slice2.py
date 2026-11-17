@@ -575,6 +575,9 @@ class IngestWiringTests(M30Slice2Base):
             self.addCleanup(patch.stop)
 
     def test_fleet_mode_dispatches_via_fleet_runner(self):
+        # M32 (#259): shipped default is now health-gate on; this test pins
+        # dispatch wiring with a fake runner, so pin the gate off explicitly.
+        self._gate_env(enabled=False)
         policy = fleet_policy()
         fleet = fake_fleet_runner()
         single = fake_runner()
@@ -616,6 +619,9 @@ class IngestWiringTests(M30Slice2Base):
         self.assertEqual(self.state()["assignments"], [])
 
     def test_run_mode_ignores_fleet_runner(self):
+        # M32 (#259): shipped default is now health-gate on; this test pins
+        # dispatch wiring with a fake runner, so pin the gate off explicitly.
+        self._gate_env(enabled=False)
         policy = active_policy()
         single = fake_runner()
         fleet = fake_fleet_runner()
@@ -630,6 +636,9 @@ class IngestWiringTests(M30Slice2Base):
         self.assertNotIn("fleet_dispatch_started", self.ledger_kinds())
 
     def test_batch_mode_ignores_fleet_runner(self):
+        # M32 (#259): shipped default is now health-gate on; this test pins
+        # dispatch wiring with a fake runner, so pin the gate off explicitly.
+        self._gate_env(enabled=False)
         policy = batch_policy()
         batch = fake_batch_runner()
         fleet = fake_fleet_runner()
@@ -654,6 +663,9 @@ class IngestWiringTests(M30Slice2Base):
         self.assertIn("active_scope_shadow", self.ledger_kinds())
 
     def test_caps_block_fleet_before_assignment(self):
+        # M32 (#259): shipped default is now health-gate on; this test pins
+        # dispatch wiring with a fake runner, so pin the gate off explicitly.
+        self._gate_env(enabled=False)
         policy = fleet_policy()
         policy["caps"] = {"max_dispatches_per_thread": 1,
                           "max_budget_minutes_per_thread": 10}

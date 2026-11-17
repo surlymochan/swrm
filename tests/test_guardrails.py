@@ -32,8 +32,11 @@ class GuardrailsTests(unittest.TestCase):
         patch = mock.patch.object(xs, "NOW", return_value=self.now)
         patch.start()
         self.addCleanup(patch.stop)
+        # M32 (#259): shipped default is now health-gate on; these tests pin
+        # budget/fallback behaviour, so pin the gate off explicitly.
         self.policy = xs.deep_merge(xs.load_policy(), {"budget": {"timezone": "Asia/Singapore",
-                                   "daily_executor_minutes": 10, "per_backend": {"pi": 6}, "per_run_max_minutes": 5}})
+                                   "daily_executor_minutes": 10, "per_backend": {"pi": 6}, "per_run_max_minutes": 5},
+                                   "routing": {"health_gate": {"enabled": False, "timeout_seconds": 10, "on_unknown": "allow"}}})
 
     def ledger(self, entries):
         Path(xs.LEDGER).write_text("\n".join(json.dumps(e) for e in entries) + "\n")

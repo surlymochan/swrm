@@ -176,6 +176,14 @@ class PolicyValidationTests(M28Slice1Base):
 
 
 class ActiveScopeTests(M28Slice1Base):
+    def setUp(self):
+        super().setUp()
+        # M32 (#259): shipped default is now health-gate on; these tests pin
+        # intake behaviour with a fake runner, so pin the gate off explicitly.
+        patch = mock.patch.object(xs, "load_policy",
+                                  return_value=gate_policy(enabled=False))
+        patch.start()
+        self.addCleanup(patch.stop)
     def test_in_scope_dispatches(self):
         policy = active_policy()
         runner = fake_runner()
@@ -258,6 +266,14 @@ class ActiveScopeTests(M28Slice1Base):
 
 
 class CapsTests(M28Slice1Base):
+    def setUp(self):
+        super().setUp()
+        # M32 (#259): shipped default is now health-gate on; these tests pin
+        # intake behaviour with a fake runner, so pin the gate off explicitly.
+        patch = mock.patch.object(xs, "load_policy",
+                                  return_value=gate_policy(enabled=False))
+        patch.start()
+        self.addCleanup(patch.stop)
     def test_dispatch_count_cap_blocks_second_dispatch_on_thread(self):
         policy = active_policy(caps={"max_dispatches_per_thread": 1})
         runner = fake_runner()
@@ -327,6 +343,14 @@ class CapsTests(M28Slice1Base):
 
 
 class IdempotencyTests(M28Slice1Base):
+    def setUp(self):
+        super().setUp()
+        # M32 (#259): shipped default is now health-gate on; these tests pin
+        # intake behaviour with a fake runner, so pin the gate off explicitly.
+        patch = mock.patch.object(xs, "load_policy",
+                                  return_value=gate_policy(enabled=False))
+        patch.start()
+        self.addCleanup(patch.stop)
     def test_redelivery_after_dispatch_dispatches_once(self):
         policy = active_policy()
         runner = fake_runner()
@@ -491,12 +515,15 @@ class HealthGateTests(M28Slice1Base):
         self.assertNotIn("health_gate", result)
 
     def test_gate_off_dispatches_unchanged(self):
-        # Shipped default (health gate disabled in policy.json): the
-        # pre-check is a no-op and dispatch proceeds exactly as in M27.
+        # Gate off (explicit, since the shipped default flipped to on in
+        # M32 #259): the pre-check is a no-op and dispatch proceeds
+        # exactly as in M27.
         policy = active_policy()
         runner = fake_runner()
-        result = self.ingest(trig("g7"), policy=policy, dispatch_runner=runner,
-                             channel_poster=fake_channel())
+        with mock.patch.object(xs, "load_policy",
+                               return_value=gate_policy(enabled=False)):
+            result = self.ingest(trig("g7"), policy=policy, dispatch_runner=runner,
+                                 channel_poster=fake_channel())
         self.assertTrue(result["dispatched"])
         self.assertNotIn("health_gate", result)
         self.assertNotIn("intake_health_gate_blocked", self.ledger_kinds())
