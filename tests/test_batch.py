@@ -223,7 +223,9 @@ class BatchTests(FakeFleetFixture, unittest.TestCase):
         (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"pi": 1}}))
         (self.cards / "one.md").write_text("first card")
         (self.cards / "two.md").write_text("second card")
-        rc, summary, _ = self.run_batch()
+        # M32 (#259): shipped default is now health-gate on; this test pins
+        # cap queueing, so pin the gate off explicitly.
+        rc, summary, _ = self.run_batch(no_health_gate=True)
         self.assertEqual(rc, 0)
         self.assertEqual([row["host"] for row in summary["cards"]], ["b1", "b2"])
         starts, finishes = [], []
@@ -242,7 +244,9 @@ class BatchTests(FakeFleetFixture, unittest.TestCase):
         (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"total": 1}}))
         (self.cards / "one.md").write_text("first card")
         (self.cards / "two.md").write_text("second card")
-        rc, summary, _ = self.run_batch()
+        # M32 (#259): shipped default is now health-gate on; this test pins
+        # cap queueing, so pin the gate off explicitly.
+        rc, summary, _ = self.run_batch(no_health_gate=True)
         self.assertEqual(rc, 0)
         starts, finishes = [], []
         for name in ("b1", "b2"):
@@ -300,7 +304,10 @@ class BatchTests(FakeFleetFixture, unittest.TestCase):
         for name in ("b1", "b2"):
             self.hosts[name]["kind"] = "local"
         (self.data / "fleet.json").write_text(json.dumps({"hosts": list(self.hosts.values())}))
+        # M32 (#259): shipped default is now health-gate on; this test pins
+        # detached-batch mechanics, so pin the gate off explicitly.
         proc = subprocess.run([sys.executable, str(Path(_load.ROOT) / "bin" / "openswarm"), "batch",
+                               "--no-health-gate",
                                "--repo", "project", "--cards", str(self.cards), "--hosts", "b1,b2", "--detach",
                                "--poll-seconds", "0.01"], capture_output=True, text=True, timeout=10,
                               env={**os.environ, "OPENSWARM_HOME": str(self.data)})

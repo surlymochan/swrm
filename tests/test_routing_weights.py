@@ -105,6 +105,9 @@ class RoutingWeightsTests(unittest.TestCase):
         policy["routing"]["weighted"] = False
         policy["routing"]["min_samples"] = 2
         policy["routing"]["default_order"] = ["codex", "ocgo"]
+        # M32 (#259): shipped default is now health-gate on; this test pins
+        # record-only routing, so pin the gate off explicitly.
+        policy["routing"]["health_gate"] = {"enabled": False, "timeout_seconds": 10, "on_unknown": "allow"}
         profile = {"type": "impl", "difficulty": 3}
         state = copy.deepcopy(BASE_STATE)
         expected = xs.route(profile, state, policy)

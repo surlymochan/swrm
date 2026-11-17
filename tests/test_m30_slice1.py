@@ -452,6 +452,9 @@ class IngestWiringTests(M30Slice1Base):
             self.addCleanup(patch.stop)
 
     def test_batch_mode_dispatches_via_batch_runner(self):
+        # M32 (#259): shipped default is now health-gate on; this test pins
+        # dispatch wiring with a fake runner, so pin the gate off explicitly.
+        self._gate_env(enabled=False)
         policy = batch_policy()
         runner = fake_batch_runner()
         single = fake_runner()
@@ -480,6 +483,9 @@ class IngestWiringTests(M30Slice1Base):
         self.assertEqual(self.state()["assignments"], [])
 
     def test_run_mode_ignores_batch_runner(self):
+        # M32 (#259): shipped default is now health-gate on; this test pins
+        # dispatch wiring with a fake runner, so pin the gate off explicitly.
+        self._gate_env(enabled=False)
         policy = active_policy()
         single = fake_runner()
         batch = fake_batch_runner()
@@ -506,6 +512,9 @@ class IngestWiringTests(M30Slice1Base):
         self.assertIn("active_scope_shadow", self.ledger_kinds())
 
     def test_caps_block_batch_before_assignment(self):
+        # M32 (#259): shipped default is now health-gate on; this test pins
+        # dispatch wiring with a fake runner, so pin the gate off explicitly.
+        self._gate_env(enabled=False)
         policy = batch_policy()
         policy["caps"] = {"max_dispatches_per_thread": 1,
                           "max_budget_minutes_per_thread": 10}

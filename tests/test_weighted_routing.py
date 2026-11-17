@@ -51,6 +51,9 @@ def weighted_policy(**overrides):
     policy = copy.deepcopy(POLICY)
     policy["routing"]["default_order"] = ["codex", "ocgo"]
     policy["routing"]["min_samples"] = 8
+    # M32 (#259): shipped default is now health-gate on; these tests pin
+    # routing behaviour, so pin the gate off explicitly.
+    policy["routing"]["health_gate"] = {"enabled": False, "timeout_seconds": 10, "on_unknown": "allow"}
     policy["routing"].update(overrides)
     return policy
 

@@ -10,7 +10,7 @@ final pick, an unhealthy backend refuses to dispatch with an actionable
 error, and the decision lands in the ledger and result.json.
 
 Pinned behaviour (the tests below pin each one):
-- Gate off (shipped default) changes nothing: no health_gate record
+- Gate off changes nothing: no health_gate record
   anywhere, byte-identical behaviour.
 - Unhealthy blocks: status unroutable, error_class health_gate_blocked,
   no exec attempt, no silent reroute to another backend.
@@ -104,8 +104,10 @@ class ConfigValidation(unittest.TestCase):
         self.assertEqual(xs.health_gate_config(policy),
                          {"enabled": False, "timeout_seconds": 10, "on_unknown": "allow"})
 
-    def test_shipped_policy_is_disabled(self):
-        self.assertFalse(xs.health_gate_config(POLICY)["enabled"])
+    # M32 (#259): the shipped default flipped to enabled; this test pins
+    # the new shipped default (it was test_shipped_policy_is_disabled).
+    def test_shipped_policy_is_enabled(self):
+        self.assertTrue(xs.health_gate_config(POLICY)["enabled"])
 
     def test_enabled_config_round_trips(self):
         cfg = xs.health_gate_config(gate_policy(enabled=True, timeout_seconds=5, on_unknown="block"))

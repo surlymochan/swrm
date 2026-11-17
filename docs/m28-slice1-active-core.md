@@ -71,7 +71,7 @@ When a cap would be exceeded the dispatch is refused with a
 `intake_health_gate_check` runs `apply_health_gate` against the swrm
 `policy.json` `routing.health_gate` config -- the same config and the
 same probe the `openswarm run` child applies after routing. When the
-gate is off (shipped default) it returns `(None, False)` and dispatch
+gate is off it returns `(None, False)` and dispatch
 proceeds exactly as before. When on, the effective backend is probed:
 an explicitly configured dispatch backend, or the backend `route()`
 picks for the default run profile (`{"type": "impl", "difficulty": 3}`,

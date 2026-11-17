@@ -23,7 +23,7 @@ Pinned behaviour (the tests below pin each one):
   dispatch (and vice versa).
 - An explicit --backend is gated exactly like a routed pick; the gate
   flags are not forwarded to the remote run.
-- Gate off (shipped default, routing.health_gate.enabled=false) changes
+- Gate off (routing.health_gate.enabled=false) changes
   nothing: no probe, no transport call, no gate entry.
 - --skip-health-gate bypasses the probe and the bypass itself is recorded.
 - The single-run gate is untouched: `openswarm run` still probes this
@@ -212,9 +212,13 @@ class FleetHealthGatePerHostTests(unittest.TestCase):
         self.assertIn("on_unknown=allow", record["reason"])
 
     def test_gate_off_never_touches_transport(self):
+        # M32 (#259): shipped default is now health-gate on; "gate off" must
+        # be explicit now, not inherited from the shipped default.
+        policy = copy.deepcopy(POLICY)
+        policy["routing"]["health_gate"] = {"enabled": False, "timeout_seconds": 10, "on_unknown": "allow"}
         with mock.patch.object(xs, "host_run",
                                side_effect=AssertionError("gate off must not probe")):
-            self.assertEqual(xs.fleet_health_gate(gate_args(health_gate=False), POLICY,
+            self.assertEqual(xs.fleet_health_gate(gate_args(health_gate=False), policy,
                                                   "codex", host=SSH_HOST), (None, False))
 
     def test_skip_bypasses_without_probing(self):

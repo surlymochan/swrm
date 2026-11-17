@@ -158,7 +158,7 @@ Ledger kinds: `trigger_received` 10, `decision` 10, `ticket_created` 8,
 ## Deliberate limits (carried from slice 1, still true)
 
 - The health-gate pre-check costs one extra probe per dispatch when
-  the gate is enabled; the gate is off by default.
+  the gate is enabled; the gate is on by default since M32 #259.
 - Caps count allocated budget minutes, not wall clock.
 - `intake poll --issue` still advances the repo cursor — no: fixed
   by the #236 dispatch itself (PR #239). A thread-restricted poll

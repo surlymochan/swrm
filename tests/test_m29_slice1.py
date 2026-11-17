@@ -190,6 +190,14 @@ class RepoPolicyValidationTests(M29Slice1Base):
 
 
 class PerRepoIsolationTests(M29Slice1Base):
+    def setUp(self):
+        super().setUp()
+        # M32 (#259): shipped default is now health-gate on; these tests pin
+        # intake behaviour with a fake runner, so pin the gate off explicitly.
+        patch = mock.patch.object(xs, "load_policy",
+                                  return_value=gate_policy(enabled=False))
+        patch.start()
+        self.addCleanup(patch.stop)
     def test_swrm_default_behaviour_is_unchanged(self):
         # Regression: with no repo_policies entry for swrm, the Gate
         # decision for a swrm Trigger is byte-identical to the pre-M29
@@ -266,6 +274,14 @@ class PerRepoIsolationTests(M29Slice1Base):
 
 
 class EvalidAllowlistTests(M29Slice1Base):
+    def setUp(self):
+        super().setUp()
+        # M32 (#259): shipped default is now health-gate on; these tests pin
+        # intake behaviour with a fake runner, so pin the gate off explicitly.
+        patch = mock.patch.object(xs, "load_policy",
+                                  return_value=gate_policy(enabled=False))
+        patch.start()
+        self.addCleanup(patch.stop)
     def test_evalid_in_scope_dispatches(self):
         policy = active_policy()
         runner = fake_runner()
@@ -312,6 +328,14 @@ class EvalidAllowlistTests(M29Slice1Base):
 
 
 class CrossRepoDedupTests(M29Slice1Base):
+    def setUp(self):
+        super().setUp()
+        # M32 (#259): shipped default is now health-gate on; these tests pin
+        # intake behaviour with a fake runner, so pin the gate off explicitly.
+        patch = mock.patch.object(xs, "load_policy",
+                                  return_value=gate_policy(enabled=False))
+        patch.start()
+        self.addCleanup(patch.stop)
     def test_same_text_two_repos_builds_one_mandate(self):
         policy = active_policy()
         runner = fake_runner()
@@ -452,6 +476,14 @@ class CrossRepoDedupTests(M29Slice1Base):
 
 
 class CapsTests(M29Slice1Base):
+    def setUp(self):
+        super().setUp()
+        # M32 (#259): shipped default is now health-gate on; these tests pin
+        # intake behaviour with a fake runner, so pin the gate off explicitly.
+        patch = mock.patch.object(xs, "load_policy",
+                                  return_value=gate_policy(enabled=False))
+        patch.start()
+        self.addCleanup(patch.stop)
     def test_dispatch_count_cap_blocks_second_dispatch_on_evalid_thread(self):
         policy = active_policy(caps={"max_dispatches_per_thread": 1})
         runner = fake_runner()
