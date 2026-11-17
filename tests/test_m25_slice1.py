@@ -28,6 +28,14 @@ Pinned behaviour (the tests below pin each one):
 - An invalid health_gate config fails loudly when the gate is on, and is
   ignored when the gate is off.
 
+NOTE (M31 slice 1, #254): the probe moved to the executor host, so the
+end-to-end tests below pin the batch decision given a probe verdict by
+mocking fxs.fleet_probe_host_health (the per-host probe entry point),
+not fxs.health_probe_backend — the verdict-to-decision mapping is
+unchanged, only where the verdict is measured moved. The probe mechanics
+themselves (executor-side execution, transport timeout/unknown) are
+pinned in tests/test_m31_slice1.py and by live gocc evidence.
+
 Run: python3 -m unittest tests.test_m25_slice1
      (or: python3 tests/test_m25_slice1.py)
 """
@@ -78,6 +86,32 @@ def probe_record(verdict, reason, status="fail"):
 UNHEALTHY = probe_record("unhealthy", "codex is not logged in (codex login status says 'Not logged in')")
 HEALTHY = probe_record("healthy", "all 3 applicable check(s) passed", status="pass")
 UNKNOWN = probe_record("unknown", "codex login status could not be classified", status="unknown")
+TIMEOUT = {"backend": "codex", "verdict": "unknown",
+           "reason": "health probe exceeded its 1s budget; verdict is unknown, not a pass",
+           "checks": [{"name": "binary", "status": "pass",
+                       "detail": "codex binary is executable", "evidence": "probe state: codex.binary"},
+                      {"name": "login", "status": "pass",
+                       "detail": "live session", "evidence": "command: codex login status"},
+                      {"name": "timeout", "status": "timeout",
+                       "detail": "health probe exceeded its 1s budget; verdict is unknown, not a pass",
+                       "evidence": "gate deadline"}],
+           "seconds": 1.0, "timeout_seconds": 1}
+
+
+def per_host_probe(*records):
+    """side_effect for fxs.fleet_probe_host_health (M31, #254): the canned
+    verdict(s), stamped with the host dimension like the real per-host
+    probe does. One record serves every call; several serve in order
+    (one per card, in card order)."""
+    it = iter(records)
+
+    def probe(host, backend, policy, timeout_seconds, backends_file=None, remote_backends_file=None):
+        out = copy.deepcopy(records[0] if len(records) == 1 else next(it))
+        out["probe_host"] = host["name"]
+        out["probe_side"] = "executor"
+        return out
+
+    return probe
 
 
 class BatchHealthGateUnitTests(unittest.TestCase):
@@ -167,7 +201,7 @@ class BatchHealthGateTests(test_batch.FakeFleetFixture, unittest.TestCase):
 
     def test_no_health_gate_flag_also_off(self):
         (self.cards / "one.md").write_text("first card")
-        with mock.patch.object(fxs, "health_probe_backend",
+        with mock.patch.object(fxs, "fleet_probe_host_health",
                                side_effect=AssertionError("probe must not run")):
             rc, summary, _ = self.run_batch(no_health_gate=True)
         self.assertEqual(rc, 0)
@@ -177,7 +211,7 @@ class BatchHealthGateTests(test_batch.FakeFleetFixture, unittest.TestCase):
     def test_unhealthy_backend_blocks_card_without_exec(self):
         (self.cards / "one.md").write_text("first card")
         counter = self.launch_counter()
-        with mock.patch.object(fxs, "health_probe_backend", return_value=copy.deepcopy(UNHEALTHY)):
+        with mock.patch.object(fxs, "fleet_probe_host_health", side_effect=per_host_probe(UNHEALTHY)):
             rc, summary, _ = self.run_batch(health_gate=True, backend="codex")
         self.assertEqual(rc, 1)
         row = summary["cards"][0]
@@ -199,7 +233,7 @@ class BatchHealthGateTests(test_batch.FakeFleetFixture, unittest.TestCase):
         # args backend="codex" is user-explicit (spec backend_explicit=True):
         # the gate must still refuse it, not treat it as a free pass.
         (self.cards / "one.md").write_text("first card")
-        with mock.patch.object(fxs, "health_probe_backend", return_value=copy.deepcopy(UNHEALTHY)):
+        with mock.patch.object(fxs, "fleet_probe_host_health", side_effect=per_host_probe(UNHEALTHY)):
             rc, summary, _ = self.run_batch(health_gate=True, backend="codex")
         spec = json.loads((self.data / "batches" / summary["id"] / "spec.json").read_text())
         self.assertTrue(spec["backend_explicit"])
@@ -215,7 +249,7 @@ class BatchHealthGateTests(test_batch.FakeFleetFixture, unittest.TestCase):
         with mock.patch.object(fxs, "get_state", return_value=codex_state()), \
                 mock.patch.object(fxs, "route",
                                   return_value={"ok": True, "backend": "codex", "model": "cheap"}), \
-                mock.patch.object(fxs, "health_probe_backend", return_value=copy.deepcopy(UNHEALTHY)):
+                mock.patch.object(fxs, "fleet_probe_host_health", side_effect=per_host_probe(UNHEALTHY)):
             rc, summary, _ = self.run_batch(health_gate=True, backend=None)
         spec = json.loads((self.data / "batches" / summary["id"] / "spec.json").read_text())
         self.assertFalse(spec["backend_explicit"])
@@ -227,8 +261,8 @@ class BatchHealthGateTests(test_batch.FakeFleetFixture, unittest.TestCase):
         (self.cards / "one.md").write_text("first card")
         (self.cards / "two.md").write_text("second card")
         counter = self.launch_counter()
-        with mock.patch.object(fxs, "health_probe_backend",
-                               side_effect=[copy.deepcopy(UNHEALTHY), copy.deepcopy(HEALTHY)]):
+        with mock.patch.object(fxs, "fleet_probe_host_health",
+                               side_effect=per_host_probe(UNHEALTHY, HEALTHY)):
             rc, summary, _ = self.run_batch(health_gate=True, backend="codex")
         self.assertEqual(rc, 1)  # not all cards done
         self.assertEqual(summary["cards"][0]["status"], "blocked")
@@ -240,7 +274,7 @@ class BatchHealthGateTests(test_batch.FakeFleetFixture, unittest.TestCase):
     def test_healthy_backend_dispatches_and_records_gate(self):
         (self.cards / "one.md").write_text("first card")
         (self.cards / "two.md").write_text("second card")
-        with mock.patch.object(fxs, "health_probe_backend", return_value=copy.deepcopy(HEALTHY)):
+        with mock.patch.object(fxs, "fleet_probe_host_health", side_effect=per_host_probe(HEALTHY)):
             rc, summary, _ = self.run_batch(health_gate=True, backend="codex")
         self.assertEqual(rc, 0)
         for row in summary["cards"]:
@@ -253,7 +287,7 @@ class BatchHealthGateTests(test_batch.FakeFleetFixture, unittest.TestCase):
         # M24 run: with the gate off there is nothing to bypass and no
         # record); health_gate=True turns the gate on for this batch.
         (self.cards / "one.md").write_text("first card")
-        with mock.patch.object(fxs, "health_probe_backend",
+        with mock.patch.object(fxs, "fleet_probe_host_health",
                                side_effect=AssertionError("probe must not run")):
             rc, summary, _ = self.run_batch(health_gate=True, skip_health_gate=True, backend="codex")
         self.assertEqual(rc, 0)
@@ -265,7 +299,7 @@ class BatchHealthGateTests(test_batch.FakeFleetFixture, unittest.TestCase):
     def test_unknown_with_block_posture_blocks(self):
         (self.cards / "one.md").write_text("first card")
         cfg = {"enabled": True, "timeout_seconds": 10, "on_unknown": "block"}
-        with mock.patch.object(fxs, "health_probe_backend", return_value=copy.deepcopy(UNKNOWN)), \
+        with mock.patch.object(fxs, "fleet_probe_host_health", side_effect=per_host_probe(UNKNOWN)), \
                 mock.patch.object(fxs, "health_gate_config", return_value=cfg):
             rc, summary, _ = self.run_batch(health_gate=True, backend="codex")
         self.assertEqual(rc, 1)
@@ -275,7 +309,7 @@ class BatchHealthGateTests(test_batch.FakeFleetFixture, unittest.TestCase):
 
     def test_unknown_with_allow_posture_dispatches(self):
         (self.cards / "one.md").write_text("first card")
-        with mock.patch.object(fxs, "health_probe_backend", return_value=copy.deepcopy(UNKNOWN)):
+        with mock.patch.object(fxs, "fleet_probe_host_health", side_effect=per_host_probe(UNKNOWN)):
             rc, summary, _ = self.run_batch(health_gate=True, backend="codex")
         self.assertEqual(rc, 0)
         row = summary["cards"][0]
@@ -284,18 +318,16 @@ class BatchHealthGateTests(test_batch.FakeFleetFixture, unittest.TestCase):
         self.assertEqual(row["health_gate"]["action"], "allowed")
 
     def test_probe_timeout_bounds_and_unknown_verdict(self):
-        """Real probe, slow login: a 1s budget must stop new checks after
-        the deadline, record the timeout, and (on_unknown=block) refuse."""
+        """Executor-side probe hit its 1s budget (binary + login ran, then
+        the timeout check): the record is verdict unknown, and
+        (on_unknown=block) the card is refused. The probe's own deadline
+        mechanics are pinned in test_m24_slice1.py / test_m31_slice1.py;
+        this test pins the batch decision given that record."""
         (self.cards / "one.md").write_text("first card")
         counter = self.launch_counter()
 
-        def slow_login(binary, timeout):
-            time.sleep(1.2)
-            return xs._health_check("login", "pass", "live session", "command: codex login status")
-
         cfg = {"enabled": True, "timeout_seconds": 1, "on_unknown": "block"}
-        with mock.patch.object(fxs, "get_state", return_value=codex_state()), \
-                mock.patch.object(fxs, "_health_codex_login", side_effect=slow_login), \
+        with mock.patch.object(fxs, "fleet_probe_host_health", side_effect=per_host_probe(TIMEOUT)), \
                 mock.patch.object(fxs, "health_gate_config", return_value=cfg):
             rc, summary, _ = self.run_batch(health_gate=True, backend="codex")
         self.assertEqual(rc, 1)
@@ -312,7 +344,7 @@ class BatchHealthGateTests(test_batch.FakeFleetFixture, unittest.TestCase):
     def test_blocked_card_blocks_its_dependents(self):
         (self.cards / "one.md").write_text("first card")
         (self.cards / "two.md").write_text("second card\ndepends_on: one.md")
-        with mock.patch.object(fxs, "health_probe_backend", return_value=copy.deepcopy(UNHEALTHY)):
+        with mock.patch.object(fxs, "fleet_probe_host_health", side_effect=per_host_probe(UNHEALTHY)):
             rc, summary, _ = self.run_batch(health_gate=True, backend="codex")
         self.assertEqual(rc, 1)
         self.assertEqual(summary["cards"][0]["status"], "blocked")

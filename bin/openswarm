@@ -5674,12 +5674,19 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
 # Policy shape (policy.json, routing.health_gate):
 #   {"enabled": false, "timeout_seconds": 10, "on_unknown": "allow"}
 # Fleet exec forwarding (M25 slice 2, #204) gates a forwarded `run` on its
-# effective backend at the controller, via fleet_health_gate, before any
-# host exec attempt; the gate only runs in cmd_run's single-dispatch path
-# (initial pick + fallback re-route), in execute_batch's per-card dispatch
-# (M25 slice 1, #202, via batch_health_gate), and in cmd_fleet's exec
-# branch. The auto-rework escalation pick is not gated in this slice
-# (known gap, see README).
+# effective backend before any host exec attempt; the gate only runs in
+# cmd_run's single-dispatch path (initial pick + fallback re-route), in
+# execute_batch's per-card dispatch (M25 slice 1, #202, via
+# batch_health_gate), and in cmd_fleet's exec branch. The auto-rework
+# escalation pick is not gated in this slice (known gap, see README).
+# M31 slice 1 (#254): the fleet/batch probe runs on the executor host
+# (fleet_probe_host_health, via `openswarm health-probe` over the
+# transport for remote hosts, in-process for local hosts), and the gate
+# decides per host — a healthy remote host is no longer mis-blocked
+# because the controller lacks the backend/login, and an unhealthy one
+# is no longer waved through because the controller is healthy. The
+# single-run gate is unchanged: for `openswarm run` this host IS the
+# executor, so its verdict was already executor-side.
 
 HEALTH_GATE_DEFAULT_TIMEOUT_SECONDS = 10
 HEALTH_GATE_TIMEOUT_MIN_SECONDS = 1
@@ -6072,6 +6079,41 @@ def health_gate_error(record):
             f"in the ledger and result.json). The gate never reroutes to another backend.")
 
 
+def health_gate_bypass_record(backend, cfg, source, stage):
+    """The bypass record: --skip-health-gate probes nothing, and the
+    bypass itself is the record (M24, #198). Shared by the single-run,
+    fleet, and batch gates so the bypass looks the same everywhere."""
+    return {"enabled": True, "source": source, "stage": stage, "backend": backend,
+            "verdict": "bypassed", "action": "bypassed",
+            "reason": "health gate bypassed by explicit --skip-health-gate; no probe ran",
+            "checks": [], "seconds": 0, "timeout_seconds": cfg["timeout_seconds"],
+            "on_unknown": cfg["on_unknown"]}
+
+
+def health_gate_decide(record, cfg, source, stage):
+    """Apply the gate decision to an already-probed record. Returns
+    (record, blocked). This is the single decision path every gate
+    (single run, batch card, fleet exec) funnels through: `blocked` is
+    True only for unhealthy, or for unknown when on_unknown is "block".
+    An unknown verdict is never a silent allow or a silent block — the
+    posture is applied here and the reason says so on the record."""
+    record.update({"enabled": True, "source": source, "stage": stage,
+                   "on_unknown": cfg["on_unknown"]})
+    if record["verdict"] == "unhealthy":
+        record["action"] = "blocked"
+        return record, True
+    if record["verdict"] == "unknown" and cfg["on_unknown"] == "block":
+        record["action"] = "blocked"
+        record["reason"] = (f"health gate cannot judge {record['backend']!r} ({record['reason']}); "
+                            f"on_unknown=block refuses to dispatch")
+        return record, True
+    record["action"] = "allowed"
+    if record["verdict"] == "unknown":
+        record["reason"] = (f"health gate cannot judge {record['backend']!r} ({record['reason']}); "
+                            f"on_unknown=allow dispatches with the unknown verdict on the record")
+    return record, False
+
+
 def apply_health_gate(backend, st, policy, args, custom_backends=(), stage="initial"):
     """Decide whether `backend` may dispatch. Returns (record, blocked).
 
@@ -6081,6 +6123,8 @@ def apply_health_gate(backend, st, policy, args, custom_backends=(), stage="init
     action allowed/blocked/bypassed, the checks with evidence pointers,
     and the config source. `blocked` is True only for unhealthy, or for
     unknown when on_unknown is "block". A bypassed gate probes nothing.
+    The probe runs on this host: for a single `openswarm run` this host
+    IS the executor, so the verdict is already executor-side.
     """
     cfg = health_gate_config(policy)
     flag_on = bool(getattr(args, "health_gate", False))
@@ -6095,27 +6139,145 @@ def apply_health_gate(backend, st, policy, args, custom_backends=(), stage="init
     if not enabled:
         return None, False
     if flag_skip:
-        return {"enabled": True, "source": source, "stage": stage, "backend": backend,
-                "verdict": "bypassed", "action": "bypassed",
-                "reason": "health gate bypassed by explicit --skip-health-gate; no probe ran",
-                "checks": [], "seconds": 0, "timeout_seconds": cfg["timeout_seconds"],
-                "on_unknown": cfg["on_unknown"]}, False
+        return health_gate_bypass_record(backend, cfg, source, stage), False
     record = health_probe_backend(backend, st, policy, cfg["timeout_seconds"], custom_backends)
-    record.update({"enabled": True, "source": source, "stage": stage,
-                   "on_unknown": cfg["on_unknown"]})
-    if record["verdict"] == "unhealthy":
-        record["action"] = "blocked"
-        return record, True
-    if record["verdict"] == "unknown" and cfg["on_unknown"] == "block":
-        record["action"] = "blocked"
-        record["reason"] = (f"health gate cannot judge {backend!r} ({record['reason']}); "
-                            f"on_unknown=block refuses to dispatch")
-        return record, True
-    record["action"] = "allowed"
-    if record["verdict"] == "unknown":
-        record["reason"] = (f"health gate cannot judge {backend!r} ({record['reason']}); "
-                            f"on_unknown=allow dispatches with the unknown verdict on the record")
-    return record, False
+    return health_gate_decide(record, cfg, source, stage)
+
+
+def fleet_probe_host_health(host, backend, policy, timeout_seconds, backends_file=None,
+                            remote_backends_file=None):
+    """Probe one backend on one fleet host — on the executor host itself
+    (M31 slice 1, #254). Returns the health_probe_backend record stamped
+    with probe_host / probe_side="executor".
+
+    A local host is probed in-process (same state path the single-run
+    gate uses). A remote host runs `openswarm health-probe --backend …
+    --json` over its own transport, so the verdict reflects the executor
+    host's binaries / login / transport, never the controller's: a
+    healthy remote host is no longer mis-blocked because the controller
+    lacks the backend or the login, and an unhealthy one is no longer
+    waved through because the controller happens to be healthy.
+
+    A probe that cannot be read back is verdict "unknown", never a
+    silent allow: transport timeout (rc 124), a non-zero remote exit, or
+    unparseable output all land here with the transport failure on the
+    record, and the caller's on_unknown posture decides. `backends_file`
+    is the controller-local custom-backends file (used for a local host
+    only); `remote_backends_file` is a path valid ON the remote host
+    (the forwarded --backends-file of a `fleet exec`, which the remote
+    run reads itself) — without it the remote probe judges custom
+    backends against the remote host's own backends.json.
+    """
+    host_name = host["name"]
+    if host["kind"] == "local":
+        try:
+            st = get_state(policy)
+        except (RuntimeError, OSError, SystemExit):
+            st = {}
+        custom_backends = load_custom_backends(policy, explicit=backends_file)
+        record = health_probe_backend(backend, st, policy, timeout_seconds, custom_backends)
+        record["probe_host"] = host_name
+        record["probe_side"] = "executor"
+        return record
+    probe_cmd = ["health-probe", "--backend", backend,
+                 "--timeout-seconds", str(timeout_seconds), "--json"]
+    if remote_backends_file:
+        probe_cmd += ["--backends-file", remote_backends_file]
+    started = time.monotonic()
+    # Transport allowance on top of the probe budget: the SSH handshake
+    # and process start are not part of the probe's own timeout.
+    rc, out, err = host_run(host, host_openswarm(host, probe_cmd),
+                            timeout=max(1, timeout_seconds + 30))
+    seconds = round(time.monotonic() - started, 3)
+    if rc == 124:
+        return {"backend": backend, "verdict": "unknown",
+                "reason": f"health probe on host {host_name!r} timed out after "
+                          f"{timeout_seconds}s (transport rc=124); executor health unknown",
+                "checks": [_health_check("transport", "timeout",
+                                         f"health probe on host {host_name!r} timed out after "
+                                         f"{timeout_seconds}s; executor health unknown",
+                                         "fleet transport: openswarm health-probe")],
+                "seconds": seconds, "timeout_seconds": timeout_seconds,
+                "probe_host": host_name, "probe_side": "executor"}
+    if rc != 0:
+        detail = (err or out).decode(errors="replace").strip()[:200] or f"remote exit {rc}"
+        return {"backend": backend, "verdict": "unknown",
+                "reason": f"health probe on host {host_name!r} failed (rc={rc}): {detail}",
+                "checks": [_health_check("transport", "unknown",
+                                         f"health probe on host {host_name!r} failed (rc={rc}): {detail}",
+                                         "fleet transport: openswarm health-probe")],
+                "seconds": seconds, "timeout_seconds": timeout_seconds,
+                "probe_host": host_name, "probe_side": "executor"}
+    try:
+        record = json.loads(out)
+    except (ValueError, UnicodeError):
+        return {"backend": backend, "verdict": "unknown",
+                "reason": f"health probe on host {host_name!r} returned unparseable output; "
+                          f"executor health unknown",
+                "checks": [_health_check("transport", "unknown",
+                                         f"health probe on host {host_name!r} returned unparseable "
+                                         f"output ({out[:100]!r}); executor health unknown",
+                                         "fleet transport: openswarm health-probe")],
+                "seconds": seconds, "timeout_seconds": timeout_seconds,
+                "probe_host": host_name, "probe_side": "executor"}
+    if not isinstance(record, dict) or record.get("verdict") not in ("healthy", "unknown", "unhealthy"):
+        return {"backend": backend, "verdict": "unknown",
+                "reason": f"health probe on host {host_name!r} returned no usable verdict; "
+                          f"executor health unknown",
+                "checks": [_health_check("transport", "unknown",
+                                         f"health probe on host {host_name!r} returned no usable "
+                                         f"verdict ({str(record)[:100]}); executor health unknown",
+                                         "fleet transport: openswarm health-probe")],
+                "seconds": seconds, "timeout_seconds": timeout_seconds,
+                "probe_host": host_name, "probe_side": "executor"}
+    record["probe_host"] = host_name
+    record["probe_side"] = "executor"
+    return record
+
+
+def cmd_health_probe(args, policy):
+    """`openswarm health-probe --backend <b> [--json]` (M31 slice 1, #254).
+
+    Read-only executor-side probe: run health_probe_backend for one
+    backend on THIS host and print the record. This is the entry point
+    the fleet controller invokes over the transport (`fleet exec` /
+    batch / dispatch gate), so a remote host's verdict is measured
+    where the work would run. Exit 0 whenever the probe ran — even for
+    an unhealthy verdict, which is a successful probe with a verdict,
+    not a command failure; usage/config errors exit 2. Writes nothing:
+    no ledger entry, no state file beyond get_state's own refresh path
+    (the same read path `openswarm quota` uses).
+    """
+    timeout_seconds = args.timeout_seconds
+    if timeout_seconds < HEALTH_GATE_TIMEOUT_MIN_SECONDS or timeout_seconds > HEALTH_GATE_TIMEOUT_MAX_SECONDS:
+        print(f"openswarm: --timeout-seconds must be between {HEALTH_GATE_TIMEOUT_MIN_SECONDS} "
+              f"and {HEALTH_GATE_TIMEOUT_MAX_SECONDS}, got {timeout_seconds!r}", file=sys.stderr)
+        sys.exit(2)
+    try:
+        st = get_state(policy)
+    except (RuntimeError, OSError, SystemExit):
+        # get_state exits when a fixed OPENSWARM_STATE_FILE is unreadable;
+        # a probe degrades to an empty state (verdict unknown, per the
+        # gate's on_unknown posture) instead of dying without a record —
+        # the fleet controller turns any non-JSON reply into unknown
+        # anyway, but a real record names the failing check.
+        st = {}
+    try:
+        custom_backends = load_custom_backends(policy, explicit=args.backends_file)
+    except (CustomBackendConfigError, ValueError) as error:
+        print(f"openswarm: {error}", file=sys.stderr)
+        sys.exit(2)
+    record = health_probe_backend(args.backend, st, policy, timeout_seconds, custom_backends)
+    record["probe_host"] = "local"
+    record["probe_side"] = "executor"
+    if getattr(args, "json", False):
+        print(json.dumps(record, indent=2, ensure_ascii=False))
+        return
+    print(f"health probe: backend {args.backend!r} is {record['verdict']} "
+          f"({record['seconds']}s, timeout {timeout_seconds}s)")
+    for check in record["checks"]:
+        print(f"  {check['name']}: {check['status']} — {check['detail']} (evidence: {check['evidence']})")
+    print(f"reason: {record['reason']}")
 
 
 def cmd_quota(args, policy, custom_backends=None):
@@ -13032,9 +13194,10 @@ def cmd_fleet(args, policy=None):
             # blocked/health-gate, exit 2 like the quota refusal above.
             # When the gate is off (shipped default) fleet_health_gate
             # returns (None, False) without reading probe state, so
-            # forwarding stays byte-identical. The probe reads the
-            # controller's state; the remote run's own M24 gate is the
-            # executor-side check. The gate flags are NOT forwarded to
+            # forwarding stays byte-identical. M31 slice 1 (#254):
+            # the probe runs on the target host (executor-side), so a
+            # healthy remote host is no longer mis-blocked by the
+            # controller's state. The gate flags are NOT forwarded to
             # the remote run. A dry run is gated like a single run (M24
             # shows the gate decision on dry runs too): a blocked dry run
             # is refused and recorded, an allowed dry run dispatches
@@ -13044,7 +13207,8 @@ def cmd_fleet(args, policy=None):
             else:
                 eff_backend, eff_model = parsed.backend, parsed.model
             gate_record, gate_blocked = fleet_health_gate(
-                args, policy, eff_backend, backends_file=parsed.backends_file)
+                args, policy, eff_backend, backends_file=parsed.backends_file, host=host,
+                remote_backends_file=parsed.backends_file)
             if gate_record is not None and (gate_blocked or not parsed.dry_run):
                 gate_entry_id = f"fleet-{host['name']}-{uuid.uuid4().hex[:8]}"
                 fleet_record_health_gate(host["name"], gate_entry_id, eff_backend, eff_model,
@@ -14718,50 +14882,59 @@ def batch_record_blocked(summary, row, dep, reason):
               file=sys.stderr)
 
 
-def batch_health_gate(spec, policy, backend):
+def batch_health_gate(spec, policy, backend, host=None):
     """(record, blocked) for one batch card's effective backend (M25 slice 1, #202).
 
-    Reuses apply_health_gate() — the same decision path single `openswarm run`
-    uses (M24, #198) — on the per-card effective backend (after weighted +
-    quota routing, so an explicit --backend is gated exactly like a routed
-    pick). Returns (None, False) when the gate is off: probe state is never
-    read, so a gated-off batch dispatches byte-identically to before. Also
-    (None, False) when no backend is selected yet (backend None): the remote
-    run's own M24 gate judges the pick it actually routes to.
+    Reuses the same decision path single `openswarm run` uses (M24, #198)
+    — health_gate_decide() — on the per-card effective backend (after
+    weighted + quota routing, so an explicit --backend is gated exactly
+    like a routed pick). Returns (None, False) when the gate is off:
+    probe state is never read, so a gated-off batch dispatches
+    byte-identically to before. Also (None, False) when no backend is
+    selected yet (backend None): the remote run's own M24 gate judges
+    the pick it actually routes to.
 
-    The probe reads the controller's probe state (get_state), the same state
-    batch_weighted_route already routes on — so for a card dispatched to a
-    remote host the verdict reflects the controller host, not the executor
-    host; the remote run's own gate is the executor-side check. A probe-state
-    read failure degrades to an empty state (verdict unknown, per the
-    configured on_unknown posture) instead of stranding the card; an invalid
-    health_gate config fails loudly like a single run. The gate flags live on
-    the batch spec, so a resumed or detached batch gates exactly like the
-    batch that created it.
+    M31 slice 1 (#254): when `host` is given, the probe runs on that
+    host (fleet_probe_host_health — executor-side), so a card bound for
+    a healthy remote host is no longer mis-blocked by the controller's
+    state; without a host the controller-state probe is kept as the
+    fallback. A probe-state read failure degrades to an empty state
+    (verdict unknown, per the configured on_unknown posture) instead of
+    stranding the card; an invalid health_gate config fails loudly like
+    a single run. The gate flags live on the batch spec, so a resumed
+    or detached batch gates exactly like the batch that created it. A
+    remote probe judges custom backends against the executor host's own
+    backends.json (the spec's controller-local backends file is not
+    valid on the remote host); a local host uses the spec's file.
     """
     # Flag precedence mirrors apply_health_gate (M24): --health-gate wins
     # over --no-health-gate when both are passed; --no-health-gate wins
     # over the policy default.
     if spec.get("health_gate"):
-        enabled = True
+        enabled, source = True, "flag --health-gate"
     elif spec.get("no_health_gate"):
         return None, False
     else:
         raw = (policy.get("routing") or {}).get("health_gate") or {}
-        enabled = isinstance(raw, dict) and bool(raw.get("enabled"))
+        enabled, source = isinstance(raw, dict) and bool(raw.get("enabled")), "policy routing.health_gate"
     if not enabled:
         return None, False
     if backend is None:
         return None, False
-    args = argparse.Namespace(health_gate=bool(spec.get("health_gate")),
-                              no_health_gate=False,
-                              skip_health_gate=bool(spec.get("skip_health_gate")))
+    cfg = health_gate_config(policy)
+    if spec.get("skip_health_gate"):
+        return health_gate_bypass_record(backend, cfg, source, "batch"), False
+    if host is not None:
+        record = fleet_probe_host_health(host, backend, policy, cfg["timeout_seconds"],
+                                         backends_file=spec.get("backends_file"))
+        return health_gate_decide(record, cfg, source, "batch")
     try:
         st = get_state(policy)
-    except (RuntimeError, OSError):
+    except (RuntimeError, OSError, SystemExit):
         st = {}
     custom_backends = load_custom_backends(policy, explicit=spec.get("backends_file"))
-    return apply_health_gate(backend, st, policy, args, custom_backends=custom_backends, stage="batch")
+    record = health_probe_backend(backend, st, policy, cfg["timeout_seconds"], custom_backends)
+    return health_gate_decide(record, cfg, source, "batch")
 
 
 def batch_record_health_gate_blocked(summary, row, record):
@@ -14778,6 +14951,7 @@ def batch_record_health_gate_blocked(summary, row, record):
         append_ledger({"id": f"batch-{summary['id']}-{row['card']}", "ts": NOW(),
                        "title": f"batch {row['card']} blocked by health gate",
                        "status": "blocked", "batch_id": summary["id"], "card": row["card"],
+                       "host": row.get("host"),
                        "blocked_by": "health-gate", "blocked_reason": record["reason"],
                        "health_gate": record, "scope": summary.get("scope")})
     except OSError as error:
@@ -14803,30 +14977,37 @@ def batch_block_row_health_gate(summary, row, record):
     return record
 
 
-def fleet_health_gate(args, policy, backend, backends_file=None):
+def fleet_health_gate(args, policy, backend, backends_file=None, host=None,
+                      remote_backends_file=None):
     """(record, blocked) for one `fleet exec` run's effective backend (M25 slice 2, #204).
 
-    Reuses apply_health_gate() — the same decision path single `openswarm run`
-    uses (M24, #198) and batch cards use (M25 slice 1, #202) — on the
-    effective backend: the weighted/quota-routed pick when routing chose
-    one, else the forwarded explicit --backend. Returns (None, False)
-    when the gate is off: probe state is never read, and the custom
-    backends file is never loaded, so a gated-off fleet exec forwards
-    byte-identically to before. Also (None, False) when no backend is
-    selected yet (backend None): the remote run's own M24 gate judges the
-    pick it actually routes to.
+    Reuses the same decision path single `openswarm run` uses (M24,
+    #198) and batch cards use (M25 slice 1, #202) — health_gate_decide()
+    — on the effective backend: the weighted/quota-routed pick when
+    routing chose one, else the forwarded explicit --backend. Returns
+    (None, False) when the gate is off: probe state is never read, and
+    the custom backends file is never loaded, so a gated-off fleet exec
+    forwards byte-identically to before. Also (None, False) when no
+    backend is selected yet (backend None): the remote run's own M24
+    gate judges the pick it actually routes to.
 
-    The probe reads the controller's probe state (get_state), the same
-    state fleet_weighted_route already routes on — so for a run forwarded
-    to a remote host the verdict reflects the controller host, not the
-    executor host; the remote run's own gate is the executor-side check.
-    A probe-state read failure degrades to an empty state (verdict
-    unknown, per the configured on_unknown posture) instead of stranding
-    the dispatch; an invalid health_gate config fails loudly like a single
-    run. The gate flags live on the fleet exec invocation (before the
-    host, like --timeout) and are NOT forwarded to the remote run: forcing
-    them on there would override the executor host's own policy with the
-    controller's choice.
+    M31 slice 1 (#254): when `host` is given, the probe runs on that
+    host (fleet_probe_host_health — executor-side, via `openswarm
+    health-probe` over the transport for a remote host), so the verdict
+    reflects the executor host, not the controller; without a host the
+    controller-state probe is kept as the fallback. A probe-state read
+    failure degrades to an empty state (verdict unknown, per the
+    configured on_unknown posture) instead of stranding the dispatch; a
+    probe that cannot be read back from a remote host is likewise
+    verdict unknown, never a silent allow; an invalid health_gate
+    config fails loudly like a single run. The gate flags live on the
+    fleet exec invocation (before the host, like --timeout) and are NOT
+    forwarded to the remote run: forcing them on there would override
+    the executor host's own policy with the controller's choice.
+    `remote_backends_file` is a path valid ON the remote host (the
+    forwarded --backends-file, which the remote run reads itself); the
+    remote probe uses it for custom backends, else the remote host's
+    own backends.json.
     """
     if backend is None:
         return None, False
@@ -14836,20 +15017,29 @@ def fleet_health_gate(args, policy, backend, backends_file=None):
     # config (no validation), so an invalid config is ignored while the
     # gate is off, exactly like batch_health_gate.
     if getattr(args, "health_gate", False):
-        enabled = True
+        enabled, source = True, "flag --health-gate"
     elif getattr(args, "no_health_gate", False):
         return None, False
     else:
         raw = (policy.get("routing") or {}).get("health_gate") or {}
-        enabled = isinstance(raw, dict) and bool(raw.get("enabled"))
+        enabled, source = isinstance(raw, dict) and bool(raw.get("enabled")), "policy routing.health_gate"
     if not enabled:
         return None, False
+    cfg = health_gate_config(policy)
+    if getattr(args, "skip_health_gate", False):
+        return health_gate_bypass_record(backend, cfg, source, "fleet"), False
+    if host is not None:
+        record = fleet_probe_host_health(host, backend, policy, cfg["timeout_seconds"],
+                                         backends_file=backends_file,
+                                         remote_backends_file=remote_backends_file)
+        return health_gate_decide(record, cfg, source, "fleet")
     try:
         st = get_state(policy)
-    except (RuntimeError, OSError):
+    except (RuntimeError, OSError, SystemExit):
         st = {}
     custom_backends = load_custom_backends(policy, explicit=backends_file)
-    return apply_health_gate(backend, st, policy, args, custom_backends=custom_backends, stage="fleet")
+    record = health_probe_backend(backend, st, policy, cfg["timeout_seconds"], custom_backends)
+    return health_gate_decide(record, cfg, source, "fleet")
 
 
 def fleet_record_health_gate(host, entry_id, backend, model, card_type, scope, record, blocked,
@@ -14878,7 +15068,12 @@ def fleet_record_health_gate(host, entry_id, backend, model, card_type, scope, r
                  "status": "blocked" if blocked else "dispatched", "host": host,
                  "backend": backend, "model": model,
                  "card_type": card_type, "scope": scope,
-                 "fleet_health_gate": True, "health_gate": record, "seconds": None}
+                 "fleet_health_gate": True, "health_gate": record, "seconds": None,
+                 # M31 slice 1 (#254): the host dimension of the
+                 # verdict — which host was probed, and that the probe
+                 # ran on the executor side, not the controller.
+                 "probe_host": record.get("probe_host", host),
+                 "probe_side": record.get("probe_side", "controller")}
         if blocked:
             entry.update({"blocked_by": "health-gate", "blocked_reason": record["reason"],
                           "error_class": "health_gate_blocked",
@@ -15186,13 +15381,15 @@ def execute_batch(spec, summary):
                     # unaffected. When the gate is off (shipped
                     # default) batch_health_gate returns (None, False)
                     # without reading probe state, so dispatch stays
-                    # byte-identical. The probe reads the controller's
-                    # state; the remote run's own M24 gate is the
-                    # executor-side check. The gate flags are NOT
-                    # forwarded to the remote run: forcing them on
-                    # there would override the executor host's own
-                    # policy with the controller's choice.
-                    gate_record, gate_blocked = batch_health_gate(spec, policy, eff_backend)
+                    # byte-identical. M31 slice 1 (#254): the probe
+                    # runs on the card's host (executor-side), so a
+                    # card bound for a healthy remote host is no longer
+                    # mis-blocked by the controller's state. The gate
+                    # flags are NOT forwarded to the remote run:
+                    # forcing them on there would override the executor
+                    # host's own policy with the controller's choice.
+                    gate_record, gate_blocked = batch_health_gate(
+                        spec, policy, eff_backend, host=spec["hosts"][row["host"]])
                     if gate_record is not None:
                         row["health_gate"] = gate_record
                         if gate_blocked:
@@ -19566,6 +19763,7 @@ def fleet_block_row_health_gate(summary, row, record):
         append_ledger({"id": f"fleet-{summary['id']}-{row['card']}", "ts": NOW(),
                        "title": f"fleet {row['card']} blocked by health gate",
                        "status": "blocked", "fleet_id": summary["id"], "card": row["card"],
+                       "host": row.get("host"),
                        "blocked_by": "health-gate", "blocked_reason": record["reason"],
                        "health_gate": record, "scope": summary.get("scope")})
     except OSError as error:
@@ -19657,8 +19855,11 @@ def run_openswarm_fleet(ticket, trigger, decision, policy, data_dir, cards_dir, 
         host = assignments[0][1]
         row["host"] = host["name"]
         row["runner"] = host["name"]
+        # M31 slice 1 (#254): probe the picked runner (executor-side);
+        # cfg["backends_file"] is controller-local, so the remote probe
+        # judges custom backends against the runner's own backends.json.
         record, blocked = fleet_health_gate(gate_args, swrm_policy, backend,
-                                            cfg["backends_file"])
+                                            cfg["backends_file"], host=host)
         if blocked:
             fleet_block_row_health_gate(summary, row, record)
             continue
@@ -21548,6 +21749,13 @@ def main():
     sp = sub.add_parser("quota", help="read-only probe: remaining quota per backend (M17, #169)")
     sp.add_argument("--backends-file", help="custom backends config (JSON); defaults to $OPENSWARM_HOME/backends.json")
     sp.add_argument("--json", action="store_true", help="print the probe as JSON")
+    sp = sub.add_parser("health-probe", help="read-only probe: backend health verdict for this host (M31, #254); "
+                                             "the entry point the fleet controller runs on the executor host")
+    sp.add_argument("--backend", required=True, help="backend to probe (e.g. codex, pi, echo)")
+    sp.add_argument("--timeout-seconds", type=float, default=HEALTH_GATE_DEFAULT_TIMEOUT_SECONDS,
+                    help="probe budget in seconds (default 10, 1..120)")
+    sp.add_argument("--backends-file", help="custom backends config (JSON); defaults to $OPENSWARM_HOME/backends.json")
+    sp.add_argument("--json", action="store_true", help="print the probe record as JSON")
     quota_sub = sp.add_subparsers(dest="quota_cmd")
     sq = quota_sub.add_parser("sync", help="pull latest codex rate_limits from gocc (read-only SSH) "
                                "into the local probe cache (M23, #193)")
@@ -22014,6 +22222,8 @@ def main():
             sys.exit(2)
     elif a.cmd == "report":
         cmd_report(a, policy)
+    elif a.cmd == "health-probe":
+        cmd_health_probe(a, policy)
     elif a.cmd == "quota":
         try:
             if getattr(a, "quota_cmd", None) == "sync":
