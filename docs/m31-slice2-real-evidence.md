@@ -91,7 +91,7 @@ status partial、28.848s。
 已随不翻转裁定回滚）：
 
 - `Ran 1345 tests in 461.736s`，`FAILED (failures=55, errors=9, skipped=6)`。
-- 失败清单（64 项，全文见 `~/workspace/github-maturity/bench-env/m31s2-fullsuite.log`）：
+- 失败清单（64 项，全文见 `~/workspace/github-maturity/bench-env/m31s2-fullsuite-flip-on.log`）：
   `test_adaptive_margin`、`test_agy`（3）、`test_calibration_gate`、
   `test_fleet`、`test_fleet_verify_evalid`、`test_guardrails`、
   `test_batch`（3）、`test_host_scope`（3）、`test_m25_slice1`（2）、
