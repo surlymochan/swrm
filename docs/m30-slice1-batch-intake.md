@@ -9,9 +9,11 @@ fleet + real-run evidence + acceptance.
 `policy.dispatch.mode` selects the dispatch path for an accepted
 Mandate. `"run"` (default, shipped) keeps today's single
 `openswarm run`; `"batch"` routes the Mandate through
-`intake_dispatch_batch` instead. `"fleet"` is refused by policy
-validation until slice 2 lands, so a typo cannot silently select an
-unimplemented path. No new subcommand: `intake poll` picks the mode up
+`intake_dispatch_batch` instead. `"fleet"` (M30 slice 2, #251)
+routes it through `intake_dispatch_fleet`: the same cards,
+dispatched in topo order across the fleet runners via
+`fleet_dispatch_once`, each card health-gated before any exec
+attempt. No new subcommand: `intake poll` picks the mode up
 from the policy file, and `intake policy` prints it.
 
 Card generation (`intake_batch_cards`) is deterministic and
@@ -48,7 +50,8 @@ active-scope shadow (non-allowlist stays shadow), per-thread caps,
 and the M24/M25 health-gate pre-check all run before any Assignment
 exists. A missing batch runner means Ticket only, exactly like a
 missing single-run runner. Batch dispatches do not post to the Channel
-yet (slice 2): the batch summary is the record.
+(slice 2 adds the completion post for fleet only; batch keeps the
+slice-1 behaviour): the batch summary is the record.
 
 ## Ledger record
 

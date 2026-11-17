@@ -189,11 +189,11 @@ class DispatchModeTests(M30Slice1Base):
         xs.validate_intake_policy(policy)
         self.assertEqual(xs.intake_dispatch_config(policy)["mode"], "batch")
 
-    def test_fleet_mode_refused_until_slice_2(self):
+    def test_fleet_mode_validates_slice_2(self):
         policy = xs.default_intake_policy()
         policy["dispatch"] = {"mode": "fleet"}
-        with self.assertRaises(ValueError):
-            xs.validate_intake_policy(policy)
+        xs.validate_intake_policy(policy)
+        self.assertEqual(xs.intake_dispatch_config(policy)["mode"], "fleet")
 
     def test_bad_mode_refused(self):
         for bad in ("Fleet", "BATCH", "", 3, None, ["batch"]):

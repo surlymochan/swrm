@@ -17164,7 +17164,7 @@ INTAKE_POLICY_VERSION = 1
 INTAKE_DECISIONS = ("accept", "stop", "ignore", "unavailable")
 INTAKE_STRENGTHS = ("explicit", "inferred")
 INTAKE_ACCEPT_MODES = ("off", "shadow", "on", "active")
-INTAKE_DISPATCH_MODES = ("run", "batch")
+INTAKE_DISPATCH_MODES = ("run", "batch", "fleet")
 INTAKE_TICKET_STATES = ("open", "ended")
 INTAKE_ASSIGNMENT_STATES = ("pending", "running", "ended")
 
@@ -17294,11 +17294,12 @@ def validate_intake_policy(policy):
             value = dispatch.get(key)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f"intake policy dispatch.{key} must be a non-empty string or null")
-        # M30 slice 1 (#247): dispatch mode. "run" is the shipped
-        # default (one `openswarm run` per Mandate); "batch" routes an
-        # accepted Mandate through the batch path instead. "fleet"
-        # arrives with slice 2 and is refused until then, so a typo
-        # cannot silently select an unimplemented path.
+        # M30 slice 1 (#247) / slice 2 (#251): dispatch mode. "run"
+        # is the shipped default (one `openswarm run` per Mandate);
+        # "batch" routes an accepted Mandate through the batch path;
+        # "fleet" routes it through the fleet path (slice 2). A value
+        # outside this tuple is refused, so a typo cannot silently
+        # select an unimplemented path.
         mode = dispatch.get("mode", "run")
         if mode not in INTAKE_DISPATCH_MODES:
             raise ValueError(f"intake policy dispatch.mode must be one of "
@@ -18049,7 +18050,7 @@ def intake_try_resume(trigger, gate, policy, state, data_dir=None, now=None):
 def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
                           assess=True, model_command=None, assess_timeout=120,
                           dispatch_runner=None, channel_poster=None,
-                          dispatch_cwd=None, batch_runner=None):
+                          dispatch_cwd=None, batch_runner=None, fleet_runner=None):
     """Ingest one Trigger end to end: dedup -> Gate -> Subscription
     resume (slice 3: a human follow-up on an ended Ticket's thread
     resumes it under its Mandate, no new Eval) -> Assessment -> Decision
@@ -18075,7 +18076,11 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
     policy.dispatch.mode "batch" (M30 slice 1, #247) the dispatch goes
     through intake_dispatch_batch instead of intake_dispatch: the
     Mandate becomes batch cards, dispatched in M4 topo order through
-    execute_batch. In active mode (M28 slice 1, #232) three further gates apply before any
+    execute_batch. With mode "fleet" (M30 slice 2, #251) it goes
+    through intake_dispatch_fleet: the same cards, dispatched in topo
+    order across the fleet runners via fleet_dispatch_once, one card
+    per runner pick, each card health-gated (M25 slice 2) before any
+    exec attempt. In active mode (M28 slice 1, #232) three further gates apply before any
     Assignment exists: the Trigger must be inside the allowlisted scope
     (active_scope repos + authorized accounts; outside stays shadow with
     a ledger trace) and inside the per-thread caps, and the M24/M25
@@ -18086,7 +18091,9 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
     once at the end) so a dispatch that saves state mid-flight cannot
     have its Assignment clobbered by a stale in-memory copy. Batch
     dispatches do not post to the Channel yet (slice 2): the batch
-    summary is the record, and the result notes that instead."""
+    summary is the record, and the result notes that instead. Fleet
+    dispatches post to the Channel like single runs (fleet id + per-card
+    run ids in the body); batch keeps the slice-1 behaviour."""
     trigger = normalize_trigger(raw_trigger)
     if policy is None:
         policy, _source = load_intake_policy(data_dir=data_dir)
@@ -18218,13 +18225,15 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
                 result["dispatch_note"] = (f"active mode: outside allowlisted scope "
                                            f"({scope_reason}); Ticket only, no dispatch (shadow)")
                 return result
-        # M30 slice 1 (#247): the dispatch runner depends on the mode
-        # -- "run" takes dispatch_runner, "batch" takes batch_runner.
-        # A missing runner for the configured mode means Ticket only,
-        # exactly like a missing single-run runner today.
+        # M30 slice 1 (#247) / slice 2 (#251): the dispatch runner
+        # depends on the mode -- "run" takes dispatch_runner, "batch"
+        # takes batch_runner, "fleet" takes fleet_runner. A missing
+        # runner for the configured mode means Ticket only, exactly
+        # like a missing single-run runner today.
         dispatch_cfg = intake_dispatch_config(policy)
         mode = dispatch_cfg["mode"]
-        runner = dispatch_runner if mode == "run" else batch_runner
+        runner = {"run": dispatch_runner, "batch": batch_runner,
+                  "fleet": fleet_runner}[mode]
         dispatchable = (decision["accept_mode"] in ("on", "active")
                         and not decision["draft_only"]
                         and runner is not None)
@@ -18276,6 +18285,13 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
                 result["dispatched"] = True
                 result["dispatch"] = dispatch
                 result["dispatch_mode"] = "batch"
+            elif mode == "fleet":
+                dispatch = intake_dispatch_fleet(ticket, trigger, decision, policy=policy,
+                                                 data_dir=data_dir, fleet_runner=fleet_runner,
+                                                 cwd=dispatch_cwd)
+                result["dispatched"] = True
+                result["dispatch"] = dispatch
+                result["dispatch_mode"] = "fleet"
             else:
                 dispatch = intake_dispatch(ticket, trigger, decision, policy=policy,
                                            data_dir=data_dir, dispatch_runner=dispatch_runner,
@@ -18284,9 +18300,10 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
                 result["dispatch"] = dispatch
                 result["dispatch_mode"] = "run"
         except ValueError as error:
-            # intake_dispatch / intake_dispatch_batch already ended the
-            # Assignment and wrote the dispatch_failed ledger entry;
-            # record the outcome here only.
+            # intake_dispatch / intake_dispatch_batch /
+            # intake_dispatch_fleet already ended the Assignment and
+            # wrote the dispatch_failed ledger entry; record the outcome
+            # here only.
             result["dispatch_error"] = str(error)[:500]
             result["dispatch_note"] = f"dispatch failed: {error}"
             return result
@@ -18307,12 +18324,14 @@ def intake_ingest_trigger(raw_trigger, policy=None, data_dir=None, now=None,
                 append_intake_ledger({"kind": "channel_posted", "trigger_id": trigger["id"],
                                       "ticket_id": ticket["id"],
                                       "run_id": dispatch["run_id"],
+                                      "fleet_id": dispatch.get("fleet_id"),
                                       "comment_id": comment.get("id"),
                                       "url": comment.get("html_url")}, data_dir)
             except ValueError as error:
                 append_intake_ledger({"kind": "channel_failed", "trigger_id": trigger["id"],
                                       "ticket_id": ticket["id"],
                                       "run_id": dispatch["run_id"],
+                                      "fleet_id": dispatch.get("fleet_id"),
                                       "error": str(error)[:500]}, data_dir)
                 result["channel_error"] = str(error)[:500]
         return result
@@ -19349,6 +19368,341 @@ def run_openswarm_batch(ticket, trigger, decision, policy, data_dir, cards_dir, 
             "summary": summary, "exit_code": rc}
 
 
+# ---------------------------------------------------------------- intake M30 slice 2 (#251): fleet path
+#
+# An accepted Mandate can be dispatched across the fleet when
+# policy.dispatch.mode is "fleet" (explicit opt-in; shipped default
+# stays "run"). Card generation is shared with the batch path
+# (intake_batch_cards): a checklist becomes one card per item chained
+# in M4 topo order, a body without a checklist becomes a single card.
+# The fleet runner dispatches the cards in topo order, one card at a
+# time, through fleet_dispatch_once -- the same core `fleet dispatch`
+# and `fleet dispatch-many` use -- so a card lands on the
+# least-loaded eligible runner (fleet_dispatch_many_plan), a failed
+# or blocked card blocks its M4 dependents, and a successor stacks on
+# its dependency's commit (batch_stack_base) exactly like a batch
+# card. Each card is health-gated (fleet_health_gate, M25 slice 2)
+# on its effective backend before any exec attempt; an explicitly
+# configured dispatch backend is gated exactly like a routed pick,
+# never exempt. A card no runner can take (backend not offered, no
+# repo mapping, unreachable, or every runner at capacity) is recorded
+# blocked with the per-runner reasons, never queued silently or run
+# locally. Idempotency mirrors intake_dispatch_batch: one Ticket
+# dispatches to fleet at most once.
+
+def intake_fleet_card_outcomes(summary):
+    """Per-card outcome rows from a fleet summary (or [] when the runner
+    returned no summary). Pure: the intake ledger mirrors these rows
+    verbatim, so a blocked card's record is checkable without opening
+    the fleet summary. A blocked card carries its blocked reason and
+    (when the M25 gate blocked it) the health_gate record; run_id stays
+    None for a card that was never dispatched."""
+    if not isinstance(summary, dict):
+        return []
+    outcomes = []
+    for row in summary.get("cards") or []:
+        outcomes.append({
+            "card": row.get("card"),
+            "runner": row.get("runner"),
+            "status": row.get("status"),
+            "blocked": row.get("status") == "blocked",
+            "health_gate": row.get("health_gate"),
+            "reason": (row.get("blocked_reason") or row.get("summary") or ""),
+            "run_id": row.get("run_id"),
+        })
+    return outcomes
+
+
+def intake_dispatch_fleet(ticket, trigger, decision, policy=None, data_dir=None,
+                          fleet_runner=None, cwd=None):
+    """Create an Assignment for an accepted Ticket and dispatch it as a
+    fleet. Mirrors intake_dispatch_batch: one Ticket dispatches at most
+    once (a second call raises before creating anything); the Assignment
+    moves pending -> running -> ended and a runner failure still ends
+    it with the reason. Cards are generated from the Mandate and written
+    under <OPENSWARM_HOME>/intake-fleets/<ticket_id>/cards/ before the
+    runner starts, so the card set is on disk even if the runner fails.
+    Returns {assignment, fleet_id, run_id, status, summary} on success;
+    run_id is the first dispatched card's remote run id (None when no
+    card was dispatched); raises ValueError on runner failure (the
+    caller records it as fleet_dispatch_failed). fleet_runner replaces
+    the default runner (tests inject a fake); it receives (ticket,
+    trigger, decision, policy, data_dir, cards_dir, cwd) and returns
+    {fleet_id, status, summary?}."""
+    policy = policy or default_intake_policy()
+    cfg = intake_dispatch_config(policy)
+    if cfg["mode"] != "fleet":
+        raise ValueError(f"intake fleet dispatch requires dispatch.mode=fleet, "
+                         f"got {cfg['mode']!r}")
+    executor = "fleet"
+    state = load_intake_state(data_dir)
+    if any(a.get("ticket_id") == ticket["id"] for a in state.get("assignments") or []):
+        raise ValueError(f"ticket {ticket['id']} already has an assignment; "
+                         "refusing a second dispatch")
+    base_dir = os.path.dirname(intake_paths(data_dir)["state"])
+    cards_dir = os.path.join(base_dir, "intake-fleets", safe_id(ticket["id"]), "cards")
+    assignment = new_intake_assignment(ticket, executor,
+                                       budget_minutes=cfg["budget_minutes"])
+    state["assignments"].append(assignment)
+    save_intake_state(state, data_dir)
+    append_intake_ledger({"kind": "assignment_created", "trigger_id": trigger["id"],
+                          "ticket_id": ticket["id"], "assignment_id": assignment["id"],
+                          "executor": executor,
+                          "budget_minutes": cfg["budget_minutes"]}, data_dir)
+    running = transition_intake_assignment(assignment, "running",
+                                           reason="dispatching as fleet")
+    state["assignments"] = [running if a["id"] == assignment["id"] else a
+                            for a in state["assignments"]]
+    save_intake_state(state, data_dir)
+
+    def _fail(error):
+        state = load_intake_state(data_dir)
+        failed = transition_intake_assignment(
+            next(a for a in state["assignments"] if a["id"] == assignment["id"]),
+            "ended", reason=f"fleet dispatch failed: {error}")
+        state["assignments"] = [failed if a["id"] == assignment["id"] else a
+                                for a in state["assignments"]]
+        save_intake_state(state, data_dir)
+        append_intake_ledger({"kind": "fleet_dispatch_failed", "trigger_id": trigger["id"],
+                              "ticket_id": ticket["id"], "assignment_id": assignment["id"],
+                              "error": str(error)[:500]}, data_dir)
+
+    try:
+        cards = intake_write_batch_cards(ticket, trigger, cards_dir)
+        plan = batch_plan(cards_dir)
+    except ValueError as error:
+        _fail(error)
+        raise
+    append_intake_ledger({"kind": "intake_fleet_created", "trigger_id": trigger["id"],
+                          "ticket_id": ticket["id"], "assignment_id": assignment["id"],
+                          "cards": [c["name"] for c in cards],
+                          "order": plan["order"], "cards_dir": cards_dir}, data_dir)
+    append_intake_ledger({"kind": "fleet_dispatch_started", "trigger_id": trigger["id"],
+                          "ticket_id": ticket["id"], "assignment_id": assignment["id"],
+                          "executor": executor,
+                          "budget_minutes": cfg["budget_minutes"],
+                          "cards": [c["name"] for c in cards]}, data_dir)
+    runner = fleet_runner or run_openswarm_fleet
+    try:
+        outcome = runner(ticket, trigger, decision, policy, data_dir, cards_dir, cwd)
+        if not isinstance(outcome, dict) or not outcome.get("fleet_id"):
+            raise ValueError(f"fleet runner returned no fleet_id: {str(outcome)[:200]}")
+    except ValueError as error:
+        _fail(error)
+        raise
+    ended = transition_intake_assignment(running, "ended",
+                                         reason=f"fleet {outcome['fleet_id']}: {outcome.get('status')}")
+    state = load_intake_state(data_dir)
+    state["assignments"] = [ended if a["id"] == assignment["id"] else a
+                            for a in state["assignments"]]
+    save_intake_state(state, data_dir)
+    append_intake_ledger({"kind": "fleet_dispatch_finished", "trigger_id": trigger["id"],
+                          "ticket_id": ticket["id"], "assignment_id": assignment["id"],
+                          "fleet_id": outcome["fleet_id"], "status": outcome.get("status")},
+                         data_dir)
+    summary = outcome.get("summary")
+    rows = intake_fleet_card_outcomes(summary)
+    for row in rows:
+        append_intake_ledger({"kind": "intake_fleet_card_result", "trigger_id": trigger["id"],
+                              "ticket_id": ticket["id"], "fleet_id": outcome["fleet_id"],
+                              **row}, data_dir)
+    first_run = next((r["run_id"] for r in rows if r.get("run_id")), None)
+    return {"assignment": ended, "fleet_id": outcome["fleet_id"],
+            "run_id": first_run, "status": outcome.get("status"), "summary": summary}
+
+
+def fleet_save(summary):
+    """Persist a fleet-dispatch summary (mirror of batch_save)."""
+    directory = os.path.join(DATA, "fleets", summary["id"])
+    jsave(os.path.join(directory, "summary.json"), summary)
+
+
+def fleet_record_blocked(summary, row, dep, reason):
+    """Controller-ledger entry for a fleet card that was never dispatched
+    (mirror of batch_record_blocked). Blocked cards have no run id; the
+    entry id names the fleet and card so the ledger still shows the
+    dispatch decision with its blocking cause. A ledger write failure
+    must not fail the fleet, so it is reported and the fleet summary
+    (which always records the block) stays authoritative."""
+    try:
+        append_ledger({"id": f"fleet-{summary['id']}-{row['card']}", "ts": NOW(),
+                       "title": f"fleet {row['card']} blocked by {dep}",
+                       "status": "blocked", "fleet_id": summary["id"], "card": row["card"],
+                       "blocked_by": dep, "blocked_reason": reason,
+                       "scope": summary.get("scope")})
+    except OSError as error:
+        print(f"openswarm: warning: could not record blocked card {row['card']} in ledger: {error}",
+              file=sys.stderr)
+
+
+def fleet_block_row(summary, row, dep, reason):
+    """Mark a queued fleet row blocked (mirror of batch_block_row).
+    Records the block in the fleet summary and in the controller
+    ledger, and returns the (dep, reason) pair. Callers must not
+    dispatch the row afterwards."""
+    row["blocked_by"] = dep
+    row["blocked_reason"] = reason
+    row["state"] = "finished"
+    row["status"] = "blocked"
+    row["summary"] = f"blocked by {dep}: {reason}"
+    fleet_save(summary)
+    fleet_record_blocked(summary, row, dep, reason)
+    return dep, reason
+
+
+def fleet_block_row_health_gate(summary, row, record):
+    """Mark a queued fleet row blocked by the fleet health gate (mirror
+    of batch_block_row_health_gate). Records the block in the fleet
+    summary and in the controller ledger, and returns the record.
+    Callers must not dispatch the row afterwards."""
+    row["blocked_by"] = "health-gate"
+    row["blocked_reason"] = record["reason"]
+    row["health_gate"] = record
+    row["state"] = "finished"
+    row["status"] = "blocked"
+    row["summary"] = f"blocked by health gate: {record['reason']}"
+    fleet_save(summary)
+    try:
+        append_ledger({"id": f"fleet-{summary['id']}-{row['card']}", "ts": NOW(),
+                       "title": f"fleet {row['card']} blocked by health gate",
+                       "status": "blocked", "fleet_id": summary["id"], "card": row["card"],
+                       "blocked_by": "health-gate", "blocked_reason": record["reason"],
+                       "health_gate": record, "scope": summary.get("scope")})
+    except OSError as error:
+        print(f"openswarm: warning: could not record health-gate block for {row['card']} in ledger: {error}",
+              file=sys.stderr)
+    return record
+
+
+def run_openswarm_fleet(ticket, trigger, decision, policy, data_dir, cards_dir, cwd):
+    """Default fleet runner: dispatch the Mandate's cards in topo order
+    across the fleet, one card per runner pick, through
+    fleet_dispatch_once -- the same core `fleet dispatch` uses. A card
+    whose dependency finished without passing is blocked, never
+    dispatched; a card no runner can take is blocked with the
+    per-runner reasons; a card whose effective backend fails the M25
+    health gate is blocked with the gate record. No blocked card starts
+    an exec attempt. An explicitly configured dispatch backend is
+    passed through as the fleet backend -- and is gated per card by
+    the M25 health gate exactly like a routed pick, never exempt.
+    The repo checkout is the poll --cwd when given, else the local
+    host's mapping for the thread repo (which falls back to the process
+    working directory). Raises ValueError when no checkout or base
+    commit can be resolved, so the caller records a dispatch failure
+    instead of dispatching into the void. A per-card refusal
+    (FleetDispatchError) is recorded on that card and blocks its
+    dependents; it never aborts the remaining independent cards."""
+    cfg = intake_dispatch_config(policy)
+    repo = trigger["thread"]["repo"]
+    repo_path = (os.path.realpath(cwd) if cwd else None)
+    if repo_path is None:
+        hosts = fleet_config()
+        local = fleet_host("local", hosts)
+        if local["kind"] != "local":
+            raise ValueError("fleet host 'local' must have kind local")
+        repo_path = os.path.realpath(os.path.expanduser(host_repo(local, repo, local=True)))
+    proc = subprocess.run(["git", "rev-parse", "--verify", "HEAD^{commit}"],
+                          capture_output=True, text=True, cwd=repo_path, timeout=60)
+    if proc.returncode != 0:
+        raise ValueError(f"intake fleet: cannot resolve base commit in {repo_path}: "
+                         f"{proc.stderr.strip()[:200]}")
+    base = proc.stdout.strip()
+    swrm_policy = load_policy()
+    hosts = list(fleet_config().values())
+    plan = batch_plan(cards_dir)
+    minutes = cfg["budget_minutes"]
+    backend = cfg["backend"]
+    try:
+        check_budget(swrm_policy, [(backend, minutes)] * len(plan["cards"]))
+    except BudgetExceeded as error:
+        raise ValueError(f"intake fleet budget check failed: {error.detail}") from error
+    backends_content = None
+    if cfg["backends_file"]:
+        try:
+            with open(cfg["backends_file"], "rb") as fh:
+                backends_content = fh.read()
+        except OSError as error:
+            raise ValueError(f"intake fleet: cannot read backends file "
+                             f"{cfg['backends_file']!r} ({error})") from error
+    fid = new_run_id()
+    summary = {"id": fid, "fleet_id": fid, "repo": repo, "base": base, "scope": "repo",
+               "state": "queued", "started": NOW(), "plan": plan["cards"], "cards": [
+                   {"card": entry["card"],
+                    "path": os.path.join(os.path.abspath(cards_dir), entry["card"]),
+                    "host": None, "runner": None, "state": "queued", "status": "queued",
+                    "depends_on": entry["depends_on"], "order": entry["order"],
+                    "verify_rc": None, "branch": None, "commit": None, "seconds": None,
+                    "run_id": None, "remote_rc": None, "remote_run_dir": None,
+                    "summary": ""}
+                   for entry in plan["cards"]]}
+    fleet_save(summary)
+    summary["state"] = "running"
+    fleet_save(summary)
+    gate_args = argparse.Namespace(health_gate=False, no_health_gate=False,
+                                   skip_health_gate=False)
+    for row in summary["cards"]:
+        failure = batch_dependency_failure(summary, row)
+        if failure is not None:
+            fleet_block_row(summary, row, *failure)
+            continue
+        assignments, states = fleet_dispatch_many_plan(hosts, backend, repo, [row["card"]])
+        if not assignments:
+            detail = "; ".join(
+                f"{st['name']}: {st['reason']}" if not st["eligible"] else
+                f"{st['name']}: at capacity ({st['active']}/{st['capacity']} active)"
+                for st in states)
+            fleet_block_row(summary, row, "no-runner",
+                            f"no runner can take {row['card']}: {detail}")
+            continue
+        host = assignments[0][1]
+        row["host"] = host["name"]
+        row["runner"] = host["name"]
+        record, blocked = fleet_health_gate(gate_args, swrm_policy, backend,
+                                            cfg["backends_file"])
+        if blocked:
+            fleet_block_row_health_gate(summary, row, record)
+            continue
+        try:
+            stacked_base, _stacked_on = batch_stack_base(summary, row, base)
+        except ValueError as error:
+            row["state"] = "finished"
+            row["status"] = "failed"
+            row["summary"] = str(error)[:500]
+            fleet_save(summary)
+            continue
+        with open(row["path"], "rb") as fh:
+            raw = fh.read()
+        text = raw.decode("utf-8", errors="replace")
+        verify = parse_card_verify(text) or cfg["verify"]
+        title = f"intake {ticket['id']}: {row['card']}"
+        try:
+            disp = fleet_dispatch_once(
+                host, strip_card_verify(raw), repo=repo, backend=backend,
+                title=title, verify=verify, base=stacked_base or base,
+                backends_content=backends_content,
+                timeout=minutes * 60 + 180, card_file=row["path"], relay=False)
+        except FleetDispatchError as error:
+            row["state"] = "finished"
+            row["status"] = "failed"
+            row["summary"] = str(error)[:500]
+            fleet_save(summary)
+            continue
+        result = disp.get("remote_status")
+        row["state"] = "finished"
+        row["status"] = result or ("failed" if not disp.get("ok") else "done")
+        row["run_id"] = disp.get("remote_run_id")
+        row["remote_rc"] = disp.get("remote_rc")
+        row["remote_run_dir"] = disp.get("remote_run_dir")
+        row["verify_rc"] = disp.get("verify_rc")
+        row["summary"] = short(disp.get("fetch_error") or "", 200)
+        fleet_save(summary)
+    summary["state"] = "finished"
+    fleet_save(summary)
+    ok = all(row.get("status") == "done" for row in summary["cards"])
+    return {"fleet_id": fid, "status": summary["state"], "summary": summary,
+            "exit_code": 0 if ok else 1}
+
+
 # -- Channel -------------------------------------------------------------
 
 def intake_channel_body(ticket, trigger, dispatch):
@@ -19360,9 +19714,19 @@ def intake_channel_body(ticket, trigger, dispatch):
     lines = [INTAKE_CHANNEL_MARKER,
              f"openswarm intake: ticket `{ticket['id']}` for "
              f"{intake_thread_key(trigger['thread'])}",
-             "",
-             f"- run: `{dispatch.get('run_id')}` (status: {dispatch.get('status')})",
-             f"- executor: `{dispatch.get('assignment', {}).get('executor')}`"]
+             ""]
+    if dispatch.get("fleet_id"):
+        # M30 slice 2 (#251): a fleet dispatch has no single run id;
+        # the body carries the fleet id plus one line per card.
+        lines.append(f"- fleet: `{dispatch['fleet_id']}` "
+                     f"(status: {dispatch.get('status')})")
+        for row in (dispatch.get("summary") or {}).get("cards") or []:
+            lines.append(f"- card `{row.get('card')}` "
+                         f"@{row.get('runner') or '-'}: {row.get('status')} "
+                         f"run=`{row.get('run_id')}`")
+    else:
+        lines.append(f"- run: `{dispatch.get('run_id')}` (status: {dispatch.get('status')})")
+    lines.append(f"- executor: `{dispatch.get('assignment', {}).get('executor')}`")
     branch = result.get("branch")
     if branch:
         lines.append(f"- branch: `{branch}`")
@@ -19373,9 +19737,15 @@ def intake_channel_body(ticket, trigger, dispatch):
     if isinstance(summary, str) and summary.strip():
         lines.append(f"- summary: {summary.strip()[:500]}")
     lines.append("")
-    lines.append("Evidence: run result.json under $OPENSWARM_HOME/runs/"
-                 f"{dispatch.get('run_id')}/result.json; intake ledger entries "
-                 f"for trigger `{trigger['id']}`.")
+    if dispatch.get("fleet_id"):
+        lines.append("Evidence: fleet summary under $OPENSWARM_HOME/fleets/"
+                     f"{dispatch['fleet_id']}/summary.json; per-card run "
+                     f"result.json files under $OPENSWARM_HOME/runs/; intake "
+                     f"ledger entries for trigger `{trigger['id']}`.")
+    else:
+        lines.append("Evidence: run result.json under $OPENSWARM_HOME/runs/"
+                     f"{dispatch.get('run_id')}/result.json; intake ledger entries "
+                     f"for trigger `{trigger['id']}`.")
     return "\n".join(lines)
 
 
@@ -19457,7 +19827,8 @@ def cmd_intake_poll(args, data_dir=None):
                 dispatch_runner=None if args.no_dispatch else run_openswarm_run,
                 channel_poster=None if args.no_channel else post_intake_channel,
                 dispatch_cwd=args.cwd,
-                batch_runner=None if args.no_dispatch else run_openswarm_batch)
+                batch_runner=None if args.no_dispatch else run_openswarm_batch,
+                fleet_runner=None if args.no_dispatch else run_openswarm_fleet)
             results.append(result)
     out = {"ok": True, "repo": args.repo,
            "triggers_found": len(polled["triggers"]),
@@ -19476,7 +19847,8 @@ def cmd_intake_poll(args, data_dir=None):
                 f"ticket={result.get('ticket_id') or '-'} "
                 f"dispatched={result.get('dispatched')} "
                 f"run={((result.get('dispatch') or {}).get('run_id')) or '-'} "
-                f"batch={((result.get('dispatch') or {}).get('batch_id')) or '-'}")
+                f"batch={((result.get('dispatch') or {}).get('batch_id')) or '-'} "
+                f"fleet={((result.get('dispatch') or {}).get('fleet_id')) or '-'}")
         # M28 slice 2 (#235): why a Trigger did not dispatch -- the
         # active-scope shadow reason, a cap block, a health-gate block
         # or the Ticket-only reason -- belongs on the same line, so an
@@ -19948,6 +20320,128 @@ def intake_m30_slice1_evidence_check(entries, state=None, policy=None):
           "no blocked card carries a run_id (blocked before any exec attempt)"
           if not blocked_with_run
           else f"blocked card(s) with a run_id (exec attempt after block): {blocked_with_run}")
+    failures = sorted(name for name, c in checks.items() if not c["ok"])
+    return {"ok": not failures, "checks": checks, "failures": failures}
+
+
+# ---------------------------------------------------------------- intake M30 slice 2 (#251): fleet evidence check
+#
+# Validates one fleet-dispatch record plus the slice-2 live-evidence
+# bar from epic #246 acceptance ②/③/④ (fleet half): every fleet
+# dispatch has one Assignment, cards generated in topo order, a
+# fleet_dispatch_finished (or _failed) for every
+# fleet_dispatch_started, a per-card result for every generated card,
+# and no exec attempt behind a blocked card -- plus the live bar
+# itself: at least two real batch runs and at least two real fleet
+# runs (card results carrying a run_id), at least one blocked card or
+# pre-dispatch block, and at least one allowed run. `entries` is the
+# intake ledger in append order; `state` (optional) is the intake
+# state; `policy` (optional) is the intake policy. Returns {"ok",
+# "checks", "failures"}, mirroring the M28/M29 checkers. A missing
+# item is a failure, never a pass: the checker cannot see the outside
+# world, so it only certifies what the ledger itself proves.
+
+def intake_m30_slice2_evidence_check(entries, state=None, policy=None):
+    entries = list(entries or [])
+    checks = {}
+
+    def check(name, ok, detail):
+        checks[name] = {"ok": bool(ok), "detail": detail}
+        return bool(ok)
+
+    assigned = {}
+    for e in entries:
+        if e.get("kind") == "assignment_created" and e.get("ticket_id"):
+            assigned.setdefault(e["ticket_id"], []).append(e)
+    doubled = sorted(t for t, xs in assigned.items() if len(xs) > 1)
+    check("one_assignment_per_ticket", not doubled,
+          "at most one assignment_created per ticket (idempotent dispatch)"
+          if not doubled
+          else f"second assignment_created for ticket(s) {doubled}")
+    created = {}
+    for e in entries:
+        if e.get("kind") == "intake_fleet_created" and e.get("ticket_id"):
+            created.setdefault(e["ticket_id"], []).append(e)
+    check("fleet_cards_created",
+          bool(created) and all(e.get("cards") for xs in created.values() for e in xs),
+          f"{len(created)} ticket(s) with intake_fleet_created entries "
+          f"({sorted(created)})" if created
+          else "no intake_fleet_created entry")
+    topo_ok = True
+    topo_detail = ""
+    for ticket, xs in created.items():
+        for e in xs:
+            cards = e.get("cards") or []
+            order = e.get("order") or []
+            if sorted(order) != sorted(cards) or len(order) != len(cards):
+                topo_ok = False
+                topo_detail = (f"ticket {ticket}: order {order} does not cover "
+                               f"cards {cards}")
+    check("fleet_cards_topo_order", topo_ok,
+          "every intake_fleet_created order covers exactly its cards"
+          if topo_ok else topo_detail)
+    started = {e.get("ticket_id") for e in entries
+               if e.get("kind") == "fleet_dispatch_started"}
+    finished = {e.get("ticket_id") for e in entries
+                if e.get("kind") == "fleet_dispatch_finished" and e.get("fleet_id")}
+    failed = {e.get("ticket_id") for e in entries
+              if e.get("kind") == "fleet_dispatch_failed"}
+    unfinished = sorted((started - finished) - failed)
+    check("fleet_started_without_finish", not unfinished,
+          "every fleet_dispatch_started has a fleet_dispatch_finished or "
+          "fleet_dispatch_failed"
+          if not unfinished
+          else f"fleet_dispatch_started with no finish/failure for ticket(s) {unfinished}")
+    results = {}
+    for e in entries:
+        if e.get("kind") == "intake_fleet_card_result" and e.get("ticket_id"):
+            results.setdefault(e["ticket_id"], []).append(e)
+    missing_cards = []
+    for ticket, xs in created.items():
+        expected = {c for e in xs for c in (e.get("cards") or [])}
+        got = {r.get("card") for r in results.get(ticket, [])}
+        if expected - got:
+            missing_cards.append(f"{ticket}: {sorted(expected - got)}")
+    check("fleet_card_result_per_card", not missing_cards,
+          "every generated fleet card has an intake_fleet_card_result"
+          if not missing_cards
+          else f"cards without a result: {missing_cards}")
+    blocked_with_run = sorted({r.get("card") for rs in results.values() for r in rs
+                               if r.get("blocked") and r.get("run_id")})
+    check("fleet_blocked_card_no_exec", not blocked_with_run,
+          "no blocked fleet card carries a run_id (blocked before any exec attempt)"
+          if not blocked_with_run
+          else f"blocked fleet card(s) with a run_id (exec attempt after block): {blocked_with_run}")
+    batch_finished = [e for e in entries
+                      if e.get("kind") == "batch_dispatch_finished" and e.get("batch_id")]
+    check("live_batch_runs_at_least_2", len(batch_finished) >= 2,
+          f"{len(batch_finished)} batch_dispatch_finished record(s)"
+          if len(batch_finished) >= 2
+          else f"only {len(batch_finished)} batch run(s); need at least 2")
+    fleet_run_ids = sorted({r.get("run_id") for rs in results.values() for r in rs
+                            if r.get("run_id")})
+    check("live_fleet_runs_at_least_2", len(fleet_run_ids) >= 2,
+          f"{len(fleet_run_ids)} real fleet run(s): {fleet_run_ids}"
+          if len(fleet_run_ids) >= 2
+          else f"only {len(fleet_run_ids)} fleet run(s); need at least 2")
+    blocked_cards = [r for rs in results.values() for r in rs if r.get("blocked")]
+    batch_blocked = [e for e in entries
+                     if e.get("kind") == "intake_batch_card_result" and e.get("blocked")]
+    pre_blocks = [e for e in entries
+                  if e.get("kind") in ("intake_health_gate_blocked", "cap_blocked")]
+    blocked_total = len(blocked_cards) + len(batch_blocked) + len(pre_blocks)
+    check("live_blocked_at_least_1", blocked_total >= 1,
+          f"{blocked_total} blocked record(s) "
+          f"({len(blocked_cards)} fleet card(s), {len(batch_blocked)} batch card(s), "
+          f"{len(pre_blocks)} pre-dispatch block(s))"
+          if blocked_total >= 1
+          else "no blocked record (need at least 1 blocked card or pre-dispatch block)")
+    allowed_total = len(fleet_run_ids) + len(
+        {e.get("batch_id") for e in batch_finished})
+    check("live_allowed_at_least_1", allowed_total >= 1,
+          f"{allowed_total} allowed dispatch(es) with a run/batch id"
+          if allowed_total >= 1
+          else "no allowed dispatch with a run/batch id")
     failures = sorted(name for name, c in checks.items() if not c["ok"])
     return {"ok": not failures, "checks": checks, "failures": failures}
 
