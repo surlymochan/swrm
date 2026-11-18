@@ -2084,7 +2084,7 @@ def probe_codex(policy):
 def codex_config_model():
     """Top-level default `model` in ~/.codex/config.toml (used by bare `codex exec`)."""
     try:
-        with open(f"{HOME}/.codex/config.toml") as fh:
+        with open(f"{HOME}/.codex/config.toml", encoding="utf-8") as fh:
             for line in fh:
                 if line.lstrip().startswith("["):
                     break
@@ -2296,7 +2296,7 @@ def trip_breaker(key, policy, reason):
 
 def recent_ledger(n=50, path=None):
     try:
-        with open(path or LEDGER) as f:
+        with open(path or LEDGER, encoding="utf-8", errors="replace") as f:
             lines = f.readlines()[-n:]
         return [json.loads(x) for x in lines if x.strip()]
     except Exception:
@@ -2307,7 +2307,9 @@ def recent_ledger(n=50, path=None):
 
 def ledger_entries():
     try:
-        with open(LEDGER) as stream:
+        # errors="replace" (M34 slice 1, #269): tolerate legacy non-UTF-8
+        # lines; they fail json.loads below and are skipped, never rewritten.
+        with open(LEDGER, encoding="utf-8", errors="replace") as stream:
             for line in stream:
                 try:
                     entry = json.loads(line)
@@ -6369,12 +6371,12 @@ def exec_custom_cli(d, st, prompt, wd, rdir, timeout, evp):
         env[key] = sub(value)
     rc = run_proc(cmd, wd, env, timeout, evp)
     try:
-        with open(evp, errors="replace") as fh:
+        with open(evp, errors="replace", encoding="utf-8") as fh:
             text = fh.read()
     except OSError:
         text = ""
     try:
-        with open(evp + ".err", errors="replace") as fh:
+        with open(evp + ".err", errors="replace", encoding="utf-8") as fh:
             err_tail = fh.read()[-3000:]
     except OSError:
         err_tail = ""
@@ -7356,7 +7358,7 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
     """Run an executor. abort_re: pattern that, once seen in stderr, means the executor will only retry
     silently (e.g. opencode on a plan usage limit) — kill it early and return 75 so the caller can fall back."""
     rdir = os.path.dirname(out_path)
-    with open(out_path, "w") as out, open(out_path + ".err", "w") as err:
+    with open(out_path, "w", encoding="utf-8") as out, open(out_path + ".err", "w", encoding="utf-8") as err:
         p = subprocess.Popen(_spawnable(cmd), cwd=cwd, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
                              start_new_session=True)
         set_status(rdir, executor_pid=p.pid, events=out_path, attempt_started=NOW())
@@ -7366,7 +7368,7 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
         io_streak = 0
         while True:
             done = p.poll() is not None
-            with open(out_path, errors="replace") as events:
+            with open(out_path, errors="replace", encoding="utf-8") as events:
                 events.seek(offset)
                 pending += events.read()
                 offset = events.tell()
@@ -7385,7 +7387,7 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                 if isinstance(event, dict):
                     io_streak, lost = codex_track_io_lost(io_streak, event)
                     if lost:
-                        with open(out_path, "a") as ev:
+                        with open(out_path, "a", encoding="utf-8") as ev:
                             ev.write(json.dumps({"type": "error", "error": lost, "streak": io_streak},
                                                 ensure_ascii=False) + "\n")
                         set_status(rdir, last_error="codex shell returned exit 0 with empty output repeatedly")
@@ -7393,7 +7395,7 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                         p.wait()
                         return 134
                 if block and block.get("enforced") is False:
-                    with open(out_path, "a") as ev:
+                    with open(out_path, "a", encoding="utf-8") as ev:
                         ev.write(json.dumps({"type": "risk_warning", **block}, ensure_ascii=False) + "\n")
                 elif block:
                     set_status(rdir, risk_blocks=[block], stop_requested=True)
@@ -7415,7 +7417,7 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                 return 124
             if abort_re is not None:
                 try:
-                    with open(out_path + ".err", errors="ignore") as f:
+                    with open(out_path + ".err", errors="ignore", encoding="utf-8") as f:
                         f.seek(max(0, os.path.getsize(out_path + ".err") - 65536))
                         if abort_re.search(f.read()):
                             kill_tree(p.pid)
@@ -7465,7 +7467,7 @@ def exec_codex(d, st, prompt, wd, rdir, timeout, evp):
                "--output-schema", schema, "-o", last, prompt]
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
     usage, thread, errors = {}, None, []
-    with open(evp, errors="ignore") as fh:
+    with open(evp, errors="ignore", encoding="utf-8") as fh:
         for line in fh:
             try:
                 ev = json.loads(line)
@@ -7479,9 +7481,9 @@ def exec_codex(d, st, prompt, wd, rdir, timeout, evp):
                 errors.append(json.dumps(ev)[:500])
     final = None
     if os.path.exists(last):
-        with open(last) as fh:
+        with open(last, encoding="utf-8") as fh:
             final = extract_json(fh.read())
-    with open(evp + ".err", errors="ignore") as fh:
+    with open(evp + ".err", errors="ignore", encoding="utf-8") as fh:
         err_text = "\n".join(errors) + fh.read()[-3000:]
     return rc, final, {"usage": usage, "thread_id": thread}, err_text
 
@@ -7499,7 +7501,7 @@ def exec_opencode(d, st, prompt, wd, rdir, timeout, evp):
     cmd.append(prompt)
     rc = run_proc(cmd, wd, env, timeout, evp, abort_re=OPENCODE_ABORT_RE)
     texts, cost, tokens, session, errors = [], 0.0, {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0}, None, []
-    with open(evp, errors="ignore") as fh:
+    with open(evp, errors="ignore", encoding="utf-8") as fh:
         for line in fh:
             try:
                 ev = json.loads(line)
@@ -7519,7 +7521,7 @@ def exec_opencode(d, st, prompt, wd, rdir, timeout, evp):
             elif ev.get("type") == "error":
                 errors.append(json.dumps(ev)[:500])
     final = extract_json(texts[-1]) if texts else None
-    with open(evp + ".err", errors="ignore") as fh:
+    with open(evp + ".err", errors="ignore", encoding="utf-8") as fh:
         err_text = "\n".join(errors) + fh.read()[-3000:]
     if errors and rc == 0:
         rc = 1
@@ -7551,8 +7553,8 @@ def exec_cursor(d, st, prompt, wd, rdir, timeout, evp):
     binary = cursor_bin()
     model = d.get("model") or (load_policy().get("cursor") or {}).get("default_model") or "composer-2.5[fast=false]"
     if not binary:
-        open(evp, "w").close()
-        with open(evp + ".err", "w") as f:
+        open(evp, "w", encoding="utf-8").close()
+        with open(evp + ".err", "w", encoding="utf-8") as f:
             f.write("cursor-agent not found\n")
         return 127, None, {"usage": cursor_usage(None)}, "cursor-agent not found"
     cli_model = "composer-2.5" if model == "composer-2.5[fast=false]" else model
@@ -7565,7 +7567,7 @@ def exec_cursor(d, st, prompt, wd, rdir, timeout, evp):
     usage, result_text, errors = cursor_usage(None), None, []
     saw_usage = False
     try:
-        streamed = open(evp, errors="ignore")
+        streamed = open(evp, errors="ignore", encoding="utf-8")
     except OSError:
         streamed = None
     if streamed is not None:
@@ -7590,7 +7592,7 @@ def exec_cursor(d, st, prompt, wd, rdir, timeout, evp):
     final = result_text if isinstance(result_text, dict) and "status" in result_text else (
         extract_json(result_text) if isinstance(result_text, str) else None)
     try:
-        with open(evp + ".err", errors="ignore") as errf:
+        with open(evp + ".err", errors="ignore", encoding="utf-8") as errf:
             err_tail = errf.read()[-3000:]
     except OSError:
         err_tail = ""
@@ -7687,15 +7689,15 @@ def exec_agy(d, st, prompt, wd, rdir, timeout, evp):
     cfg = load_policy().get("agy") or {}
     model = d.get("model") or cfg.get("default_model") or AGY_DEFAULT_MODEL
     if not binary:
-        open(evp, "w").close()
-        with open(evp + ".err", "w") as f:
+        open(evp, "w", encoding="utf-8").close()
+        with open(evp + ".err", "w", encoding="utf-8") as f:
             f.write("agy not found\n")
         return 127, None, {"usage": agy_usage(None)}, "agy not found"
     cmd = agy_command(binary, model, prompt, d.get("effort"), d.get("_resume_session"), cfg)
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
     usage, response, errors, conversation, finished_reason = agy_usage(None), None, [], None, None
     try:
-        streamed = open(evp, errors="ignore")
+        streamed = open(evp, errors="ignore", encoding="utf-8")
     except OSError:
         streamed = None
     if streamed is not None:
@@ -7721,7 +7723,7 @@ def exec_agy(d, st, prompt, wd, rdir, timeout, evp):
                 if result["error"] or result["status"] in ("ERROR", "INVALID"):
                     errors.append(short(result["error"] or result["response"] or "agy error", 500))
     try:
-        with open(evp + ".err", errors="ignore") as errf:
+        with open(evp + ".err", errors="ignore", encoding="utf-8") as errf:
             err_tail = errf.read()[-3000:]
     except OSError:
         err_tail = ""
@@ -7743,7 +7745,7 @@ def pi_usage(events_path):
     usage = {k: 0 for k in PI_USAGE_KEYS}
     final, errors = None, []
     try:
-        fh = open(events_path, errors="ignore")
+        fh = open(events_path, errors="ignore", encoding="utf-8")
     except OSError:
         return usage, final, errors
     with fh:
@@ -7778,13 +7780,13 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
     """
     binary = pi_bin()
     if not binary:
-        open(evp, "w").close()
-        with open(evp + ".err", "w") as f:
+        open(evp, "w", encoding="utf-8").close()
+        with open(evp + ".err", "w", encoding="utf-8") as f:
             f.write("pi not found\n")
         return 127, None, {"usage": {k: 0 for k in PI_USAGE_KEYS}}, "pi not found"
     isolated = os.path.basename(os.path.realpath(binary)) == "pi-isolated"
     if isolated and d.get("_resume_session"):
-        open(evp, "w").close()
+        open(evp, "w", encoding="utf-8").close()
         return 1, None, {"usage": {}, "resume_supported": False}, "isolated Pi cannot resume a session"
     cfg = load_policy().get("pi") or {}
     sessions = os.path.abspath(os.path.join(rdir, "pi-sessions"))
@@ -7801,7 +7803,7 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
     usage, text, errors = pi_usage(evp)
     final = extract_json(text) if isinstance(text, str) else None
     try:
-        with open(evp + ".err", errors="ignore") as errf:
+        with open(evp + ".err", errors="ignore", encoding="utf-8") as errf:
             err_tail = errf.read()[-3000:]
     except OSError:
         err_tail = ""
@@ -7814,7 +7816,7 @@ def exec_copilot(d, st, prompt, wd, rdir, timeout, evp):
     """Run Copilot without blanket tool, path, URL or MCP permissions."""
     binary = copilot_bin()
     if not binary or not d.get("model"):
-        open(evp, "w").close()
+        open(evp, "w", encoding="utf-8").close()
         return 127, None, {"usage": {}}, "copilot binary or model unavailable"
     cmd = [binary, "-p", prompt, "--model", d["model"], "--output-format", "json",
            "--sandbox", "--assisted-approval", "--no-ask-user", "--disable-builtin-mcps"]
@@ -7823,7 +7825,7 @@ def exec_copilot(d, st, prompt, wd, rdir, timeout, evp):
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
     final, errors, session_error, resolved_model, saw_result = None, [], False, None, False
     usage = {k: 0 for k in CURSOR_USAGE_KEYS}
-    with open(evp, errors="ignore") as stream:
+    with open(evp, errors="ignore", encoding="utf-8") as stream:
         for line in stream:
             try:
                 event = json.loads(line)
@@ -7848,7 +7850,7 @@ def exec_copilot(d, st, prompt, wd, rdir, timeout, evp):
                 session_error = True
                 errors.append(short(data.get("message") or data.get("errorType") or "session error", 500))
     try:
-        with open(evp + ".err", errors="ignore") as stream:
+        with open(evp + ".err", errors="ignore", encoding="utf-8") as stream:
             errors.append(stream.read()[-3000:])
     except OSError:
         pass
@@ -7987,9 +7989,9 @@ def exclude_dependency_links(wt, linked):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     have = []
     if os.path.exists(path):
-        with open(path) as stream:
+        with open(path, encoding="utf-8") as stream:
             have = stream.read().splitlines()
-    with open(path, "a") as stream:
+    with open(path, "a", encoding="utf-8") as stream:
         for rel in linked:
             if "/" + rel not in have:
                 stream.write("/" + rel + "\n")
@@ -8360,7 +8362,7 @@ def finalize_workspace(ws, title, backend, rdir, keep):
     if commit:
         _, diffstat, _ = git(["diff", "--stat", ws["base"], commit], root)
         _, patch, _ = git(["format-patch", "--stdout", f"{ws['base']}..{commit}"], root, timeout=120)
-        with open(f"{rdir}/diff.patch", "w") as f:
+        with open(f"{rdir}/diff.patch", "w", encoding="utf-8") as f:
             f.write(patch)
     if not keep:
         cleanup_worktree(ws, commit)
@@ -8415,13 +8417,13 @@ def cmd_run(args, policy, custom_backends=None):
     if args.run_id:  # detached child: task already stored
         rid = args.run_id
         rdir = f"{RUNS}/{rid}"
-        with open(f"{rdir}/task.md") as fh:
+        with open(f"{rdir}/task.md", encoding="utf-8") as fh:
             task = fh.read()
     else:
         if args.prompt:
             task = args.prompt
         elif args.task_file:
-            with open(args.task_file) as fh:
+            with open(args.task_file, encoding="utf-8") as fh:
                 task = fh.read()
         else:
             task = sys.stdin.read()
@@ -8430,7 +8432,7 @@ def cmd_run(args, policy, custom_backends=None):
         rid = new_run_id()
         rdir = f"{RUNS}/{rid}"
         os.makedirs(rdir, exist_ok=True)
-        with open(f"{rdir}/task.md", "w") as f:
+        with open(f"{rdir}/task.md", "w", encoding="utf-8") as f:
             f.write(task)
     title = args.title or task.strip().splitlines()[0][:72]
     set_status(rdir, scope=scope)
@@ -8631,7 +8633,7 @@ def cmd_run(args, policy, custom_backends=None):
                 child.append(f"--{flag.replace('_', '-')}")
         if getattr(args, "read_only", False):
             child.append("--read-only")
-        with open(f"{rdir}/run.out", "w") as out:
+        with open(f"{rdir}/run.out", "w", encoding="utf-8") as out:
             p = subprocess.Popen(child, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                  start_new_session=True)
         set_status(rdir, runner_pid=p.pid)
@@ -8787,9 +8789,9 @@ def cmd_run(args, policy, custom_backends=None):
 
         def dispatch_rework(backend, backend_decision, backend_state, rework_task, attempt_label):
             """One rework dispatch on `backend`; returns (final_report, error_class)."""
-            with open(f"{rdir}/rework-prompt-{attempt_label}.md", "w") as f:
+            with open(f"{rdir}/rework-prompt-{attempt_label}.md", "w", encoding="utf-8") as f:
                 f.write(rework_task)
-            with open(f"{rdir}/rework-prompt.md", "w") as f:
+            with open(f"{rdir}/rework-prompt.md", "w", encoding="utf-8") as f:
                 f.write(rework_task)
             set_status(rdir, state="reworking", auto_rework_attempt=attempt_label)
             rework_prompt = execution_prompt(ws["path"], rework_task, scope)
@@ -9821,7 +9823,7 @@ def bus_create_issue(repo, cfg, title, task, metadata, executor=None):
 
 def bus_event(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a") as stream:
+    with open(path, "a", encoding="utf-8") as stream:
         stream.write(json.dumps({"type": "text", "part": {"text": bus_redact(text)}}, ensure_ascii=False) + "\n")
 
 
@@ -9947,7 +9949,7 @@ def cmd_bus_run(args, policy, rid, rdir, task, title, budget_min):
                 child += [f"--{flag.replace('_', '-')}", str(value)]
         if getattr(args, "verify_baseline", False):
             child.append("--verify-baseline")
-        with open(f"{rdir}/run.out", "w") as out:
+        with open(f"{rdir}/run.out", "w", encoding="utf-8") as out:
             process = subprocess.Popen(child, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                        start_new_session=True)
         set_status(rdir, id=rid, state="queued", title=title, started=NOW(), budget_minutes=budget_min,
@@ -10035,7 +10037,7 @@ def cmd_bus_init(args, policy):
                 "        Add the task description. Planner metadata is appended in an `openswarm-task` JSON block.\n"
                 "        Labels transition queued -> claimed -> done/failed; planners can cancel with the cancelled label.\n"
                 "        Executors claim with `/claim <executor-name>` and report in an `openswarm-result` JSON block.\n")
-    with open(os.path.join(SKILL_DIR, "docs", "BUS.md")) as stream:
+    with open(os.path.join(SKILL_DIR, "docs", "BUS.md"), encoding="utf-8") as stream:
         bus_readme = stream.read()
     files = {"README.md": bus_readme, ".github/ISSUE_TEMPLATE/openswarm.yml": template}
     updated = []
@@ -10164,7 +10166,7 @@ def bus_worker_run(issue, cfg, args, policy):
         bus_worker_clone(task, repo_path, allowed_repos)
         rdir = os.path.join(RUNS, task["run_id"])
         os.makedirs(rdir, exist_ok=True)
-        with open(os.path.join(rdir, "task.md"), "w") as stream:
+        with open(os.path.join(rdir, "task.md"), "w", encoding="utf-8") as stream:
             stream.write(task_card)
         worker_budget = min(float(task["budget_minutes"]), float(args.budget_minutes))
         if worker_budget <= 0:
@@ -10282,7 +10284,7 @@ def lane_socket_path(name):
 
 def lane_last_log_error(name):
     try:
-        with open(os.path.join(lane_root(name), "supervisor.log"), errors="ignore") as f:
+        with open(os.path.join(lane_root(name), "supervisor.log"), errors="ignore", encoding="utf-8") as f:
             lines = f.read().splitlines()
         return next((line for line in reversed(lines) if line.strip()), None)
     except OSError:
@@ -10518,11 +10520,11 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
             ex = ex if os.path.isabs(ex) else os.path.join(wt, ex)
             os.makedirs(os.path.dirname(ex), exist_ok=True)
             if os.path.exists(ex):
-                with open(ex) as fh:
+                with open(ex, encoding="utf-8") as fh:
                     have = fh.read().splitlines()
             else:
                 have = []
-            with open(ex, "a") as f:
+            with open(ex, "a", encoding="utf-8") as f:
                 for rel in linked:
                     if "/" + rel not in have:
                         f.write("/" + rel + "\n")
@@ -10857,7 +10859,7 @@ def lane_refresh_codex_child_if_stale(lane, child, policy, event_file):
 
 
 def lane_record_event(path, event):
-    with open(path, "a") as f:
+    with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
@@ -10901,7 +10903,7 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                                      state="queued", started=NOW(), runner_pid=os.getpid(), lane=lane["name"])
                         os.makedirs(rdir, exist_ok=True)
                         task = str(req.get("task") or "")
-                        with open(os.path.join(rdir, "task.md"), "w") as f:
+                        with open(os.path.join(rdir, "task.md"), "w", encoding="utf-8") as f:
                             f.write(task)
                         spec = {k: req.get(k) for k in ("title", "verify", "verify_baseline", "budget_minutes", "base",
                                                         "card_type", "rework_of", "paths", "regress_label", "read_only", "scope")}
@@ -10911,7 +10913,7 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                         spec.update({"run_id": rid, "task": task, "started": NOW(), "provider": provider})
                         spec["queued_at"] = spec["started"]
                         spec["_event_file"] = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
-                        open(spec["_event_file"], "w").close()
+                        open(spec["_event_file"], "w", encoding="utf-8").close()
                         current.update(spec)
                         lane_write_state(lane["name"], state="busy", current_run=rid, turn_state="queued",
                                          concurrency_keys=[], last_error=None)
@@ -11200,7 +11202,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                  os.path.join(rdir, f"events.{attempt}.{lane['backend']}.jsonl")
     spec["_event_file"] = event_file
     if not os.path.exists(event_file):
-        open(event_file, "w").close()
+        open(event_file, "w", encoding="utf-8").close()
     deadline = spec["started"] + max(0, float(spec["budget_minutes"] or 0)) * 60
     provider = execution_provider(lane["backend"], policy=load_policy(), lane=lane)
     set_status(rdir, state="running", lane=lane["name"], backend=lane["backend"], model=lane["model"],
@@ -11615,7 +11617,7 @@ def lane_do_run(lane, spec, child, server, current):
             ws["prepare"].append(prepared)
             if prepared["rc"] != 0:
                 evp = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
-                open(evp, "a").close()
+                open(evp, "a", encoding="utf-8").close()
                 lane_record_event(evp, {"type": "error", "error": "workspace prepare failed"})
                 # lane_prepare_workspace already reset and cleaned this worktree, so discard only prepare artifacts.
                 lane_git(["reset", "--hard", ws["base"]], ws["root"])
@@ -11772,7 +11774,7 @@ def lane_do_run(lane, spec, child, server, current):
         error_class = "exec_error"
         evp = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
         if not os.path.exists(evp):
-            open(evp, "w").close()
+            open(evp, "w", encoding="utf-8").close()
         lane_record_event(evp, {"type": "error", "error": short(e, 400)})
         if ws is None:
             # Preserve a visible failed run even if lane worktree preparation was rejected.
@@ -11976,7 +11978,7 @@ def cmd_lane_up(args, policy):
             continue
         os.makedirs(lane_root(name), exist_ok=True)
         logfile = os.path.join(lane_root(name), "supervisor.log")
-        with open(logfile, "a") as out:
+        with open(logfile, "a", encoding="utf-8") as out:
             p = subprocess.Popen([sys.executable, os.path.realpath(__file__), "lane", "serve", name],
                                  stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                  start_new_session=True, close_fds=True)
@@ -12067,7 +12069,7 @@ def cmd_lane_assign(args):
     if args.prompt is not None:
         task = args.prompt
     else:
-        with open(args.task_file) as fh:
+        with open(args.task_file, encoding="utf-8") as fh:
             task = fh.read()
     if not task.strip():
         print(json.dumps({"ok": False, "error": "empty task"}))
@@ -15124,7 +15126,7 @@ def batch_save(summary):
     for row in summary["cards"]:
         lines.append("| " + " | ".join(cell(row.get(key) if row.get(key) is not None else "-") for key in
                                       ("card", "host", "status", "verify_rc", "branch", "commit", "seconds", "summary")) + " |")
-    with open(os.path.join(directory, "summary.md"), "w") as stream:
+    with open(os.path.join(directory, "summary.md"), "w", encoding="utf-8") as stream:
         stream.write("\n".join(lines) + "\n")
 
 
@@ -15580,7 +15582,7 @@ def cmd_batch(args, policy):
     jsave(os.path.join(directory, "spec.json"), spec)
     batch_save(summary)
     if args.detach:
-        with open(os.path.join(directory, "batch.out"), "w") as log:
+        with open(os.path.join(directory, "batch.out"), "w", encoding="utf-8") as log:
             proc = subprocess.Popen([sys.executable, os.path.realpath(__file__), "batch", "--batch-id", bid],
                                     stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         summary["runner_pid"] = proc.pid
@@ -16226,7 +16228,7 @@ def cmd_watch(args, policy):
                 out("ATTEMPT", f"switched to {st.get('backend')}/{st.get('model')} (attempt {st.get('attempt')})")
             messages = WatchMessages()
             cur_path = st["events"]
-            fh = open(cur_path, errors="ignore")
+            fh = open(cur_path, errors="ignore", encoding="utf-8")
             if args.from_end:
                 fh.seek(0, 2)
         line = fh.readline() if fh else ""
@@ -16274,7 +16276,7 @@ def cmd_watch(args, policy):
             if fh:
                 fh.close()
             for path in sorted(glob.glob(os.path.join(rdir, "events.*.jsonl"))):
-                with open(path, errors="ignore") as pf:
+                with open(path, errors="ignore", encoding="utf-8") as pf:
                     for line in pf:
                         try:
                             event = json.loads(line)
@@ -16332,7 +16334,7 @@ def run_digest(rid):
     cmds, last = 0, ""
     messages = WatchMessages()
     if st.get("events") and os.path.exists(st["events"]):
-        with open(st["events"], errors="ignore") as fh:
+        with open(st["events"], errors="ignore", encoding="utf-8") as fh:
             for line in fh:
                 try:
                     rows = messages.feed(json.loads(line))
@@ -16635,7 +16637,7 @@ def _diagnose_log_signals(rdir):
         return signals
     for name in names:
         try:
-            with open(os.path.join(rdir, name), errors="ignore") as fh:
+            with open(os.path.join(rdir, name), errors="ignore", encoding="utf-8") as fh:
                 lines = fh.readlines()[-200:]
         except OSError:
             continue
@@ -16665,7 +16667,7 @@ def diagnose_failure(run_id):
     result = jload(os.path.join(rdir, "result.json"), {}) or {}
     ledger_entry = {}
     try:
-        with open(LEDGER) as stream:
+        with open(LEDGER, encoding="utf-8", errors="replace") as stream:
             for line in stream:
                 try:
                     entry = json.loads(line)
@@ -17365,7 +17367,9 @@ def append_ledger(entry):
     # Serialize completion writes with admissions so their ledger/reservation snapshot is coherent.
     with open(os.path.join(DATA, "budget.lock"), "a") as lock:
         _flock(lock, LOCK_EX)
-        with open(LEDGER, "a") as f:
+        # Explicit UTF-8 (M34 slice 1, #269): the ledger must round-trip
+        # non-ASCII exactly like result.json (jsave), on any locale.
+        with open(LEDGER, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 

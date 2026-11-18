@@ -173,7 +173,7 @@ class FleetExecGuardTests(unittest.TestCase):
         path = self.data / "ledger.jsonl"
         if not path.exists():
             return []
-        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 class FleetWaitRunResultTests(unittest.TestCase):
@@ -225,7 +225,7 @@ class FleetRecordVerifyEvalidTests(unittest.TestCase):
         path = self.data / "ledger.jsonl"
         if not path.exists():
             return []
-        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
     def record(self, result, fetch_error=None, run_id="run1"):
         xs.fleet_record_verify_evalid("local", "fleet-local-run1", result, run_id=run_id,
@@ -411,14 +411,14 @@ class FleetVerifyEvalidEndToEndTests(unittest.TestCase):
         path = self.root / "calls.jsonl"
         if not path.exists():
             return []
-        events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
         return [event for event in events if event["event"] == "start"]
 
     def ledger_entries(self):
         path = self.root / "ledger.jsonl"
         if not path.exists():
             return []
-        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
     def verify_entries(self):
         return [entry for entry in self.ledger_entries() if entry.get("fleet_verify_evalid")]

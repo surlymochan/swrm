@@ -167,16 +167,11 @@ class EscalationGateRun(unittest.TestCase):
 
     def last_result(self):
         # The two files are written in different encodings by design:
-        # result.json is UTF-8 (jsave, ensure_ascii=False), while the
-        # ledger is appended in the process locale encoding (append_ledger
-        # opens without an encoding, and earlier tests in the same process
-        # already wrote non-ASCII lines — e.g. the em dash in the
-        # health-gate refusal text). Decode each file the way it was
-        # written: default (locale) encoding for the ledger, UTF-8 for
-        # result.json. A UTF-8 read of the ledger dies on Windows
-        # (UnicodeDecodeError on byte 0x97), and a locale read of
-        # result.json mojibakes the same em dash.
-        with open(xs.LEDGER) as f:
+        # Both files are UTF-8 (M34 slice 1, #269): result.json via jsave
+        # and the ledger via append_ledger, so both are read as UTF-8.
+        # (Before M34 the ledger was locale-encoded and this helper read
+        # it with the default encoding; that split is gone.)
+        with open(xs.LEDGER, encoding="utf-8") as f:
             entry = json.loads(f.readlines()[-1])
         with open(os.path.join(xs.RUNS, entry["id"], "result.json"), encoding="utf-8") as f:
             return entry, json.load(f)
