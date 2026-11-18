@@ -5,8 +5,10 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
+import tokenize
 import unittest
 import urllib.parse
 from unittest import mock
@@ -486,6 +488,184 @@ class LedgerTests(unittest.TestCase):
         with mock.patch.dict(os.environ, self.gh_env):
             with self.assertRaisesRegex(xs.BusError, "HTTP 500"):
                 xs.linked_pr_for_run({"id": run_id}, repo)
+
+
+class LedgerUtf8Tests(unittest.TestCase):
+    """M34 slice 1 (#269): ledger/result encoding is explicit UTF-8.
+
+    The ledger writer used to rely on the locale default encoding while
+    result.json was always written UTF-8 (jsave); under a cp1252 locale a
+    non-ASCII ledger line could not be read back as UTF-8. These tests pin
+    the unified UTF-8 behaviour, including a simulated non-UTF-8 locale.
+    """
+
+    TITLE = "中文任务名 \U0001F389 caf\u00e9 \u2014 non-ASCII ledger line"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="openswarm-ledger-utf8-")
+        self.root = Path(self.tmp.name)
+        self.constants = {key: getattr(xs, key) for key in ("DATA", "LEDGER", "RUNS", "HOME")}
+        xs.DATA = str(self.root / "data")
+        xs.LEDGER = str(self.root / "data" / "ledger.jsonl")
+        xs.RUNS = str(self.root / "data" / "runs")
+        xs.HOME = str(self.root / "home")
+
+    def tearDown(self):
+        for key, value in self.constants.items():
+            setattr(xs, key, value)
+        self.tmp.cleanup()
+
+    def test_result_json_and_ledger_agree_on_non_ascii(self):
+        entry = {"id": "m34s1-agree", "title": self.TITLE, "status": "ok"}
+        xs.append_ledger(entry)
+        result_path = self.root / "result.json"
+        xs.jsave(str(result_path), dict(entry))
+        ledger_entries = list(xs.ledger_entries())
+        self.assertEqual(len(ledger_entries), 1)
+        self.assertEqual(ledger_entries[0]["title"], self.TITLE)
+        self.assertEqual(xs.jload(str(result_path), {})["title"], self.TITLE)
+        self.assertEqual(ledger_entries[0]["title"],
+                         xs.jload(str(result_path), {})["title"])
+
+    def test_append_ledger_writes_utf8_under_c_locale(self):
+        """cp1252-style locale simulation (LC_ALL=C, no coercion).
+
+        Under this locale the default text encoding is ASCII, so a bare
+        open() cannot write the title at all (control assertion); the
+        ledger / result.json / event writers must still land as UTF-8
+        and read back character-for-character.
+        """
+        home = self.root / "driver-home"
+        data = self.root / "driver-data"
+        ledger = data / "ledger.jsonl"
+        result = self.root / "result.json"
+        events = self.root / "events.jsonl"
+        lane_events = self.root / "lane-events.jsonl"
+        bin_path = os.path.join(_load.ROOT, "bin", "openswarm")
+        driver = self.root / "driver.py"
+        driver.write_text(
+            "import importlib.machinery, importlib.util, json, locale, os, sys\n"
+            "os.environ['OPENSWARM_HOME'] = %r\n" % str(home)
+            + "loader = importlib.machinery.SourceFileLoader('openswarm', %r)\n" % bin_path
+            + "spec = importlib.util.spec_from_loader('openswarm', loader)\n"
+            + "mod = importlib.util.module_from_spec(spec)\n"
+            + "loader.exec_module(mod)\n"
+            + "mod.DATA = %r\n" % str(data)
+            + "mod.LEDGER = %r\n" % str(ledger)
+            + "print('preferred:', locale.getpreferredencoding(False))\n"
+            + "title = %r\n" % self.TITLE
+            + "try:\n"
+            + "    with open(%r, 'w') as fh:\n" % str(self.root / "bare-control.txt")
+            + "        fh.write(title)\n"
+            + "    print('bare-control: wrote')\n"
+            + "except UnicodeEncodeError:\n"
+            + "    print('bare-control: UnicodeEncodeError')\n"
+            + "mod.append_ledger({'id': 'm34s1-c-locale', 'title': title, 'status': 'ok'})\n"
+            + "mod.jsave(%r, {'id': 'm34s1-c-locale', 'title': title, 'status': 'ok'})\n" % str(result)
+            + "mod.bus_event(%r, title)\n" % str(events)
+            + "mod.lane_record_event(%r, {'type': 'note', 'text': title})\n" % str(lane_events)
+            , encoding="utf-8")
+        env = dict(os.environ)
+        env.update({"LC_ALL": "C", "LANG": "C",
+                    "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0"})
+        env.pop("PYTHONIOENCODING", None)
+        proc = subprocess.run([sys.executable, str(driver)],
+                              capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        preferred = proc.stdout.split("preferred:", 1)[1].splitlines()[0].strip()
+        self.assertIn(preferred.lower(), ("ascii", "ansi_x3.4-1968"))
+        self.assertIn("bare-control: UnicodeEncodeError", proc.stdout)
+        ledger_entry = json.loads(ledger.read_bytes().decode("utf-8"))
+        self.assertEqual(ledger_entry["title"], self.TITLE)
+        self.assertEqual(json.loads(result.read_bytes().decode("utf-8"))["title"],
+                         self.TITLE)
+        self.assertEqual(json.loads(events.read_bytes().decode("utf-8"))
+                         ["part"]["text"], self.TITLE)
+        self.assertEqual(json.loads(lane_events.read_bytes().decode("utf-8"))["text"],
+                         self.TITLE)
+
+    def test_existing_fixture_ledger_reads_identically(self):
+        fixture = Path(_load.HERE) / "fixtures" / "weighted-eval-real-ledger.jsonl"
+        copy = self.root / "fixture-ledger.jsonl"
+        copy.write_bytes(fixture.read_bytes())
+        expected = [json.loads(line) for line in
+                    copy.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(len(expected), 48)
+        self.assertEqual([e["id"] for e in xs.ledger_entries_from(str(copy))],
+                         [e["id"] for e in expected])
+        self.assertEqual([e["id"] for e in xs.recent_ledger(100, path=str(copy))],
+                         [e["id"] for e in expected])
+        xs.LEDGER = str(copy)
+        self.assertEqual([e["id"] for e in xs.fleet_read_ledger_entries()],
+                         [e["id"] for e in expected])
+        self.assertEqual([e["id"] for e in xs.ledger_entries()],
+                         [e["id"] for e in expected])
+
+    def test_legacy_cp1252_line_is_tolerated_and_not_rewritten(self):
+        ledger = self.root / "legacy-ledger.jsonl"
+        valid = {"id": "valid-utf8", "title": self.TITLE, "status": "ok"}
+        ascii_entry = {"id": "valid-ascii", "title": "plain ascii", "status": "ok"}
+        raw = (json.dumps(valid, ensure_ascii=False) + "\n").encode("utf-8")
+        raw += b'{"id": "legacy-cp1252", "title": "caf\xe9", "status": "failed"}\n'
+        raw += (json.dumps(ascii_entry, ensure_ascii=False) + "\n").encode("utf-8")
+        ledger.write_bytes(raw)
+        xs.LEDGER = str(ledger)
+        entries = list(xs.ledger_entries())
+        self.assertEqual([e["id"] for e in entries],
+                         ["valid-utf8", "legacy-cp1252", "valid-ascii"])
+        self.assertEqual(entries[0]["title"], self.TITLE)
+        self.assertEqual(entries[1]["title"], "caf\ufffd")
+        recent = xs.recent_ledger(10, path=str(ledger))
+        self.assertEqual(len(recent), 3)
+        self.assertEqual(recent[0]["title"], self.TITLE)
+        fleet = xs.fleet_read_ledger_entries()
+        self.assertEqual([e["id"] for e in fleet],
+                         ["valid-utf8", "legacy-cp1252", "valid-ascii"])
+        run_lines = xs.ledger_run_lines(str(ledger))
+        self.assertIn("valid-utf8", run_lines)
+        self.assertIn("valid-ascii", run_lines)
+        self.assertNotIn("legacy-cp1252", run_lines)
+        self.assertEqual(ledger.read_bytes(), raw)
+
+    def test_no_bare_text_open_in_bin(self):
+        """Guardrail: every text-mode open() in bin/openswarm is explicit
+        UTF-8. Binary opens, flock-only lock files and os.open() are the
+        only permitted residuals (encoding is meaningless for them)."""
+        path = os.path.join(_load.ROOT, "bin", "openswarm")
+        with tokenize.open(path) as stream:
+            tokens = list(tokenize.generate_tokens(stream.readline))
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        violations = []
+        prev = None
+        for index, tok in enumerate(tokens):
+            if tok.type != tokenize.NAME or tok.string != "open":
+                prev = tok
+                continue
+            nxt = tokens[index + 1] if index + 1 < len(tokens) else None
+            is_call = nxt is not None and nxt.type == tokenize.OP and nxt.string == "("
+            is_attribute = (prev is not None and prev.type == tokenize.OP
+                            and prev.string == ".")
+            prev = tok
+            if not is_call or is_attribute:
+                continue
+            start = tok.start[0] - 1
+            depth = 0
+            joined = []
+            for line in lines[start:]:
+                joined.append(line)
+                depth += line.count("(") - line.count(")")
+                if depth <= 0:
+                    break
+            text = "\n".join(joined)
+            if "encoding=" in text:
+                continue
+            if any(mode in text for mode in ('"rb"', '"ab"', '"wb"', '"a+b"',
+                                             "'rb'", "'ab'", "'wb'", "'a+b'")):
+                continue
+            if "lock" in text.lower():
+                continue
+            violations.append(f"line {tok.start[0]}: {lines[start].strip()}")
+        self.assertEqual(violations, [])
 
 
 if __name__ == "__main__":
