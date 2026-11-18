@@ -6563,7 +6563,12 @@ def execution_prompt(wd, task, scope="repo"):
 MODEL_UNAVAILABLE_RE = re.compile(r"(at capacity|server.?overloaded|overloaded|try a different model|model is not supported|not supported when using|model .{0,40}not (found|available))", re.I)
 OPENCODE_ABORT_RE = re.compile(r"stream error.*(usage limit exceeded|insufficient balance|quota exceeded|rate.?limit)", re.I)
 RATE_LIMIT_RE = re.compile(r"(\b429\b|resource[_ -]?exhausted|rate.?limit|usage limit|quota|too many requests|insufficient balance|spend.?control)", re.I)
-AUTH_ERROR_RE = re.compile(r"(authentication required|not authenticated|unauthenticated|not logged in|please log ?in|login required|auth(?:entication)? error|FatalAuthenticationError)", re.I)
+# M33 slice 3 (#266): agy 1.5.10 reports an unlogged-in session as
+# "Please sign in to view available models." — the sign-in family below
+# keeps that probe verdict unhealthy instead of unknown. All four
+# additions are unambiguous auth phrasings; every call site applies this
+# to a failed command's stderr / error text, never to passing output.
+AUTH_ERROR_RE = re.compile(r"(authentication required|not authenticated|unauthenticated|not logged in|please log ?in|please sign[- ]?in|sign[- ]in required|not signed in|must sign[- ]?in|login required|auth(?:entication)? error|FatalAuthenticationError)", re.I)
 
 
 def set_status(rdir, **kw):
