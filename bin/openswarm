@@ -5674,11 +5674,11 @@ def apply_quota_routing(profile, st, policy, decision, custom_backends=()):
 # Policy shape (policy.json, routing.health_gate):
 #   {"enabled": true, "timeout_seconds": 10, "on_unknown": "allow"}
 # Fleet exec forwarding (M25 slice 2, #204) gates a forwarded `run` on its
-# effective backend before any host exec attempt; the gate only runs in
-# cmd_run's single-dispatch path (initial pick + fallback re-route), in
+# effective backend before any host exec attempt; the gate runs in
+# cmd_run's single-dispatch path (initial pick + fallback re-route +
+# auto-rework escalation pick, gated by M33 slice 1, #263), in
 # execute_batch's per-card dispatch (M25 slice 1, #202, via
-# batch_health_gate), and in cmd_fleet's exec branch. The auto-rework
-# escalation pick is not gated in this slice (known gap, see README).
+# batch_health_gate), and in cmd_fleet's exec branch.
 # M31 slice 1 (#254): the fleet/batch probe runs on the executor host
 # (fleet_probe_host_health, via `openswarm health-probe` over the
 # transport for remote hosts, in-process for local hosts), and the gate
@@ -8859,23 +8859,47 @@ def cmd_run(args, policy, custom_backends=None):
                     auto_rework["escalation"] = {"skipped": "router returned the same backend",
                                                  "tier": stronger_tier}
                 else:
-                    esc_task = build_rework_task(task, verify, attempt=auto_rework["attempts"] + 1,
-                                                 max_attempts=max_attempts,
-                                                 escalated_from=decision["backend"])
-                    esc_final, esc_err = dispatch_rework(
-                        esc["backend"], esc, st_esc, esc_task, "escalation")
-                    verify = reverify_after_rework(esc["backend"], esc_final, esc_err)
-                    esc_verify = ({"rc": verify.get("rc"), "failing": sorted(verify.get("failing") or [])}
-                                  if verify else None)
-                    auto_rework["escalation"] = {"from_backend": decision["backend"],
-                                                 "to_backend": esc["backend"], "tier": esc.get("tier"),
-                                                 "model": esc.get("model"), "error_class": esc_err,
-                                                 "verify": esc_verify,
-                                                 "recovered": bool(verify and verify.get("rc") == 0)}
-                    auto_rework["rework_verify"] = esc_verify
-                    auto_rework["recovered"] = auto_rework["escalation"]["recovered"]
-                    if auto_rework["recovered"]:
-                        decision = esc
+                    # M33 slice 1 (#263): gate the escalation pick like the
+                    # initial pick and the fallback re-route (stage
+                    # "escalation", same config and probe state). A blocked
+                    # escalation dispatches nothing and never falls back to
+                    # the exhausted origin backend or a third backend: the
+                    # run keeps the last retry's verify result. When the
+                    # gate is off, apply_health_gate returns None and this
+                    # branch behaves exactly as before.
+                    esc_gate_record, esc_gate_blocked = apply_health_gate(
+                        esc["backend"], st_esc, policy, args,
+                        custom_backends=custom_backends, stage="escalation")
+                    if esc_gate_blocked:
+                        print(f"health-gate: escalation to {esc['backend']!r} refused: "
+                              f"{health_gate_error(esc_gate_record)}", file=sys.stderr)
+                        auto_rework["escalation"] = {
+                            "from_backend": decision["backend"],
+                            "to_backend": esc["backend"], "tier": esc.get("tier"),
+                            "model": esc.get("model"),
+                            "blocked": health_gate_error(esc_gate_record),
+                            "health_gate": esc_gate_record,
+                            "recovered": False}
+                    else:
+                        esc_task = build_rework_task(task, verify, attempt=auto_rework["attempts"] + 1,
+                                                     max_attempts=max_attempts,
+                                                     escalated_from=decision["backend"])
+                        esc_final, esc_err = dispatch_rework(
+                            esc["backend"], esc, st_esc, esc_task, "escalation")
+                        verify = reverify_after_rework(esc["backend"], esc_final, esc_err)
+                        esc_verify = ({"rc": verify.get("rc"), "failing": sorted(verify.get("failing") or [])}
+                                      if verify else None)
+                        auto_rework["escalation"] = {"from_backend": decision["backend"],
+                                                     "to_backend": esc["backend"], "tier": esc.get("tier"),
+                                                     "model": esc.get("model"), "error_class": esc_err,
+                                                     "verify": esc_verify,
+                                                     "recovered": bool(verify and verify.get("rc") == 0)}
+                        if esc_gate_record is not None:
+                            auto_rework["escalation"]["health_gate"] = esc_gate_record
+                        auto_rework["rework_verify"] = esc_verify
+                        auto_rework["recovered"] = auto_rework["escalation"]["recovered"]
+                        if auto_rework["recovered"]:
+                            decision = esc
     # --verify-evalid (M2 slice 1, #99): once, on the final verify/commit after
     # any rework loop, replay the executor's claim through evalid in a clean
     # clone and record claim, replay and verdict in the ledger.
