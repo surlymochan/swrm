@@ -573,7 +573,10 @@ class LedgerUtf8Tests(unittest.TestCase):
                               capture_output=True, text=True, env=env, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         preferred = proc.stdout.split("preferred:", 1)[1].splitlines()[0].strip()
-        self.assertIn(preferred.lower(), ("ascii", "ansi_x3.4-1968"))
+        # The simulated locale only needs to be *not* UTF-8 (ascii on a
+        # POSIX C locale, us-ascii on macOS, cp1252 on Windows); the
+        # bare-open control below proves it actually bites.
+        self.assertNotIn(preferred.lower().replace("_", "-"), ("utf-8", "utf8"))
         self.assertIn("bare-control: UnicodeEncodeError", proc.stdout)
         ledger_entry = json.loads(ledger.read_bytes().decode("utf-8"))
         self.assertEqual(ledger_entry["title"], self.TITLE)

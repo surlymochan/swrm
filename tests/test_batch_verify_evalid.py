@@ -170,7 +170,7 @@ class BatchRecordVerifyEvalid(unittest.TestCase):
         path = self.data / "ledger.jsonl"
         if not path.exists():
             return []
-        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
     def record(self, result, row=None):
         summary = {"id": "batch1", "scope": "repo"}
