@@ -1551,8 +1551,14 @@ _spawnable = _load_spawnable()
 
 
 def sh(cmd, timeout=60, env=None, cwd=None):
+    # Git/file bytes in this repo are UTF-8 (M34); decoding them with the
+    # locale default (cp1252 on Windows) raises UnicodeDecodeError in the
+    # reader thread on non-ASCII content (e.g. a Chinese title inside a
+    # format-patch) and the caller then sees patch=None. Decode as UTF-8
+    # with replacement so sh() stays total; on UTF-8 locales this is a no-op.
     try:
-        p = subprocess.run(_spawnable(cmd), capture_output=True, text=True, timeout=timeout, env=env,
+        p = subprocess.run(_spawnable(cmd), capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout, env=env,
                            cwd=cwd, stdin=subprocess.DEVNULL)
         return p.returncode, p.stdout, p.stderr
     except Exception as e:  # noqa: BLE001
@@ -21595,6 +21601,52 @@ def cmd_regress_compare(args):
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
 
+_UTF8_REEXEC_MARKER = "OPENSWARM_UTF8_REEXEC"
+
+
+def _ensure_utf8_filesystem_encoding():
+    """Re-exec once in UTF-8 mode when the filesystem encoding is ascii.
+
+    Under a POSIX C locale (LC_ALL=C, PYTHONCOERCECLOCALE=0, PYTHONUTF8=0)
+    CPython reports sys.getfilesystemencoding() == "ascii", and
+    subprocess.Popen then fails to encode a non-ASCII argv element (e.g. a
+    Chinese task title inside the executor prompt) with UnicodeEncodeError,
+    so the run dies before dispatch. Re-executing this process with
+    PYTHONUTF8=1 makes both this process and any Python executor children
+    (which inherit the environment) use UTF-8 for argv and stdio, so the
+    prompt crosses the argv channel intact.
+
+    Contained: runs as the first statement of main(), before any file or
+    network I/O; argv is passed through unchanged; the re-exec happens at
+    most once (guarded by the marker env var); if the exec itself fails we
+    continue in the original process and the run fails exactly as before.
+    Only the observed ascii failure is in scope: non-UTF-8 but non-ascii
+    locales (e.g. latin-1) are left alone, since argv bytes round-trip
+    there through surrogateescape. Windows already reports UTF-8 (PEP 529),
+    so this is a no-op there. The re-exec deliberately overrides an
+    inherited PYTHONUTF8=0: that combination is exactly the failure mode
+    being fixed, and the override is scoped to this process tree.
+    """
+    if sys.getfilesystemencoding().lower() != "ascii":
+        return
+    if os.environ.get(_UTF8_REEXEC_MARKER):
+        return
+    executable = sys.executable
+    if not executable:
+        return
+    execve = getattr(os, "execve", None)
+    if execve is None:  # e.g. Windows has no execve; it also reports UTF-8 already
+        return
+    try:
+        env = dict(os.environ)
+        env["PYTHONUTF8"] = "1"
+        env[_UTF8_REEXEC_MARKER] = "1"
+        argv = [executable, os.path.realpath(__file__)] + sys.argv[1:]
+        execve(executable, argv, env)
+    except Exception:
+        return
+
+
 def _configure_utf8_output():
     """Reconfigure stdout/stderr to UTF-8 (Windows: console defaults to cp1252).
 
@@ -21614,6 +21666,7 @@ def _configure_utf8_output():
 
 
 def main():
+    _ensure_utf8_filesystem_encoding()
     _configure_utf8_output()
     ap = argparse.ArgumentParser(prog="openswarm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
