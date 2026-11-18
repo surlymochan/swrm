@@ -7812,21 +7812,45 @@ class PiEventCompactor:
     `message_end`/`agent_end`; the authoritative final text and usage
     always arrive in `message_end`.
 
+    slice 1 covered plain-text deltas only. A real run on the merged
+    fix (M35 slice 2, #277) showed the same O(N*F) growth in the other
+    two delta kinds: a reasoning model streams long `thinking_delta`
+    updates whose `partial`/`message` repeat the full cumulative
+    thinking text, and `toolcall_delta` updates repeat the full
+    cumulative `partialJson` arguments string. The compactor therefore
+    handles all three streaming payloads -- a text block's `text`, a
+    thinking block's `thinking`, a toolCall block's `partialJson` --
+    selected by `contentIndex`, with the same prefix-extension proof
+    and the same pass-through rule for anything unrecognised.
+
+    The same real run showed a second shape slice 1 did not expect:
+    Pi sometimes batches two chunks into one snapshot, so a delta's
+    snapshot already contains the NEXT delta too (the new suffix starts
+    with the delta instead of equalling it). The compactor tracks the
+    consumed prefix -- the text already accounted for by emitted deltas
+    -- rather than the last snapshot: a batched delta still compacts
+    and advances the prefix by the delta only, and the remainder is
+    picked up by the following delta events. A delta that matches
+    neither the advance nor its prefix (duplicate or out-of-order
+    chunk) passes through verbatim with the prefix untouched, so a
+    later event can still match; a snapshot that no longer starts with
+    the prefix (regeneration or edit) re-baselines.
+
     Compaction keeps the wire format (JSONL, same event types) and every
     event: delta updates are rewritten to carry only the newly appended
     text (all other top-level fields, including the latest cumulative
     `usage`, are preserved), `*_end` updates keep their completed block
     but lose the redundant `partial` snapshot, and everything else passes
     through verbatim. A delta is only emitted when the cumulative text
-    provably extends the previous snapshot (prefix match and the new
-    suffix equals the update's `delta`); any regeneration, edit,
-    non-text content, or shape we do not recognise passes through
-    untouched, so a future Pi version can never be silently corrupted
-    by this filter. Reconstructing a message from a compacted stream:
-    concatenate the per-`contentIndex` deltas, then replace with
-    `message_end.message` when it arrives (Pi's own assemble-then-
-    replace rule). A delta-only Pi stream (newer versions) carries no
-    cumulative fields, so it passes through byte-identical.
+    provably extends the consumed prefix: the new suffix must equal the
+    update's `delta`, or start with it (batched snapshot, see above);
+    any regeneration, edit, non-text content, or shape we do not
+    recognise passes through untouched, so a future Pi version can
+    never be silently corrupted by this filter. Reconstructing a message
+    from a compacted stream: concatenate the per-`contentIndex` deltas,
+    then replace with `message_end.message` when it arrives (Pi's own
+    assemble-then-replace rule). A delta-only Pi stream (newer versions)
+    carries no cumulative fields, so it passes through byte-identical.
 
     Memory is bounded by one snapshot per live content block -- the
     current message size, never the whole log -- and output is written
@@ -7838,14 +7862,14 @@ class PiEventCompactor:
     START_KINDS = ("text_start", "thinking_start", "toolcall_start")
 
     def __init__(self):
-        self._prev = {}  # contentIndex -> cumulative text seen so far
+        self._prev = {}  # contentIndex -> consumed prefix (text already accounted for by emitted deltas)
         self.events_seen = 0
         self.events_compacted = 0
         self.bytes_in = 0
         self.bytes_out = 0
 
     def state_bytes(self):
-        """Characters currently held as per-block snapshots (<= live message size)."""
+        """Characters currently held as per-block consumed prefixes (<= live message size)."""
         return sum(len(v) for v in self._prev.values())
 
     @staticmethod
@@ -7873,13 +7897,48 @@ class PiEventCompactor:
             texts.append(text)
         return "".join(texts)
 
+    @staticmethod
+    def _streaming_string(message, index):
+        """Cumulative string of the streaming block at `index`, or None.
+
+        Pi repeats the full cumulative payload of the block being
+        streamed -- a text block's `text`, a thinking block's
+        `thinking`, a toolCall block's `partialJson` -- in both
+        `assistantMessageEvent.partial` and the top-level `message`
+        snapshot. Returns None (do not compact) when the block at
+        `index` is absent or carries no cumulative string, so unknown
+        shapes always pass through verbatim.
+        """
+        if not isinstance(message, dict):
+            return None
+        content = message.get("content")
+        if not isinstance(content, list):
+            return None
+        block = None
+        if isinstance(index, int) and 0 <= index < len(content):
+            block = content[index]
+        if not isinstance(block, dict):
+            # Fall back to the slice-1 shape: a message of only text blocks.
+            return PiEventCompactor._text_content(message)
+        btype = block.get("type")
+        if btype == "text":
+            text = block.get("text")
+            return text if isinstance(text, str) else None
+        if btype == "thinking":
+            thinking = block.get("thinking")
+            return thinking if isinstance(thinking, str) else None
+        if btype == "toolCall":
+            partial = block.get("partialJson")
+            return partial if isinstance(partial, str) else None
+        return None
+
     def _partial_text(self, ame):
         """Cumulative text carried by an assistantMessageEvent, or None."""
         partial = ame.get("partial")
         if isinstance(partial, str):
             return partial
         if isinstance(partial, dict):
-            text = self._text_content(partial)
+            text = self._streaming_string(partial, ame.get("contentIndex", 0))
             if text is not None:
                 return text
             inner = partial.get("text")
@@ -7922,28 +7981,48 @@ class PiEventCompactor:
             delta = ame.get("delta")
             if not isinstance(delta, str):
                 return event
-            current = self._text_content(event.get("message"))
+            current = self._streaming_string(event.get("message"), index)
             if current is None:
                 if "message" in event:
-                    # The snapshot carries non-text payload (e.g. a tool
-                    # call) the delta cannot reproduce: never drop it.
+                    # The snapshot carries a payload the delta cannot
+                    # reproduce (e.g. a completed tool call with no
+                    # partialJson): never drop it.
                     return event
                 current = self._partial_text(ame)
             if current is None:
                 return event
             prev = self._prev.get(index, "")
-            if current.startswith(prev) and current[len(prev):] == delta:
-                out = dict(event)
-                out["assistantMessageEvent"] = {"type": kind, "contentIndex": index, "delta": delta}
-                out.pop("message", None)
-                out["_swrm_compacted"] = True
+            if not current.startswith(prev):
+                # Regeneration, edit, or a stream first seen mid-flight:
+                # the old text is gone. Keep the full snapshot and
+                # re-baseline so later deltas can compact.
                 self._prev[index] = current
-                self.events_compacted += 1
-                return out
-            # Regeneration, edit, or a stream first seen mid-flight: keep
-            # the full snapshot and re-baseline so later deltas can compact.
-            self._prev[index] = current
-            return event
+                return event
+            rest = current[len(prev):]
+            if rest == delta:
+                # Classic append: the delta accounts for the whole advance.
+                self._prev[index] = current
+            elif rest.startswith(delta):
+                # Batched snapshot (real Pi, #277): one snapshot already
+                # contains this delta AND the next chunk(s). Record the
+                # delta and advance only by what it accounts for; the
+                # remainder is picked up by the following delta events.
+                # Reconstruction stays exact as long as the stream keeps
+                # flowing; on an interrupted tail it may lag the last
+                # snapshot by at most one batched jump (the authoritative
+                # text still arrives in message_end).
+                self._prev[index] = prev + delta
+            else:
+                # The delta does not match the snapshot advance (duplicate
+                # or out-of-order chunk). Keep the snapshot and leave the
+                # consumed prefix untouched so a later event can still match.
+                return event
+            out = dict(event)
+            out["assistantMessageEvent"] = {"type": kind, "contentIndex": index, "delta": delta}
+            out.pop("message", None)
+            out["_swrm_compacted"] = True
+            self.events_compacted += 1
+            return out
         return event
 
     def filter_line(self, line):
