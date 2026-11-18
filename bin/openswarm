@@ -7352,22 +7352,74 @@ def enforced_risk(event, policy, worktree, scope="repo"):
     return warning
 
 
-def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
+def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None, stream_filter=None):
     _tmpdir, env = configure_executor_environment(cwd, env)
     try:
-        return _run_proc(cmd, cwd, env, timeout, out_path, abort_re)
+        return _run_proc(cmd, cwd, env, timeout, out_path, abort_re, stream_filter)
     finally:
         cleanup_executor_tmp(cwd)
 
 
-def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
+def _stream_filter_writer(stream, out_path, stream_filter):
+    """Drain a child's stdout through `stream_filter`, appending to out_path.
+
+    Runs on a daemon thread so the child stalls on a full pipe (bounded
+    memory) instead of the parent buffering an unbounded stream. Each
+    filtered line is flushed as it arrives; on EOF the thread exits,
+    which is the signal that the tail (including `message_end`) is on
+    disk. A filter failure never loses a line: the raw line is written.
+    """
+    try:
+        with open(out_path, "a", encoding="utf-8", errors="replace") as fh:
+            for raw in stream:
+                line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+                if line.endswith("\n"):
+                    line = line[:-1]
+                if line.endswith("\r"):
+                    line = line[:-1]
+                try:
+                    out_lines = stream_filter(line)
+                except Exception:
+                    out_lines = [line]
+                for out_line in out_lines:
+                    fh.write(out_line + "\n")
+                fh.flush()
+    except Exception:
+        pass
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None, stream_filter=None):
     """Run an executor. abort_re: pattern that, once seen in stderr, means the executor will only retry
-    silently (e.g. opencode on a plan usage limit) — kill it early and return 75 so the caller can fall back."""
+    silently (e.g. opencode on a plan usage limit) — kill it early and return 75 so the caller can fall back.
+    stream_filter: optional callable mapping one stdout line to the lines to append to out_path
+    (e.g. PiEventCompactor.filter_line); when None, stdout goes straight to the file as before."""
     rdir = os.path.dirname(out_path)
     with open(out_path, "w", encoding="utf-8") as out, open(out_path + ".err", "w", encoding="utf-8") as err:
-        p = subprocess.Popen(_spawnable(cmd), cwd=cwd, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
-                             start_new_session=True)
+        if stream_filter is None:
+            p = subprocess.Popen(_spawnable(cmd), cwd=cwd, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+            writer = None
+        else:
+            p = subprocess.Popen(_spawnable(cmd), cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=err,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+            writer = threading.Thread(target=_stream_filter_writer, args=(p.stdout, out_path, stream_filter),
+                                      daemon=True)
+            writer.start()
         set_status(rdir, executor_pid=p.pid, events=out_path, attempt_started=NOW())
+
+        def _finish(rc):
+            # Join the writer so the tail is flushed before the caller
+            # reads the event file (pi_usage needs the final message_end);
+            # a stuck writer never hangs the run past the timeout.
+            if writer is not None:
+                writer.join(timeout=10)
+            return rc
+
         end = NOW() + timeout
         policy = load_policy()
         offset, pending = 0, ""
@@ -7399,7 +7451,7 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                         set_status(rdir, last_error="codex shell returned exit 0 with empty output repeatedly")
                         kill_tree(p.pid, grace=0.1)
                         p.wait()
-                        return 134
+                        return _finish(134)
                 if block and block.get("enforced") is False:
                     with open(out_path, "a", encoding="utf-8") as ev:
                         ev.write(json.dumps({"type": "risk_warning", **block}, ensure_ascii=False) + "\n")
@@ -7407,20 +7459,20 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                     set_status(rdir, risk_blocks=[block], stop_requested=True)
                     kill_tree(p.pid, grace=0.1)
                     p.wait()
-                    return 133
+                    return _finish(133)
             if done:
-                return p.returncode
+                return _finish(p.returncode)
             if (jload(os.path.join(rdir, "status.json"), {}) or {}).get("stop_requested"):
                 kill_tree(p.pid)
                 p.wait()
-                return 130
+                return _finish(130)
             if NOW() >= end:
                 kill_tree(p.pid)
                 try:
                     p.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
-                return 124
+                return _finish(124)
             if abort_re is not None:
                 try:
                     with open(out_path + ".err", errors="ignore", encoding="utf-8") as f:
@@ -7431,7 +7483,7 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                                 p.wait(timeout=5)
                             except subprocess.TimeoutExpired:
                                 pass
-                            return 75
+                            return _finish(75)
                 except OSError:
                     pass
             time.sleep(0.05)
@@ -7746,6 +7798,175 @@ PI_USAGE_KEYS = ("input", "output", "cacheRead", "cacheWrite")
 PI_TOOLS = "read,bash,edit,write,grep,find,ls"
 
 
+class PiEventCompactor:
+    """Bound Pi `--mode json` event-log growth without losing receipts (#218/#274/#275).
+
+    Incident: one run's event file passed 200 MB in ~2 minutes. 5,984
+    `message_update` events held 241,046,680 of 242,034,995 bytes: every
+    update repeats the full cumulative assistant text twice over -- once
+    as `assistantMessageEvent.partial` and once as the top-level `message`
+    snapshot -- so a message growing to F bytes over N updates costs
+    O(N*F) bytes on disk. Nothing in-repo reads those snapshots:
+    `summarize_event`/`WatchMessages` ignore `message_update`, `pi_usage`
+    reads only `message_end`, and the Pi lane branch reads only
+    `message_end`/`agent_end`; the authoritative final text and usage
+    always arrive in `message_end`.
+
+    Compaction keeps the wire format (JSONL, same event types) and every
+    event: delta updates are rewritten to carry only the newly appended
+    text (all other top-level fields, including the latest cumulative
+    `usage`, are preserved), `*_end` updates keep their completed block
+    but lose the redundant `partial` snapshot, and everything else passes
+    through verbatim. A delta is only emitted when the cumulative text
+    provably extends the previous snapshot (prefix match and the new
+    suffix equals the update's `delta`); any regeneration, edit,
+    non-text content, or shape we do not recognise passes through
+    untouched, so a future Pi version can never be silently corrupted
+    by this filter. Reconstructing a message from a compacted stream:
+    concatenate the per-`contentIndex` deltas, then replace with
+    `message_end.message` when it arrives (Pi's own assemble-then-
+    replace rule). A delta-only Pi stream (newer versions) carries no
+    cumulative fields, so it passes through byte-identical.
+
+    Memory is bounded by one snapshot per live content block -- the
+    current message size, never the whole log -- and output is written
+    as it arrives; nothing is buffered for a flush.
+    """
+
+    DELTA_KINDS = ("text_delta", "thinking_delta", "toolcall_delta")
+    END_KINDS = ("text_end", "thinking_end", "toolcall_end")
+    START_KINDS = ("text_start", "thinking_start", "toolcall_start")
+
+    def __init__(self):
+        self._prev = {}  # contentIndex -> cumulative text seen so far
+        self.events_seen = 0
+        self.events_compacted = 0
+        self.bytes_in = 0
+        self.bytes_out = 0
+
+    def state_bytes(self):
+        """Characters currently held as per-block snapshots (<= live message size)."""
+        return sum(len(v) for v in self._prev.values())
+
+    @staticmethod
+    def _text_content(message):
+        """Joined text of a message dict, or None if it is absent/non-text.
+
+        Returns None (do not compact) when any content block is not a
+        plain text block, so tool calls and other payloads always pass
+        through verbatim.
+        """
+        if not isinstance(message, dict):
+            return None
+        content = message.get("content")
+        if content is None:
+            return None
+        if not isinstance(content, list):
+            return None
+        texts = []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                return None
+            text = block.get("text")
+            if not isinstance(text, str):
+                return None
+            texts.append(text)
+        return "".join(texts)
+
+    def _partial_text(self, ame):
+        """Cumulative text carried by an assistantMessageEvent, or None."""
+        partial = ame.get("partial")
+        if isinstance(partial, str):
+            return partial
+        if isinstance(partial, dict):
+            text = self._text_content(partial)
+            if text is not None:
+                return text
+            inner = partial.get("text")
+            return inner if isinstance(inner, str) else None
+        return None
+
+    def compact_event(self, event):
+        """Return the event to record: compacted, or the same object untouched."""
+        if not isinstance(event, dict):
+            return event
+        etype = event.get("type")
+        if etype in ("message_start", "message_end", "agent_end", "turn_end"):
+            self._prev.clear()
+            return event
+        if etype != "message_update":
+            return event
+        ame = event.get("assistantMessageEvent")
+        if not isinstance(ame, dict):
+            return event
+        kind = ame.get("type")
+        index = ame.get("contentIndex", 0)
+        if kind == "start":
+            self._prev.clear()
+            return event
+        if kind in self.START_KINDS:
+            self._prev.pop(index, None)
+            return event
+        if kind in self.END_KINDS:
+            # Keep the completed block (content/thinking/toolCall) and any
+            # top-level fields; only the redundant cumulative snapshot goes.
+            out = dict(event)
+            slim = dict(ame)
+            removed = slim.pop("partial", None) is not None
+            out["assistantMessageEvent"] = slim
+            self._prev.pop(index, None)
+            if removed:
+                self.events_compacted += 1
+            return out
+        if kind in self.DELTA_KINDS:
+            delta = ame.get("delta")
+            if not isinstance(delta, str):
+                return event
+            current = self._text_content(event.get("message"))
+            if current is None:
+                if "message" in event:
+                    # The snapshot carries non-text payload (e.g. a tool
+                    # call) the delta cannot reproduce: never drop it.
+                    return event
+                current = self._partial_text(ame)
+            if current is None:
+                return event
+            prev = self._prev.get(index, "")
+            if current.startswith(prev) and current[len(prev):] == delta:
+                out = dict(event)
+                out["assistantMessageEvent"] = {"type": kind, "contentIndex": index, "delta": delta}
+                out.pop("message", None)
+                out["_swrm_compacted"] = True
+                self._prev[index] = current
+                self.events_compacted += 1
+                return out
+            # Regeneration, edit, or a stream first seen mid-flight: keep
+            # the full snapshot and re-baseline so later deltas can compact.
+            self._prev[index] = current
+            return event
+        return event
+
+    def filter_line(self, line):
+        """Map one raw JSONL line to the lines to write (usually one)."""
+        self.bytes_in += len(line.encode("utf-8", "replace"))
+        try:
+            event = json.loads(line)
+        except ValueError:
+            self.bytes_out += len(line.encode("utf-8", "replace"))
+            return [line]
+        if not isinstance(event, dict):
+            self.bytes_out += len(line.encode("utf-8", "replace"))
+            return [line]
+        self.events_seen += 1
+        compacted = self.compact_event(event)
+        if compacted is event or compacted == event:
+            self.bytes_out += len(line.encode("utf-8", "replace"))
+            return [line]
+        out = json.dumps(compacted, ensure_ascii=False)
+        self.bytes_out += len(out.encode("utf-8", "replace"))
+        return [out]
+
+
 def pi_usage(events_path):
     """Sum assistant `message_end` usage from a Pi `--mode json` stream. Returns (usage, final_text, errors)."""
     usage = {k: 0 for k in PI_USAGE_KEYS}
@@ -7805,7 +8026,11 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
     if d.get("_resume_session"):
         cmd.append("--continue")
     cmd += ["--tools", PI_TOOLS, prompt]
-    rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
+    # Bound the event log at the writer: Pi's --mode json stream repeats the
+    # full cumulative message in every message_update (#218: 241 MB of
+    # 242 MB in one run). The compactor rewrites those to deltas as the
+    # bytes arrive; message_end/tool lifecycle/usage pass through verbatim.
+    rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp, stream_filter=PiEventCompactor().filter_line)
     usage, text, errors = pi_usage(evp)
     final = extract_json(text) if isinstance(text, str) else None
     try:
@@ -11238,6 +11463,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                 turn.setdefault("steer_queue", []).append(value)
                 lane_cursor_cancel(child, turn)
     final, usage, errors = None, {}, []
+    pi_compactor = PiEventCompactor() if lane["backend"] == "pi" else None
     ended = False
     budget_hit = NOW() >= deadline
     risk_policy = load_policy()
@@ -11361,6 +11587,11 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
             elif method == "error":
                 errors.append(short(params.get("error") or params, 400))
         elif lane["backend"] == "pi":
+            if pi_compactor is not None:
+                # Bound the lane event log the same way as the one-shot path:
+                # cumulative message_update snapshots become deltas at record
+                # time (#218); message_end/agent_end pass through untouched.
+                msg = pi_compactor.compact_event(msg)
             lane_record_event(event_file, msg)
             if msg.get("type") == "message_end":
                 message = msg.get("message") or {}
