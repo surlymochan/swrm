@@ -200,6 +200,9 @@ post-execution command events cannot prevent initial side effects.
 `approval.enabled` (M38, #288, default off) pauses matching irreversible actions before
 execution instead of hard-blocking: `openswarm approval list|approve|reject` decides, the
 run resumes from the pause point on approval and skips the action on rejection/timeout.
+With the gate on, a Codex thread starts with `approvalPolicy: on-request` (M38 follow-up
+#292), so high-risk commands ask first; safe non-gated commands and in-worktree file
+changes are auto-approved, anything else stays declined.
 
 Use `--scope host` for task-card-authorized host maintenance with `run`, `lane assign`, or `batch`.
 The default `--scope repo` keeps the existing worktree-only prompt. Host scope permits listed
@@ -209,7 +212,8 @@ for swrm to commit. `rm outside worktree` and `sudo` become recorded RISK warnin
 and secret-print enforcement still stops the run, including later fragments and inner commands
 wrapped by `sudo`, `env`, `nohup`, or `timeout` (e.g. `sudo cat .env`). Warning-only Codex lane command
 approvals are accepted once, including legacy exec approvals; other unexpected Codex approvals
-remain denied. Run/lane ledger records, compact reports,
+remain denied unless the gate is on and the request is a safe non-gated command or an
+in-worktree file change (auto-approved, logged in the event file). Run/lane ledger records, compact reports,
 and daily HTML/JSON task rows include scope
 (legacy entries default to `repo`). `fleet exec` forwards this option to `run`.
 

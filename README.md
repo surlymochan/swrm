@@ -1008,9 +1008,14 @@ With `approval.enabled` (M38, #288), matching high-risk actions (policy `approva
 recorded in the ledger and the run waits for `openswarm approval approve|reject <id>`
 (`openswarm approval list` shows pending items). Approval resumes the run from the pause
 point; rejection or timeout skips the action and the run stops as `risk_blocked`. With the
-gate off, behaviour is byte-identical to today. One-shot runs have no permission-request
-channel and keep the enforcement block; Codex `fileChange`/`permissions` approval methods
-likewise keep the block.
+gate on, a Codex thread starts with `approvalPolicy: on-request`, so high-risk commands raise
+a permission request before executing; non-gated command requests are auto-approved only when
+every invocation is in the safe set (read-only git/view, in-worktree tests/builds and git
+writes — M38 follow-up #292), in-worktree file changes are auto-approved, and anything else
+(including `permissions`) stays declined, with each auto decision logged in the event file.
+With the gate off, behaviour is byte-identical to today. One-shot runs have no permission-request
+channel and keep the enforcement block; Codex `permissions` approval requests likewise keep
+the block.
 
 Use `--scope host` for explicitly authorized host operations with `run`, `lane assign`, or `batch`.
 The default `--scope repo` keeps the executor inside its worktree. Host scope allows task-card-listed

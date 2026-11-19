@@ -221,9 +221,11 @@ class ApprovalGateTests(unittest.TestCase):
         self.assertEqual(xs.lane_approval_reply(child, msg, False), "abort")
 
         # Unknown method / missing id: no reply shape, caller keeps the block.
+        # fileChange gained an accept/decline shape in the M38 follow-up
+        # (#292, D2.5), so it is asserted in test_m38fix_slice1.py instead.
         child = FakeChild(backend="codex")
         self.assertIsNone(xs.lane_approval_reply(
-            child, {"method": "item/fileChange/requestApproval", "id": "req-7"}, True))
+            child, {"method": "item/permissions/requestApproval", "id": "req-7"}, True))
         self.assertEqual(child.sent, [])
         self.assertIsNone(xs.lane_approval_reply(
             child, {"method": "session/request_permission"}, True))
