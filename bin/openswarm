@@ -58,6 +58,7 @@ import io
 import json
 import math
 import os
+import posixpath
 import re
 import select
 import shlex
@@ -7233,8 +7234,83 @@ def rm_outside_worktree(command, worktree):
     return rm_outside_worktree_class(command, worktree) == "outside"
 
 
-def redact_command(command):
+# Token prefixes that mark a literal secret; such tokens are always redacted,
+# including in evidence mode (M38 follow-up #292, D3).
+_SECRET_TOKEN_PREFIXES = ("sk-", "sk-ant-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
+                          "AKIA", "xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-", "xoxe-",
+                          "glpat-", "npm_", "pypi-", "hf_", "dckr_pat_")
+
+
+def _evidence_scrub_token(token, worktree):
+    """Scrub one evidence-retained operand: secrets, credentialed URLs, outside-worktree paths."""
+    value = token.partition("=")[2] if "=" in token else token
+    if any(value.startswith(prefix) for prefix in _SECRET_TOKEN_PREFIXES):
+        return "[redacted]"
+    if "://" in token:
+        try:
+            parts = urllib.parse.urlsplit(token)
+        except ValueError:
+            return "[redacted]"
+        if parts.scheme and parts.hostname:
+            return f"{parts.scheme}://{parts.hostname}"
+        return "[redacted]"
+    if worktree and (os.path.isabs(token) or "/" in token or token in ("..", ".")):
+        root = os.path.realpath(worktree)
+        try:
+            if os.path.commonpath([root, os.path.realpath(os.path.join(root, token))]) != root:
+                return "[redacted]"
+        except ValueError:
+            return "[redacted]"
+    elif worktree is None and (os.path.isabs(token) or posixpath.isabs(token)):
+        return "[redacted]"
+    return token
+
+
+def _evidence_kept_indices(tokens):
+    """Indices of decision-relevant operands an evidence redaction keeps (D3).
+
+    git push keeps the remote and refspec; npm/pnpm/yarn publish keeps the
+    --tag flag and value; gh release keeps the subcommand and tag. Everything
+    else follows the safe-set rule.
+    """
+    keep = set()
+    if not tokens:
+        return keep
+    verb = os.path.basename(tokens[0])
+    rest = [t for t in tokens[1:] if not t.startswith("-")]
+    if verb == "git" and rest[:1] == ["push"]:
+        start = tokens.index("push", 1) + 1
+        kept = 0
+        for i in range(start, len(tokens)):
+            if tokens[i].startswith("-"):
+                continue
+            if kept < 2:
+                keep.add(i)
+                kept += 1
+    elif verb in ("npm", "pnpm", "yarn") and rest[:1] == ["publish"]:
+        for i, tok in enumerate(tokens):
+            if tok == "--tag" and i + 1 < len(tokens):
+                keep.update((i, i + 1))
+            elif tok.startswith("--tag="):
+                keep.add(i)
+    elif verb == "gh" and rest[:1] == ["release"]:
+        for i in range(2, len(tokens)):
+            if not tokens[i].startswith("-"):
+                keep.add(i)
+                break
+        for i in range(3, len(tokens)):
+            if not tokens[i].startswith("-"):
+                keep.add(i)
+                break
+    return keep
+
+
+def redact_command(command, evidence=False, worktree=None):
     # Keep the operation recognizable without retaining arbitrary operands, URLs or literal secrets.
+    # evidence=True (M38 follow-up #292, D3) additionally keeps decision-relevant
+    # operands (push remote/refspec, publish tag, release tag), scrubbed of
+    # secrets, credentialed URLs and outside-worktree paths; the full command
+    # still lives only in the event file.
     safe = {"git", "push", "npm", "pnpm", "yarn", "publish", "twine", "upload", "gh", "release", "pr", "merge",
             "sudo", "rm", "cd", "echo", "printf", "printenv", "cat", "head", "tail", "bash", "sh",
             "&&", "||", ";", "|", "-r", "-rf", "-fr", "-f", "--force", "--", "-c", "-lc"}
@@ -7242,7 +7318,12 @@ def redact_command(command):
         tokens = shlex.split(command)
     except ValueError:
         return "[redacted command]"
-    return " ".join(token if token in safe else "[redacted]" for token in tokens)[:500]
+    if not evidence:
+        return " ".join(token if token in safe else "[redacted]" for token in tokens)[:500]
+    keep = _evidence_kept_indices(tokens)
+    return " ".join(_evidence_scrub_token(token, worktree) if i in keep else
+                    (token if token in safe else "[redacted]")
+                    for i, token in enumerate(tokens))[:500]
 
 
 def computer_use_risk(event):
@@ -7375,11 +7456,15 @@ APPROVAL_RISK_CATEGORIES = {"push": "push", "publish": "publish",
 APPROVALS = f"{DATA}/approvals.json"
 # Permission-request methods whose reply can be held while a human decides.
 # session/request_permission is ACP (cursor/hermes/copilot lanes); the two
-# item/exec methods are Codex app-server lanes. Other approval methods
-# (fileChange, permissions) have no in-code approved reply shape, so they
-# keep the enforcement block.
+# item/exec methods are Codex app-server lanes. item/fileChange has a known
+# reply shape since the M38 follow-up (#292, D2.5: accept/decline, probe to
+# confirm in slice 2); item/permissions still has none, so it keeps the block.
 APPROVAL_METHODS = ("session/request_permission", "item/commandExecution/requestApproval",
                     "execCommandApproval")
+# Codex permission-request methods routed by lane_approval_route (M38
+# follow-up #292, D2). session/request_permission is ACP and is not routed here.
+CODEX_APPROVAL_METHODS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                          "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval")
 APPROVAL_DECISIONS = ("approved", "rejected")
 
 
@@ -7398,6 +7483,17 @@ def approval_config(policy):
             "wait_seconds": max(0, wait)}
 
 
+def codex_approval_policy(policy=None):
+    """Approval policy for a new codex thread (M38 follow-up #292, D1).
+
+    "on-request" while the approval gate is on, so high-risk commands raise
+    item/commandExecution/requestApproval before executing and the gate can
+    hold them; "never" otherwise (the shipped default: gate off, behaviour
+    unchanged). Other backends and one-shot runs are untouched.
+    """
+    return "on-request" if approval_config(policy if policy is not None else load_policy())["enabled"] else "never"
+
+
 def _approval_git_destructive(event, worktree):
     """Git destructive verbs (reset --hard, checkout -f, clean -f).
 
@@ -7413,7 +7509,7 @@ def _approval_git_destructive(event, worktree):
             match = re.search(pattern, " ".join(words), re.I)
             if match and not str(match.group(1)).lower().startswith("push"):
                 return {"category": "destructive", "risk": "git destructive",
-                        "command": redact_command(command)}
+                        "command": redact_command(command, evidence=True, worktree=worktree)}
     return None
 
 
@@ -7434,6 +7530,23 @@ def approval_gate_for_block(block, policy):
     return {"category": category, "risk": block["risk"], "command": block.get("command")}
 
 
+def _approval_evidence_command(event, finding, policy, worktree, scope="repo"):
+    """Evidence form (D3) of the command that triggered a gate finding.
+
+    The enforced finding itself keeps the fully redacted command, so
+    risk_blocks never leak an operand; only gate records carry this form.
+    The triggering command is the first one in the event that reproduces the
+    finding's risk, re-detected on a single-command event (same rules).
+    Falls back to the finding's command when nothing reproduces it.
+    """
+    for command in event_commands(event):
+        probe = enforced_risk({"type": "tool_execution_start", "args": {"command": command}},
+                              policy, worktree, scope=scope)
+        if probe and probe.get("risk") == finding.get("risk"):
+            return redact_command(command, evidence=True, worktree=worktree)
+    return finding.get("command")
+
+
 def approval_risk(event, policy, worktree, scope="repo"):
     """Classify one executor event for the approval gate, or None.
 
@@ -7447,6 +7560,7 @@ def approval_risk(event, policy, worktree, scope="repo"):
     finding = enforced_risk(event, policy, worktree, scope=scope)
     gate = approval_gate_for_block(finding, policy)
     if gate:
+        gate["command"] = _approval_evidence_command(event, finding, policy, worktree, scope)
         return gate
     if finding is None and "destructive" in cfg["categories"]:
         return _approval_git_destructive(event, worktree)
@@ -7474,11 +7588,14 @@ def approval_save_run(rdir, entries):
 def approval_ledger_entry(record, kind):
     # No backend/model: routing-stat readers skip backend-less ledger lines,
     # so approval records never inflate run counts or pass rates.
-    return {"type": kind, "ts": NOW(), "status": f"approval_{record['status']}",
-            "run_id": record["run_id"],
-            "title": f"approval {record['id']} ({record['category']}/{record['risk']})",
-            "approval_id": record["id"], "approval_category": record["category"],
-            "approval_risk": record["risk"], "command": record.get("command")}
+    entry = {"type": kind, "ts": NOW(), "status": f"approval_{record['status']}",
+             "run_id": record["run_id"],
+             "title": f"approval {record['id']} ({record['category']}/{record['risk']})",
+             "approval_id": record["id"], "approval_category": record["category"],
+             "approval_risk": record["risk"], "command": record.get("command")}
+    if record.get("event_ref"):
+        entry["event_ref"] = record["event_ref"]
+    return entry
 
 
 def request_approval(run_id, rdir, finding, pause_point=None, event_file=None):
@@ -7495,6 +7612,17 @@ def request_approval(run_id, rdir, finding, pause_point=None, event_file=None):
               "command": finding.get("command"), "pause_point": pause_point or {},
               "created_ts": NOW(), "decided_ts": None, "decision": None,
               "decided_by": None, "reason": None}
+    if event_file:
+        # D3 (#292): point at the approval_requested line in the event file,
+        # so an operator can read the full command there; the record itself
+        # keeps only the evidence-redacted command.
+        try:
+            with open(event_file, "rb") as fh:
+                line_no = fh.read().count(b"\n") + 1
+        except OSError:
+            line_no = None
+        if line_no is not None:
+            record["event_ref"] = {"file": event_file, "line": line_no}
     entries = approval_load_run(rdir)
     entries.append(record)
     approval_save_run(rdir, entries)
@@ -7594,6 +7722,12 @@ def lane_approval_reply(child, msg, approved, event_file=None):
         child.send({"jsonrpc": "2.0", "id": req_id,
                     "result": {"decision": "approved" if approved else "abort"}})
         sent = "approved" if approved else "abort"
+    elif method == "item/fileChange/requestApproval":
+        # M38 follow-up (#292, D2.5): accept/decline is the first-choice shape;
+        # slice 2 probes it against a real codex lane.
+        child.send({"jsonrpc": "2.0", "id": req_id,
+                    "result": {"decision": "accept" if approved else "decline"}})
+        sent = "accept" if approved else "decline"
     else:
         return None
     if event_file:
@@ -11295,6 +11429,15 @@ class LaneChild:
                         raise RuntimeError(f"pi RPC {item.get('command')} failed: {short(item.get('error'), 250)}")
                     return item
                 if event_file and item.get("method") and "id" in item:
+                    if self.lane["backend"] == "codex" and item.get("method") in CODEX_APPROVAL_METHODS:
+                        # D2 (#292): never decline a Codex permission request
+                        # while waiting for an RPC reply; defer it to the
+                        # backlog so the event loop routes it (a gated
+                        # request must pause, not be refused inside a
+                        # turn/start wait). Slice 2 probes for deadlock
+                        # here; if it appears, revert to on-the-spot decline.
+                        deferred.append(item)
+                        continue
                     if lane_approval_response(self, item, event_file):
                         continue
                     if self.lane["backend"] in ("cursor", "hermes", "copilot") and lane_acp_request(self, item, event_file):
@@ -11645,7 +11788,7 @@ def lane_begin_turn(lane, child, prompt, worktree, event_file, turn):
     if lane["backend"] == "codex":
         req_id = "thread-" + uuid.uuid4().hex
         child.send({"jsonrpc": "2.0", "id": req_id, "method": "thread/start",
-                    "params": {"cwd": worktree, "model": lane["model"], "approvalPolicy": "never",
+                    "params": {"cwd": worktree, "model": lane["model"], "approvalPolicy": codex_approval_policy(),
                                "sandbox": load_policy().get("codex", {}).get("sandbox", "workspace-write"),
                                "ephemeral": True}})
         reply = child.wait_response(req_id, 60, event_file)
@@ -11806,6 +11949,261 @@ def lane_acp_request(child, msg, event_file):
     return True
 
 
+# ---------------------------------------------------------------- non-gated disposition (M38 follow-up #292, D2)
+#
+# With the gate on, a codex thread runs with approvalPolicy on-request, so
+# codex also asks about harmless commands. Those requests must not all pause
+# for a human: this table auto-approves only commands whose every invocation
+# is in the safe set, and declines everything else (fail closed). Transparent
+# wrappers (sh -c / env / timeout / ...) are not actions themselves; the
+# wrapped command is yielded as its own invocation and checked there. `cd`
+# is allowed only inside the worktree: it sets the cwd the later invocations
+# are checked against. Anything the table does not list is declined, and
+# every auto decision leaves an event-file trace (method + redacted command +
+# reason) so a stuck lane can be diagnosed from the event file.
+_NON_GATED_READONLY_GIT = {"status", "diff", "log", "show", "branch", "rev-parse", "ls-files"}
+_NON_GATED_READONLY_VIEW = {"ls", "pwd", "cat", "head", "tail", "grep", "rg", "wc", "echo", "printf"}
+_NON_GATED_TEST_VERBS = {"pytest", "vitest", "jest", "tsc", "eslint"}
+_NON_GATED_TEST_SUBCOMMANDS = {("npm", "test"), ("go", "test"), ("cargo", "test"), ("bun", "test")}
+_NON_GATED_GIT_WRITE = {"add", "commit", "checkout", "branch", "stash", "tag", "merge"}
+_NON_GATED_NETWORK_VERBS = {"curl", "wget", "ssh", "scp", "rsync"}
+_NON_GATED_TRANSPARENT_WRAPPERS = {"sh", "bash", "zsh", "dash", "ksh", "fish",
+                                   "env", "timeout", "nice", "exec", "command", "nohup", "!"}
+_NON_GATED_REDIRECT_OPS = {">", ">>", "<", "<<", "2>", "2>>", "&>", "&>>"}
+_NON_GATED_DEV_SINKS = {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin"}
+
+
+def _path_looks_like(token):
+    return "/" in token or token in ("..", ".") or token.startswith("~") or os.path.isabs(token)
+
+
+def _path_inside_worktree(token, cwd, root):
+    """Resolve one path-looking operand against cwd; True only when it stays in the worktree."""
+    if token.startswith("~"):
+        token = os.path.expanduser(token)
+    token = os.path.expandvars(token)
+    if "$" in token:
+        return False  # unresolvable variable: fail closed
+    path = os.path.realpath(os.path.join(cwd, token))
+    try:
+        return os.path.commonpath([root, path]) == root
+    except ValueError:
+        return False
+
+
+def _non_gated_operands_ok(words, cwd, root):
+    """(ok, reason) for the operands of one invocation: no outside-worktree path."""
+    expect_target = False
+    skip_next = False
+    for tok in words[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in ("-m", "--message"):
+            skip_next = True  # free text (commit message), not a path
+            continue
+        if expect_target:
+            expect_target = False
+            if tok in _NON_GATED_DEV_SINKS:
+                continue
+            if not _path_inside_worktree(tok, cwd, root):
+                return False, f"redirect target outside worktree: {tok}"
+            continue
+        if tok in _NON_GATED_REDIRECT_OPS or re.fullmatch(r"[0-9]*[<>]+", tok):
+            expect_target = True
+            continue
+        if tok.startswith("-") and "=" in tok:
+            _flag, _sep, value = tok.partition("=")
+            if _path_looks_like(value) and not _path_inside_worktree(value, cwd, root):
+                return False, f"option path outside worktree: {tok}"
+            continue
+        if tok.startswith("-"):
+            continue
+        if tok in _NON_GATED_DEV_SINKS:
+            continue
+        if _path_looks_like(tok) and not _path_inside_worktree(tok, cwd, root):
+            return False, f"path outside worktree: {tok}"
+    return True, ""
+
+
+def _non_gated_git_ok(words, cwd, root):
+    if len(words) < 2:
+        return False, "bare git is not auto-approved"
+    sub = words[1]
+    if sub in _NON_GATED_READONLY_GIT or sub in _NON_GATED_GIT_WRITE:
+        if sub == "checkout" and any(a in ("-f", "--force", "--") for a in words[2:]):
+            return False, "git checkout with -f/--force/-- is not auto-approved"
+        return _non_gated_operands_ok(words, cwd, root)
+    return False, f"git {sub} is not auto-approved"
+
+
+def _non_gated_invocation_ok(words, cwd, root):
+    """(ok, reason) for one shell invocation from shell_invocations()."""
+    if not words:
+        return True, ""
+    verb = os.path.basename(words[0])
+    if not verb or verb in _NON_GATED_REDIRECT_OPS or words[0].isdigit():
+        return True, ""  # redirect residue (e.g. the "1" of 2>&1), not a command
+    if verb in _NON_GATED_TRANSPARENT_WRAPPERS:
+        if verb in ("sh", "bash", "zsh", "dash", "ksh", "fish"):
+            body = None
+            for i, word in enumerate(words[1:], 1):
+                if word in ("-c", "--command") or re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", word):
+                    body = words[i + 1] if i + 1 < len(words) else None
+                    break
+            if body is None:
+                return False, f"shell {verb} without -c body"
+            # Recurse: shell_invocations also yields the body as its own
+            # invocation, but an unparseable body yields nothing there, so
+            # the body must be checked here to stay fail-closed.
+            return _non_gated_command_ok(body, root, cwd=cwd)
+        return True, ""
+    if verb == "sudo":
+        return False, "sudo is not auto-approved"
+    if verb in _NON_GATED_NETWORK_VERBS:
+        return False, f"network verb {verb} is not auto-approved"
+    if verb == "rm":
+        return False, "rm is not auto-approved"
+    if verb == "cd":
+        dest = words[1] if len(words) > 1 else HOME
+        if not _path_inside_worktree(dest, cwd, root):
+            return False, "cd outside worktree"
+        return True, ""
+    if verb == "git":
+        return _non_gated_git_ok(words, cwd, root)
+    if verb in _NON_GATED_READONLY_VIEW or verb in _NON_GATED_TEST_VERBS:
+        return _non_gated_operands_ok(words, cwd, root)
+    if verb in ("npm", "pnpm", "yarn", "go", "cargo", "bun"):
+        if len(words) > 1 and (verb, words[1]) in _NON_GATED_TEST_SUBCOMMANDS:
+            return _non_gated_operands_ok(words, cwd, root)
+        return False, f"{verb} {words[1] if len(words) > 1 else '(no subcommand)'} is not auto-approved"
+    return False, f"verb {verb} is not in the auto-approve set"
+
+
+def _non_gated_command_ok(command, worktree, cwd=None):
+    """(ok, reason) for one command string: every invocation must be auto-approvable."""
+    if not command or not command.strip():
+        return False, "empty command"
+    root = os.path.realpath(worktree)
+    base = os.path.realpath(cwd) if cwd else root
+    invocations = list(shell_invocations(command, base))
+    if not invocations:
+        return False, "unparseable command"
+    for words, invocation_cwd in invocations:
+        ok, reason = _non_gated_invocation_ok(words, invocation_cwd, root)
+        if not ok:
+            return False, reason
+    return True, ""
+
+
+def _non_gated_filechange_ok(msg, worktree):
+    """(ok, reason) for an item/fileChange/requestApproval message: every target must stay in the worktree."""
+    params = msg.get("params") or {}
+    paths = []
+
+    def visit(value):
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                if key in ("path", "paths"):
+                    if isinstance(item, str):
+                        paths.append(item)
+                    elif isinstance(item, list):
+                        paths.extend(str(x) for x in item if isinstance(x, str))
+                elif key == "uri" and isinstance(item, str):
+                    paths.append(item)
+                elif isinstance(item, (dict, list)):
+                    visit(item)
+
+    visit(params)
+    if not paths:
+        return False, "no file paths in request"
+    root = os.path.realpath(worktree)
+    for raw in paths:
+        path = raw
+        if path.startswith("file://"):
+            # Literal prefix strip (not urlsplit().path): on Windows the test
+            # form file://C:\...\wt/a.py puts the drive path in the netloc,
+            # which urlsplit would swallow, leaving only "/a.py".
+            path = urllib.parse.unquote(path[len("file://"):])
+            if path.startswith("localhost/"):
+                path = path[len("localhost/"):]
+            if len(path) >= 3 and path[0] == "/" and path[1].isalpha() and path[2] == ":":
+                path = path[1:]
+        if not _path_inside_worktree(path, root, root):
+            return False, f"file change outside worktree: {path}"
+    return True, ""
+
+
+def lane_approval_route(child, msg, event_file, policy, worktree, scope="repo", host_warning=False):
+    """Route one Codex permission request (M38 follow-up #292, D2).
+
+    Single disposition for non-gated Codex requests, used by the event loop;
+    wait_response defers Codex requests to the backlog so they arrive here
+    instead of being declined inside a turn/start wait. Enforced-risk blocks
+    and gated requests are handled by the caller before this runs (steps 1-2);
+    host warnings likewise (step 3). Returns True when the request was
+    handled (replied), False when msg is not a Codex permission request.
+    With the gate off, preserves today's blanket decline.
+    """
+    method = msg.get("method", "")
+    if method not in CODEX_APPROVAL_METHODS or "id" not in msg:
+        return False
+    if host_warning and method in ("item/commandExecution/requestApproval", "execCommandApproval"):
+        # Step 3 (unchanged): only command requests already classified as host
+        # warnings may proceed, once.
+        decision = "approved" if method == "execCommandApproval" else "accept"
+        child.send({"jsonrpc": "2.0", "id": msg.get("id"), "result": {"decision": decision}})
+        lane_record_event(event_file, {"type": "approval_auto_approved", "method": method,
+                                       "reason": "host warning (one-time)"})
+        return True
+    if host_warning:
+        # A host warning on a fileChange/permissions request still declines,
+        # exactly as lane_approval_response does today.
+        lane_approval_response(child, msg, event_file, host_warning=True)
+        return True
+    if not approval_config(policy)["enabled"]:
+        # Gate off: today's behaviour — blanket decline.
+        lane_approval_response(child, msg, event_file)
+        return True
+    if method in ("item/commandExecution/requestApproval", "execCommandApproval"):
+        commands = event_commands(msg)
+        if not commands:
+            lane_approval_reply(child, msg, False, event_file)
+            lane_record_event(event_file, {"type": "approval_declined_non_gated", "method": method,
+                                           "reason": "no command found in request"})
+            return True
+        for command in commands:
+            ok, reason = _non_gated_command_ok(command, worktree)
+            if not ok:
+                lane_approval_reply(child, msg, False, event_file)
+                lane_record_event(event_file, {"type": "approval_declined_non_gated", "method": method,
+                                               "reason": reason,
+                                               "command": redact_command(command, evidence=True, worktree=worktree)})
+                return True
+        lane_approval_reply(child, msg, True, event_file)
+        lane_record_event(event_file, {"type": "approval_auto_approved", "method": method,
+                                       "reason": "all invocations in safe set",
+                                       "command": "; ".join(redact_command(c, evidence=True, worktree=worktree)
+                                                           for c in commands)})
+        return True
+    if method == "item/fileChange/requestApproval":
+        ok, reason = _non_gated_filechange_ok(msg, worktree)
+        lane_approval_reply(child, msg, ok, event_file)
+        lane_record_event(event_file, {"type": "approval_auto_approved" if ok else "approval_declined_non_gated",
+                                       "method": method,
+                                       "reason": reason or "all paths inside worktree"})
+        return True
+    # Steps 6-7: permissions and unknown methods stay declined (permissions
+    # still replies with an empty set).
+    lane_approval_response(child, msg, event_file)
+    lane_record_event(event_file, {"type": "approval_declined_non_gated", "method": method,
+                                   "reason": "permissions/unknown method is not auto-approved"})
+    return True
+
+
 def lane_approval_response(child, msg, event_file, host_warning=False):
     method = msg.get("method", "")
     req_id = msg.get("id")
@@ -11950,9 +12348,9 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
             # point, rejected falls through to the block below. Git
             # destructive verbs are not enforced risks, so they arrive with
             # no block and are classified by approval_risk (same detector).
-            gate = approval_gate_for_block(block, risk_policy) if block else None
-            if gate is None and msg.get("method") in APPROVAL_METHODS and "id" in msg:
-                gate = approval_risk(msg, risk_policy, ws["path"], scope=spec.get("scope", "repo"))
+            # approval_risk re-derives the finding (same detection) and
+            # carries the evidence-form command on gate records (#292, D3).
+            gate = approval_risk(msg, risk_policy, ws["path"], scope=spec.get("scope", "repo"))
             replied = False
             if gate:
                 if lane_approval_pause(child, spec, msg, gate, rdir, event_file,
@@ -11979,8 +12377,9 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                 continue
         if lane["backend"] == "codex":
             if "method" in msg and "id" in msg:
-                if lane_approval_response(child, msg, event_file,
-                                          host_warning=bool(block and block.get("enforced") is False)):
+                if lane_approval_route(child, msg, event_file, risk_policy, ws["path"],
+                                       scope=spec.get("scope", "repo"),
+                                       host_warning=bool(block and block.get("enforced") is False)):
                     continue
             lane_record_event(event_file, msg)
             method = msg.get("method")
