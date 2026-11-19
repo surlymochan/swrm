@@ -22070,10 +22070,14 @@ def _count_event_file(path):
 def _find_ledger_pointer(run_id):
     """(1-based line number, byte offset) of the run's ledger row, or (None, None).
 
-    The last matching row wins (a run id is appended once, but a re-ingest
-    must not silently point at a stale row).
+    The run's own row (``id == run_id``) wins over rows that merely
+    reference the run (``run_id == run_id``, e.g. fleet dispatch rows):
+    the last id-match wins, and a run_id-match is only a fallback when no
+    id-match exists. A run id is appended once, but a re-ingest must not
+    silently point at a stale row.
     """
-    line_no, offset, found = None, None, None
+    id_line, id_offset = None, None
+    ref_line, ref_offset = None, None
     try:
         fh = open(LEDGER, "rb")
     except OSError:
@@ -22085,10 +22089,15 @@ def _find_ledger_pointer(run_id):
                 entry = json.loads(raw.decode("utf-8", errors="ignore"))
             except Exception:
                 entry = None
-            if isinstance(entry, dict) and (entry.get("id") == run_id or entry.get("run_id") == run_id):
-                line_no, offset, found = number, pos, entry
+            if isinstance(entry, dict):
+                if entry.get("id") == run_id:
+                    id_line, id_offset = number, pos
+                elif entry.get("run_id") == run_id:
+                    ref_line, ref_offset = number, pos
             pos += len(raw)
-    return line_no, offset
+    if id_line is not None:
+        return id_line, id_offset
+    return ref_line, ref_offset
 
 
 def _event_type_summary(counts):
@@ -22099,6 +22108,24 @@ def _trace_int(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return int(value)
+
+
+def _usage_value(usage, *keys):
+    """First present usage counter across backend key styles.
+
+    Pi backends record ``input``/``output``/``cacheRead``/``cacheWrite``;
+    agy backends record ``input_tokens``/``output_tokens``/
+    ``cache_read_tokens``/``cache_write_tokens``. Real runs of both kinds
+    exist (M36 slice 2), so the exporter must accept either style instead
+    of silently dropping the agy counters.
+    """
+    if not isinstance(usage, dict):
+        return None
+    for key in keys:
+        value = usage.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return None
 
 
 def build_run_trace(run_id):
@@ -22163,8 +22190,8 @@ def build_run_trace(run_id):
                   "swrm.rework_of": result.get("rework_of"), "swrm.commit": result.get("commit"),
                   "swrm.branch": result.get("branch"), "swrm.error_class": error_class,
                   "swrm.run.seconds": wall_seconds,
-                  "swrm.usage.input_tokens": _trace_int(usage.get("input")),
-                  "swrm.usage.output_tokens": _trace_int(usage.get("output")),
+                  "swrm.usage.input_tokens": _trace_int(_usage_value(usage, "input", "input_tokens")),
+                  "swrm.usage.output_tokens": _trace_int(_usage_value(usage, "output", "output_tokens")),
                   "swrm.ledger.line": ledger_line, "swrm.ledger.offset": ledger_offset,
                   "swrm.ledger.found": ledger_line is not None}
     if verify_evalid is not None:
@@ -22213,10 +22240,10 @@ def build_run_trace(run_id):
                    "swrm.events.lines": total_lines,
                    "swrm.events.types": _event_type_summary(type_counts) or None,
                    "swrm.events.missing": missing,
-                   "swrm.usage.input_tokens": _trace_int(a_usage.get("input")),
-                   "swrm.usage.output_tokens": _trace_int(a_usage.get("output")),
-                   "swrm.usage.cache_read": _trace_int(a_usage.get("cacheRead")),
-                   "swrm.usage.cache_write": _trace_int(a_usage.get("cacheWrite"))}
+                   "swrm.usage.input_tokens": _trace_int(_usage_value(a_usage, "input", "input_tokens")),
+                   "swrm.usage.output_tokens": _trace_int(_usage_value(a_usage, "output", "output_tokens")),
+                   "swrm.usage.cache_read": _trace_int(_usage_value(a_usage, "cacheRead", "cache_read_tokens")),
+                   "swrm.usage.cache_write": _trace_int(_usage_value(a_usage, "cacheWrite", "cache_write_tokens"))}
         attempt_spans.append(new_span("swrm.attempt", a_start, a_end, None, a_attrs,
                                       status_code=2 if a_failed else 1,
                                       status_message=str(attempt.get("error_class"))[:200] if a_failed and attempt.get("error_class") else None))
@@ -22236,7 +22263,13 @@ def build_run_trace(run_id):
         if isinstance(raw, int) and not isinstance(raw, bool):
             n_rework = raw
     if n_rework > 0 and attempt_spans:
-        first = max(0, len(attempt_spans) - n_rework)
+        # Escalation dispatches extra attempts that auto_rework.attempts does
+        # not count, so the rework chain is every attempt after the initial
+        # one; without escalation the tail N rework attempts are the chain.
+        if isinstance(auto_rework.get("escalation"), dict) and len(attempt_spans) > 1:
+            first = 1
+        else:
+            first = max(0, len(attempt_spans) - n_rework)
         rework_spans = attempt_spans[first:]
         r_start = float(rework_spans[0]["startTimeUnixNano"]) / 1e9
         r_end = float(rework_spans[-1]["endTimeUnixNano"]) / 1e9
