@@ -21975,6 +21975,365 @@ def _configure_utf8_output():
             pass
 
 
+# ---------------------------------------------------------------- OTel trace export (M36 slice 1, #280)
+# Maps a finished run (status.json + result.json + ledger row + per-attempt
+# event files) to OpenTelemetry spans and exports them as OTLP/HTTP JSON,
+# either to a local file (default, no network) or by POST to a configured
+# OTLP endpoint. Stdlib only; no new dependency. No free text from the run
+# (task, titles, event bodies) is copied into spans — only counts and
+# structured fields — so executor output and secrets never leave the run
+# directory through a trace. Span/time derivation rules are documented in
+# docs/m36-slice1-trace-export.md.
+#
+# Span tree (all spans kind INTERNAL, service.name=openswarm):
+#   swrm.run            root; status.json started..finished
+#   |- swrm.dispatch    route + probe + queue (started..execution_started)
+#   |- swrm.execute     first-attempt window; parents attempt spans
+#   |  |- swrm.attempt  one per result.json attempts[] entry, chained in order
+#   |- swrm.rework      only when auto_rework.attempts > 0; spans the last N
+#   |                    attempt spans (N = auto_rework attempts) and links them
+#   |- swrm.verify      only when result.json has a verify dict
+# Trace/span ids are deterministic (SHA-256 of run id / trace id + span
+# name + index) so the same run always exports the same trace.
+class TraceExportError(Exception):
+    pass
+
+
+TRACE_SCOPE_NAME = "openswarm"
+
+
+def _trace_id_for_run(run_id):
+    return hashlib.sha256(f"openswarm-trace:{run_id}".encode()).hexdigest()[:32]
+
+
+def _span_id_for(trace_id, name, index):
+    return hashlib.sha256(f"{trace_id}:{name}:{index}".encode()).hexdigest()[:16]
+
+
+def _trace_num(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _nanos(epoch_seconds):
+    return int(round(epoch_seconds * 1_000_000_000))
+
+
+def _otel_value(value):
+    if isinstance(value, bool):
+        return {"boolValue": value}
+    if isinstance(value, int):
+        return {"intValue": str(value)}
+    if isinstance(value, float):
+        return {"doubleValue": value}
+    return {"stringValue": str(value)}
+
+
+def _otel_attrs(mapping):
+    attrs = []
+    for key, value in (mapping or {}).items():
+        if value is None:
+            continue
+        attrs.append({"key": key, "value": _otel_value(value)})
+    return attrs
+
+
+def _count_event_file(path):
+    """(total_lines, {event_type: count}, missing) for one events file.
+
+    Streams the file; only the `type` field of each JSON line is counted.
+    Event bodies are never read into spans.
+    """
+    counts, total = {}, 0
+    try:
+        fh = open(path, encoding="utf-8", errors="ignore")
+    except OSError:
+        return 0, {}, True
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            total += 1
+            try:
+                event = json.loads(line)
+            except Exception:
+                counts["unparsed"] = counts.get("unparsed", 0) + 1
+                continue
+            kind = event.get("type") if isinstance(event, dict) else None
+            kind = kind if isinstance(kind, str) and kind else "unparsed"
+            counts[kind] = counts.get(kind, 0) + 1
+    return total, counts, False
+
+
+def _find_ledger_pointer(run_id):
+    """(1-based line number, byte offset) of the run's ledger row, or (None, None).
+
+    The last matching row wins (a run id is appended once, but a re-ingest
+    must not silently point at a stale row).
+    """
+    line_no, offset, found = None, None, None
+    try:
+        fh = open(LEDGER, "rb")
+    except OSError:
+        return None, None
+    with fh:
+        pos = 0
+        for number, raw in enumerate(fh, start=1):
+            try:
+                entry = json.loads(raw.decode("utf-8", errors="ignore"))
+            except Exception:
+                entry = None
+            if isinstance(entry, dict) and (entry.get("id") == run_id or entry.get("run_id") == run_id):
+                line_no, offset, found = number, pos, entry
+            pos += len(raw)
+    return line_no, offset
+
+
+def _event_type_summary(counts):
+    return ",".join(f"{kind}={counts[kind]}" for kind in sorted(counts))
+
+
+def _trace_int(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def build_run_trace(run_id):
+    """Build the OTLP payload for one finished run. Returns a trace dict.
+
+    Raises TraceExportError when the run directory or result.json is missing.
+    """
+    rdir = os.path.join(RUNS, run_id)
+    if not os.path.isdir(rdir):
+        raise TraceExportError(f"run not found: {run_id} (no run directory under {RUNS})")
+    result = jload(os.path.join(rdir, "result.json"), None)
+    if not isinstance(result, dict) or not result.get("id"):
+        raise TraceExportError(f"run {run_id} has no result.json (run incomplete or unknown)")
+    status = jload(os.path.join(rdir, "status.json"), {}) or {}
+    ledger_line, ledger_offset = _find_ledger_pointer(run_id)
+
+    trace_id = _trace_id_for_run(run_id)
+    spans = []
+    index = [0]
+
+    def new_span(name, start, end, parent_id, attrs, status_code=1, status_message=None, links=None):
+        index[0] += 1
+        span_id = _span_id_for(trace_id, name, index[0])
+        start = max(0.0, float(start))
+        end = max(start, float(end))
+        span = {"traceId": trace_id, "spanId": span_id, "name": name, "kind": 1,
+                "startTimeUnixNano": str(_nanos(start)), "endTimeUnixNano": str(_nanos(end)),
+                "attributes": _otel_attrs(attrs),
+                "status": {"code": status_code} if not status_message else
+                          {"code": status_code, "message": status_message}}
+        if parent_id:
+            span["parentSpanId"] = parent_id
+        if links:
+            span["links"] = [{"traceId": trace_id, "spanId": link} for link in links]
+        spans.append(span)
+        return span
+
+    # --- time base (fallback chain documented in docs/m36-slice1-trace-export.md)
+    attempts = result.get("attempts") if isinstance(result.get("attempts"), list) else []
+    attempt_seconds = sum(_trace_num(a.get("seconds")) or 0 for a in attempts if isinstance(a, dict))
+    wall_seconds = _trace_num(result.get("seconds")) or attempt_seconds
+    started = _trace_num(status.get("started"))
+    if started is None:
+        started = os.path.getmtime(os.path.join(rdir, "result.json")) - wall_seconds
+    finished = _trace_num(status.get("finished"))
+    if finished is None or finished < started:
+        finished = started + wall_seconds
+    if finished < started:
+        finished = started
+
+    verify = result.get("verify") if isinstance(result.get("verify"), dict) else None
+    verify_evalid = result.get("verify_evalid") if isinstance(result.get("verify_evalid"), dict) else None
+    auto_rework = result.get("auto_rework") if isinstance(result.get("auto_rework"), dict) else None
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    error_class = result.get("error_class")
+    run_status = result.get("status")
+    root_failed = bool(error_class) or run_status in ("failed", "stopped") or (
+        verify is not None and _trace_num(verify.get("rc")) not in (0, None))
+    root_attrs = {"swrm.run.id": run_id, "swrm.run.status": run_status,
+                  "swrm.backend": result.get("backend"), "swrm.model": result.get("model"),
+                  "swrm.effort": result.get("effort"), "swrm.card_type": result.get("card_type"),
+                  "swrm.rework_of": result.get("rework_of"), "swrm.commit": result.get("commit"),
+                  "swrm.branch": result.get("branch"), "swrm.error_class": error_class,
+                  "swrm.run.seconds": wall_seconds,
+                  "swrm.usage.input_tokens": _trace_int(usage.get("input")),
+                  "swrm.usage.output_tokens": _trace_int(usage.get("output")),
+                  "swrm.ledger.line": ledger_line, "swrm.ledger.offset": ledger_offset,
+                  "swrm.ledger.found": ledger_line is not None}
+    if verify_evalid is not None:
+        root_attrs["swrm.verify_evalid.verdict"] = verify_evalid.get("verdict")
+    root = new_span("swrm.run", started, finished, None, root_attrs,
+                    status_code=2 if root_failed else 1,
+                    status_message=str(error_class)[:200] if root_failed and error_class else None)
+    root_id = root["spanId"]
+
+    # --- dispatch: route + probe + queue
+    queued = _trace_num(status.get("queued_seconds")) or 0
+    exec_started = _trace_num(status.get("execution_started"))
+    dispatch_end = exec_started if exec_started is not None else started + queued
+    dispatch_end = min(max(dispatch_end, started), finished)
+    new_span("swrm.dispatch", started, dispatch_end, root_id,
+             {"swrm.backend": result.get("backend"), "swrm.model": result.get("model"),
+              "swrm.effort": result.get("effort"),
+              "swrm.dispatch.queued_seconds": queued,
+              "swrm.dispatch.routed_by_advice": result.get("routed_by_advice"),
+              "swrm.dispatch.routed_from": result.get("routed_from")})
+
+    # --- execute + attempt spans, chained in order (absolute per-attempt
+    # starts are not recorded; each attempt starts where the previous ended)
+    cursor = dispatch_end
+    attempt_spans = []
+    for number, attempt in enumerate(attempts, start=1):
+        if not isinstance(attempt, dict):
+            continue
+        seconds = _trace_num(attempt.get("seconds")) or 0
+        a_start, a_end = cursor, min(cursor + seconds, finished)
+        a_end = max(a_end, a_start)
+        cursor = a_end
+        meta = attempt.get("meta") if isinstance(attempt.get("meta"), dict) else {}
+        a_usage = meta.get("usage") if isinstance(meta.get("usage"), dict) else {}
+        events_path = attempt.get("events")
+        total_lines, type_counts, missing = ((0, {}, True) if not events_path else
+                                            _count_event_file(events_path))
+        a_rc = attempt.get("rc")
+        a_failed = (isinstance(a_rc, int) and not isinstance(a_rc, bool) and a_rc != 0) or bool(attempt.get("error_class"))
+        a_attrs = {"swrm.attempt.number": number, "swrm.attempt.backend": attempt.get("backend"),
+                   "swrm.attempt.model": attempt.get("model"), "swrm.attempt.effort": attempt.get("effort"),
+                   "swrm.attempt.rc": a_rc if isinstance(a_rc, int) and not isinstance(a_rc, bool) else None,
+                   "swrm.attempt.error_class": attempt.get("error_class"),
+                   "swrm.attempt.seconds": seconds,
+                   "swrm.events.file": os.path.basename(str(events_path)) if events_path else None,
+                   "swrm.events.lines": total_lines,
+                   "swrm.events.types": _event_type_summary(type_counts) or None,
+                   "swrm.events.missing": missing,
+                   "swrm.usage.input_tokens": _trace_int(a_usage.get("input")),
+                   "swrm.usage.output_tokens": _trace_int(a_usage.get("output")),
+                   "swrm.usage.cache_read": _trace_int(a_usage.get("cacheRead")),
+                   "swrm.usage.cache_write": _trace_int(a_usage.get("cacheWrite"))}
+        attempt_spans.append(new_span("swrm.attempt", a_start, a_end, None, a_attrs,
+                                      status_code=2 if a_failed else 1,
+                                      status_message=str(attempt.get("error_class"))[:200] if a_failed and attempt.get("error_class") else None))
+    # Parent attempt spans under the execute phase span (created after the
+    # attempts so its end is the last attempt end).
+    execute_end = cursor
+    execute = new_span("swrm.execute", dispatch_end, execute_end, root_id,
+                       {"swrm.execute.attempts": len(attempt_spans)})
+    for span in attempt_spans:
+        span["parentSpanId"] = execute["spanId"]
+
+    # --- rework: last N attempts, where N = auto_rework.attempts (each rework
+    # dispatch contributes at least one attempt, so the tail is rework)
+    n_rework = 0
+    if auto_rework is not None:
+        raw = auto_rework.get("attempts")
+        if isinstance(raw, int) and not isinstance(raw, bool):
+            n_rework = raw
+    if n_rework > 0 and attempt_spans:
+        first = max(0, len(attempt_spans) - n_rework)
+        rework_spans = attempt_spans[first:]
+        r_start = float(rework_spans[0]["startTimeUnixNano"]) / 1e9
+        r_end = float(rework_spans[-1]["endTimeUnixNano"]) / 1e9
+        rework_verify = auto_rework.get("rework_verify") if isinstance(auto_rework.get("rework_verify"), dict) else None
+        new_span("swrm.rework", r_start, r_end, root_id,
+                 {"swrm.rework.attempts": n_rework,
+                  "swrm.rework.max_attempts": auto_rework.get("max_attempts"),
+                  "swrm.rework.recovered": auto_rework.get("recovered"),
+                  "swrm.rework.final_verify_rc": rework_verify.get("rc") if rework_verify else None},
+                 status_code=2 if not auto_rework.get("recovered") else 1,
+                 links=[span["spanId"] for span in rework_spans])
+
+    # --- verify: runs after the last attempt, ends at the run finish
+    if verify is not None:
+        v_seconds = _trace_num(verify.get("seconds")) or 0
+        v_end = finished
+        v_start = max(cursor, v_end - v_seconds)
+        v_rc = verify.get("rc")
+        v_failed = isinstance(v_rc, int) and not isinstance(v_rc, bool) and v_rc != 0
+        failing = verify.get("failing") if isinstance(verify.get("failing"), list) else []
+        new_span("swrm.verify", v_start, v_end, root_id,
+                 {"swrm.verify.phase": verify.get("phase"), "swrm.verify.rc": v_rc if isinstance(v_rc, int) and not isinstance(v_rc, bool) else None,
+                  "swrm.verify.seconds": v_seconds, "swrm.verify.failing_count": len(failing)},
+                 status_code=2 if v_failed else 1,
+                 status_message=("verify rc=%s" % v_rc) if v_failed else None)
+
+    payload = {"resourceSpans": [{"resource": {"attributes": _otel_attrs(
+        {"service.name": "openswarm", "swrm.run.id": run_id})},
+        "scopeSpans": [{"scope": {"name": TRACE_SCOPE_NAME}, "spans": spans}]}]}
+    return {"run_id": run_id, "run_dir": rdir, "trace_id": trace_id,
+            "span_count": len(spans), "payload": payload,
+            "ledger_line": ledger_line, "ledger_offset": ledger_offset}
+
+
+def post_otlp(endpoint, payload, timeout=10):
+    """POST an OTLP JSON payload; returns the HTTP status. Only 2xx counts
+    as sent — anything else raises TraceExportError, never a fake success."""
+    import urllib.error
+    import urllib.request
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(endpoint, data=body, method="POST",
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = response.status
+    except urllib.error.HTTPError as error:
+        raise TraceExportError(f"endpoint returned HTTP {error.code}") from error
+    except (urllib.error.URLError, OSError, TimeoutError) as error:
+        raise TraceExportError(f"endpoint unreachable: {error}") from error
+    if status < 200 or status >= 300:
+        raise TraceExportError(f"endpoint returned HTTP {status}")
+    return status
+
+
+def cmd_trace_export(args, policy):
+    endpoint = args.endpoint if args.endpoint is not None else envvar("OTLP_ENDPOINT")
+    if args.endpoint == "":
+        print("openswarm: trace export: --endpoint is empty; pass an OTLP/HTTP URL or set OPENSWARM_OTLP_ENDPOINT",
+              file=sys.stderr)
+        sys.exit(2)
+    if getattr(args, "no_file", False) and not endpoint:
+        print("openswarm: trace export: --no-file requires --endpoint (or OPENSWARM_OTLP_ENDPOINT)",
+              file=sys.stderr)
+        sys.exit(2)
+    try:
+        trace = build_run_trace(args.run_id)
+    except TraceExportError as error:
+        print(f"openswarm: trace export: {error}", file=sys.stderr)
+        sys.exit(2)
+    out_path = args.out or os.path.join(trace["run_dir"], "trace.otlp.json")
+    file_written = None
+    if not getattr(args, "no_file", False):
+        try:
+            parent = os.path.dirname(out_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as fh:
+                json.dump(trace["payload"], fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+            file_written = out_path
+        except OSError as error:
+            print(f"openswarm: trace export: cannot write {out_path}: {error}", file=sys.stderr)
+            sys.exit(1)
+    http_status = None
+    if endpoint:
+        try:
+            http_status = post_otlp(endpoint, trace["payload"], timeout=args.timeout)
+        except TraceExportError as error:
+            note = (f" (trace file kept at {file_written}; not reported as sent)" if file_written
+                    else " (nothing was reported as sent)")
+            print(f"openswarm: trace export: OTLP POST to {endpoint} failed: {error}{note}", file=sys.stderr)
+            sys.exit(1)
+    print(json.dumps({"run_id": trace["run_id"], "trace_id": trace["trace_id"], "spans": trace["span_count"],
+                      "file": file_written, "endpoint": endpoint, "http_status": http_status,
+                      "exported": True}, indent=2, ensure_ascii=False))
+
+
 def main():
     _ensure_utf8_filesystem_encoding()
     _configure_utf8_output()
@@ -22218,6 +22577,17 @@ def main():
     sp = sub.add_parser("diagnose", help="classify a failed run from its ledger, status and logs (M10, #137)")
     sp.add_argument("run_id", help="run id under $OPENSWARM_HOME/runs")
     sp.add_argument("--json", action="store_true", help="print the diagnosis as JSON (default output is JSON)")
+
+    sp = sub.add_parser("trace", help="export a finished run as OpenTelemetry spans (M36 slice 1, #280)")
+    trace_sub = sp.add_subparsers(dest="trace_cmd", required=True)
+    tp = trace_sub.add_parser("export", help="export one run to local OTLP JSON and/or an OTLP/HTTP endpoint")
+    tp.add_argument("run_id", help="run id, e.g. 20261119-090000-abcdef")
+    tp.add_argument("--out", default=None, help="OTLP JSON file path (default: <run-dir>/trace.otlp.json)")
+    tp.add_argument("--endpoint", default=None,
+                    help="OTLP/HTTP endpoint URL, e.g. http://localhost:4318/v1/traces (or OPENSWARM_OTLP_ENDPOINT)")
+    tp.add_argument("--no-file", action="store_true",
+                    help="do not write the local OTLP JSON file (requires --endpoint)")
+    tp.add_argument("--timeout", type=float, default=10.0, help="OTLP/HTTP POST timeout in seconds (default: 10)")
 
     sp = sub.add_parser("resume", help="list active runs and busy lanes after planner restart")
     sp.add_argument("--since-hours", type=float, default=6,
@@ -22610,6 +22980,9 @@ def main():
         cmd_runs(a, policy)
     elif a.cmd == "diagnose":
         cmd_diagnose(a)
+    elif a.cmd == "trace":
+        if a.trace_cmd == "export":
+            cmd_trace_export(a, policy)
     elif a.cmd == "resume":
         try:
             cmd_resume(a)

@@ -1,0 +1,459 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "openswarm"
+            }
+          },
+          {
+            "key": "swrm.run.id",
+            "value": {
+              "stringValue": "20261119-090000-m36s1x"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "openswarm"
+          },
+          "spans": [
+            {
+              "traceId": "bff2a184db6ec71c1394c77d7966d527",
+              "spanId": "69245f476770d423",
+              "name": "swrm.run",
+              "kind": 1,
+              "startTimeUnixNano": "1792966800000000000",
+              "endTimeUnixNano": "1792966920500000000",
+              "attributes": [
+                {
+                  "key": "swrm.run.id",
+                  "value": {
+                    "stringValue": "20261119-090000-m36s1x"
+                  }
+                },
+                {
+                  "key": "swrm.run.status",
+                  "value": {
+                    "stringValue": "done"
+                  }
+                },
+                {
+                  "key": "swrm.backend",
+                  "value": {
+                    "stringValue": "pi"
+                  }
+                },
+                {
+                  "key": "swrm.model",
+                  "value": {
+                    "stringValue": "MiniMax-M3.1-Flash-Preview"
+                  }
+                },
+                {
+                  "key": "swrm.effort",
+                  "value": {
+                    "stringValue": "high"
+                  }
+                },
+                {
+                  "key": "swrm.card_type",
+                  "value": {
+                    "stringValue": "feature"
+                  }
+                },
+                {
+                  "key": "swrm.rework_of",
+                  "value": {
+                    "stringValue": "20261119-080000-prev01"
+                  }
+                },
+                {
+                  "key": "swrm.commit",
+                  "value": {
+                    "stringValue": "abc1234def5678"
+                  }
+                },
+                {
+                  "key": "swrm.branch",
+                  "value": {
+                    "stringValue": "openswarm/20261119-090000-m36s1x"
+                  }
+                },
+                {
+                  "key": "swrm.run.seconds",
+                  "value": {
+                    "doubleValue": 120.5
+                  }
+                },
+                {
+                  "key": "swrm.usage.input_tokens",
+                  "value": {
+                    "intValue": "1000"
+                  }
+                },
+                {
+                  "key": "swrm.usage.output_tokens",
+                  "value": {
+                    "intValue": "500"
+                  }
+                },
+                {
+                  "key": "swrm.ledger.found",
+                  "value": {
+                    "boolValue": false
+                  }
+                },
+                {
+                  "key": "swrm.verify_evalid.verdict",
+                  "value": {
+                    "stringValue": "pass"
+                  }
+                }
+              ],
+              "status": {
+                "code": 1
+              }
+            },
+            {
+              "traceId": "bff2a184db6ec71c1394c77d7966d527",
+              "spanId": "e5167cedaed27790",
+              "name": "swrm.dispatch",
+              "kind": 1,
+              "startTimeUnixNano": "1792966800000000000",
+              "endTimeUnixNano": "1792966802000000000",
+              "attributes": [
+                {
+                  "key": "swrm.backend",
+                  "value": {
+                    "stringValue": "pi"
+                  }
+                },
+                {
+                  "key": "swrm.model",
+                  "value": {
+                    "stringValue": "MiniMax-M3.1-Flash-Preview"
+                  }
+                },
+                {
+                  "key": "swrm.effort",
+                  "value": {
+                    "stringValue": "high"
+                  }
+                },
+                {
+                  "key": "swrm.dispatch.queued_seconds",
+                  "value": {
+                    "doubleValue": 2.0
+                  }
+                }
+              ],
+              "status": {
+                "code": 1
+              },
+              "parentSpanId": "69245f476770d423"
+            },
+            {
+              "traceId": "bff2a184db6ec71c1394c77d7966d527",
+              "spanId": "fd68878755fb8ba4",
+              "name": "swrm.attempt",
+              "kind": 1,
+              "startTimeUnixNano": "1792966802000000000",
+              "endTimeUnixNano": "1792966862000000000",
+              "attributes": [
+                {
+                  "key": "swrm.attempt.number",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "swrm.attempt.backend",
+                  "value": {
+                    "stringValue": "pi"
+                  }
+                },
+                {
+                  "key": "swrm.attempt.model",
+                  "value": {
+                    "stringValue": "MiniMax-M3.1-Flash-Preview"
+                  }
+                },
+                {
+                  "key": "swrm.attempt.effort",
+                  "value": {
+                    "stringValue": "high"
+                  }
+                },
+                {
+                  "key": "swrm.attempt.rc",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "swrm.attempt.error_class",
+                  "value": {
+                    "stringValue": "test_failure"
+                  }
+                },
+                {
+                  "key": "swrm.attempt.seconds",
+                  "value": {
+                    "doubleValue": 60.0
+                  }
+                },
+                {
+                  "key": "swrm.events.file",
+                  "value": {
+                    "stringValue": "events.1.pi.jsonl"
+                  }
+                },
+                {
+                  "key": "swrm.events.lines",
+                  "value": {
+                    "intValue": "6"
+                  }
+                },
+                {
+                  "key": "swrm.events.types",
+                  "value": {
+                    "stringValue": "agent_end=1,message_end=1,message_start=1,message_update=2,session=1"
+                  }
+                },
+                {
+                  "key": "swrm.events.missing",
+                  "value": {
+                    "boolValue": false
+                  }
+                },
+                {
+                  "key": "swrm.usage.input_tokens",
+                  "value": {
+                    "intValue": "800"
+                  }
+                },
+                {
+                  "key": "swrm.usage.output_tokens",
+                  "value": {
+                    "intValue": "400"
+                  }
+                },
+                {
+                  "key": "swrm.usage.cache_read",
+                  "value": {
+                    "intValue": "10"
+                  }
+                },
+                {
+                  "key": "swrm.usage.cache_write",
+                  "value": {
+                    "intValue": "2"
+                  }
+                }
+              ],
+              "status": {
+                "code": 2,
+                "message": "test_failure"
+              },
+              "parentSpanId": "1be9057335d443d1"
+            },
+            {
+              "traceId": "bff2a184db6ec71c1394c77d7966d527",
+              "spanId": "dfd043fa7ed3151e",
+              "name": "swrm.attempt",
+              "kind": 1,
+              "startTimeUnixNano": "1792966862000000000",
+              "endTimeUnixNano": "1792966917500000000",
+              "attributes": [
+                {
+                  "key": "swrm.attempt.number",
+                  "value": {
+                    "intValue": "2"
+                  }
+                },
+                {
+                  "key": "swrm.attempt.backend",
+                  "value": {
+                    "stringValue": "pi"
+                  }
+                },
+                {
+                  "key": "swrm.attempt.model",
+                  "value": {
+                    "stringValue": "MiniMax-M3.1-Flash-Preview"
+                  }
+                },
+                {
+                  "key": "swrm.attempt.effort",
+                  "value": {
+                    "stringValue": "high"
+                  }
+                },
+                {
+                  "key": "swrm.attempt.rc",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "swrm.attempt.seconds",
+                  "value": {
+                    "doubleValue": 55.5
+                  }
+                },
+                {
+                  "key": "swrm.events.file",
+                  "value": {
+                    "stringValue": "events.2.pi.jsonl"
+                  }
+                },
+                {
+                  "key": "swrm.events.lines",
+                  "value": {
+                    "intValue": "3"
+                  }
+                },
+                {
+                  "key": "swrm.events.types",
+                  "value": {
+                    "stringValue": "message_end=1,message_start=1,session=1"
+                  }
+                },
+                {
+                  "key": "swrm.events.missing",
+                  "value": {
+                    "boolValue": false
+                  }
+                },
+                {
+                  "key": "swrm.usage.input_tokens",
+                  "value": {
+                    "intValue": "200"
+                  }
+                },
+                {
+                  "key": "swrm.usage.output_tokens",
+                  "value": {
+                    "intValue": "100"
+                  }
+                }
+              ],
+              "status": {
+                "code": 1
+              },
+              "parentSpanId": "1be9057335d443d1"
+            },
+            {
+              "traceId": "bff2a184db6ec71c1394c77d7966d527",
+              "spanId": "1be9057335d443d1",
+              "name": "swrm.execute",
+              "kind": 1,
+              "startTimeUnixNano": "1792966802000000000",
+              "endTimeUnixNano": "1792966917500000000",
+              "attributes": [
+                {
+                  "key": "swrm.execute.attempts",
+                  "value": {
+                    "intValue": "2"
+                  }
+                }
+              ],
+              "status": {
+                "code": 1
+              },
+              "parentSpanId": "69245f476770d423"
+            },
+            {
+              "traceId": "bff2a184db6ec71c1394c77d7966d527",
+              "spanId": "cca68f8ee6d47041",
+              "name": "swrm.rework",
+              "kind": 1,
+              "startTimeUnixNano": "1792966862000000000",
+              "endTimeUnixNano": "1792966917500000000",
+              "attributes": [
+                {
+                  "key": "swrm.rework.attempts",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "swrm.rework.max_attempts",
+                  "value": {
+                    "intValue": "2"
+                  }
+                },
+                {
+                  "key": "swrm.rework.recovered",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "swrm.rework.final_verify_rc",
+                  "value": {
+                    "intValue": "0"
+                  }
+                }
+              ],
+              "status": {
+                "code": 1
+              },
+              "parentSpanId": "69245f476770d423",
+              "links": [
+                {
+                  "traceId": "bff2a184db6ec71c1394c77d7966d527",
+                  "spanId": "dfd043fa7ed3151e"
+                }
+              ]
+            },
+            {
+              "traceId": "bff2a184db6ec71c1394c77d7966d527",
+              "spanId": "e5fe2cc7a8df69f6",
+              "name": "swrm.verify",
+              "kind": 1,
+              "startTimeUnixNano": "1792966917500000000",
+              "endTimeUnixNano": "1792966920500000000",
+              "attributes": [
+                {
+                  "key": "swrm.verify.phase",
+                  "value": {
+                    "stringValue": "verify"
+                  }
+                },
+                {
+                  "key": "swrm.verify.rc",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "swrm.verify.seconds",
+                  "value": {
+                    "doubleValue": 5.0
+                  }
+                },
+                {
+                  "key": "swrm.verify.failing_count",
+                  "value": {
+                    "intValue": "0"
+                  }
+                }
+              ],
+              "status": {
+                "code": 1
+              },
+              "parentSpanId": "69245f476770d423"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
