@@ -33,6 +33,7 @@ Subcommands:
   stop             terminate a run (partial work is still committed to its branch)
   ingest-claude    record Claude plan usage (from statusline JSON on stdin, or flags)
   ledger           show recent runs or ingest GitHub PR results
+  mcp              start an MCP server on stdio (M37, #285): initialize + tools/list + tools/call
 
 Local data sources and credentials are documented in README.md ("What openswarm reads").
 Nothing that reads another tool's login/auth file is enabled by default.
@@ -22324,6 +22325,296 @@ def post_otlp(endpoint, payload, timeout=10):
     return status
 
 
+
+# ---------------------------------------------------------------- MCP server (M37 slice 1, #285)
+# `openswarm mcp` starts a Model Context Protocol server on stdio (JSON-RPC 2.0,
+# newline-delimited messages). Protocol version 2025-06-18. The server only
+# starts under this explicit command: no other subcommand opens a listener,
+# nothing is resident, and the default behaviour of every other subcommand is
+# unchanged. No new dependency: the transport is stdlib json over stdio.
+# Tools: dispatch (one task card through the existing `run` path: dispatch ->
+# execute -> verify -> ledger) and query (run status / ledger summary by run id).
+# dispatch spawns `openswarm run` as a child with piped stdio, so the run path
+# is literally the same code the CLI uses and the child's stdout can never
+# corrupt the MCP stream. dispatch blocks until the run finishes; a dry run
+# (dry_run=true) only routes and records the run, it does not execute.
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_SERVER_NAME = "openswarm"
+# Surfaced only in initialize serverInfo; bump with releases.
+MCP_SERVER_VERSION = "0.4.55"
+
+MCP_TOOLS = [
+    {"name": "dispatch",
+     "description": "Dispatch one task card through the existing openswarm run path "
+                    "(dispatch -> execute -> verify -> ledger). Returns the run id, "
+                    "status, branch/commit and verify outcome. With dry_run=true it only "
+                    "routes and records the run, it does not execute.",
+     "inputSchema": {"type": "object",
+                     "properties": {"task": {"type": "string",
+                                             "description": "Task card text (required, non-empty)."},
+                                    "title": {"type": "string",
+                                              "description": "Short run title (default: first line of the task)."},
+                                    "backend": {"type": "string",
+                                                "description": "Force a backend, e.g. pi, codex, ocgo."},
+                                    "verify": {"type": "string",
+                                               "description": "Acceptance command run after the executor finishes."},
+                                    "budget_minutes": {"type": "number",
+                                                       "description": "Hard wall-clock budget in minutes (> 0)."},
+                                    "dry_run": {"type": "boolean",
+                                                "description": "Route only, do not execute (default false)."},
+                                    "skip_health_gate": {"type": "boolean",
+                                                         "description": "Bypass the pre-dispatch backend health gate "
+                                                                        "(default false; the bypass is recorded in the "
+                                                                        "ledger and result.json, same as the CLI flag)."}},
+                     "required": ["task"],
+                     "additionalProperties": False}},
+    {"name": "query",
+     "description": "Look up one run by id: state/status, backend, branch/commit, "
+                    "verify outcome and its ledger entry. Run ids are listed by "
+                    "`openswarm runs -n 20 --json`.",
+     "inputSchema": {"type": "object",
+                     "properties": {"run_id": {"type": "string",
+                                                "description": "Run id, e.g. 20261119-090000-abcdef."}},
+                     "required": ["run_id"],
+                     "additionalProperties": False}},
+]
+
+
+def _mcp_error(code, message, req_id):
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+
+def _mcp_result(result, req_id):
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+
+def _mcp_text_result(payload, req_id, is_error=False):
+    result = {"content": [{"type": "text",
+                           "text": payload if isinstance(payload, str)
+                           else json.dumps(payload, indent=2, ensure_ascii=False)}]}
+    if is_error:
+        result["isError"] = True
+    return _mcp_result(result, req_id)
+
+
+def _mcp_check_args(tool, arguments):
+    """Validate tools/call arguments against the tool schema.
+
+    Raises ValueError with an actionable message; nothing fails silently.
+    """
+    if not isinstance(arguments, dict):
+        raise ValueError(f"arguments for tool {tool['name']!r} must be an object, got "
+                         f"{type(arguments).__name__}; pass e.g. { {'task': '...'} if tool['name'] == 'dispatch' else {'run_id': '...'} }")
+    schema = tool["inputSchema"]
+    allowed = set(schema["properties"])
+    unknown = sorted(set(arguments) - allowed)
+    if unknown:
+        raise ValueError(f"unknown argument(s) for tool {tool['name']!r}: {', '.join(unknown)}; "
+                         f"allowed arguments are: {', '.join(sorted(allowed))}")
+    for required in schema.get("required", []):
+        if required not in arguments:
+            raise ValueError(f"tool {tool['name']!r} requires argument {required!r}; "
+                             f"pass e.g. { {'task': '...'} if tool['name'] == 'dispatch' else {'run_id': '...'} }")
+    for key, value in arguments.items():
+        kind = schema["properties"][key].get("type")
+        if kind == "string":
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"argument {key!r} for tool {tool['name']!r} must be a non-empty string")
+        elif kind == "boolean":
+            if not isinstance(value, bool):
+                raise ValueError(f"argument {key!r} for tool {tool['name']!r} must be true or false, "
+                                 f"got {value!r}")
+        elif kind == "number":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"argument {key!r} for tool {tool['name']!r} must be a number > 0, "
+                                 f"got {value!r}")
+    return arguments
+
+
+def mcp_tool_dispatch(arguments, policy):
+    """Run one task card through the existing `run` path (child process).
+
+    Returns (ok, payload): ok False means the run itself failed; the payload
+    always carries the run id and the evidence (or the child error) so the
+    caller never has to guess what happened.
+    """
+    task = arguments["task"]
+    child = [sys.executable, os.path.realpath(__file__), "run", "--prompt", task]
+    if arguments.get("title"):
+        child += ["--title", arguments["title"]]
+    if arguments.get("backend"):
+        child += ["--backend", arguments["backend"]]
+    if arguments.get("verify"):
+        child += ["--verify", arguments["verify"]]
+    if arguments.get("budget_minutes") is not None:
+        child += ["--budget-minutes", str(arguments["budget_minutes"])]
+    if arguments.get("dry_run"):
+        child += ["--dry-run"]
+    if arguments.get("skip_health_gate"):
+        child += ["--skip-health-gate"]
+    try:
+        proc = subprocess.run(child, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except OSError as error:
+        return False, {"error": f"could not start the run subprocess: {error}; "
+                                "retry `openswarm run --dry-run` from a shell to see the underlying error"}
+    out = (proc.stdout or "").strip()
+    try:
+        payload = json.loads(out) if out else {}
+    except ValueError:
+        payload = {"raw_output": out[-2000:]}
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip()
+        result = {"error": "run failed (exit %d)%s" % (proc.returncode,
+                        (": " + err[-1500:]) if err else ""),
+                  "run_id": payload.get("id") if isinstance(payload, dict) else None,
+                  "hint": "reproduce with `openswarm run --dry-run --prompt '<task>'` from a shell"}
+        if isinstance(payload, dict) and payload:
+            # The child still prints its structured failure record (e.g. a
+            # health-gate block with evidence); keep it, don't drop it.
+            result["run"] = {k: v for k, v in payload.items() if k != "raw_output"}
+            if payload.get("raw_output"):
+                result["stdout"] = payload["raw_output"]
+        return False, result
+    if not isinstance(payload, dict) or "id" not in payload:
+        return False, {"error": "run subprocess returned unparseable output; no run id to report",
+                       "hint": "reproduce with `openswarm run --dry-run --prompt '<task>'` from a shell",
+                       "stdout": out[-2000:]}
+    return True, payload
+
+
+def mcp_tool_query(arguments):
+    """Summarise one run from its status/result files plus its ledger entry."""
+    rid = arguments["run_id"]
+    if "/" in rid or "\\" in rid or ".." in rid:
+        raise ValueError(f"invalid run_id {rid!r}: run ids contain no slashes; "
+                         "list real ids with `openswarm runs -n 20 --json`")
+    rdir = os.path.join(RUNS, rid)
+    if not os.path.isdir(rdir):
+        raise ValueError(f"unknown run: {rid!r} (no run directory under {RUNS}); "
+                         "list real ids with `openswarm runs -n 20 --json`")
+    digest = run_digest(rid)
+    result = jload(os.path.join(rdir, "result.json"), {}) or {}
+    title = digest.get("title") or result.get("title")
+    if not title:  # dry-run records no title in status.json; fall back to the task card
+        try:
+            with open(os.path.join(rdir, "task.md"), encoding="utf-8") as fh:
+                title = fh.read().strip().splitlines()[0][:72]
+        except (OSError, IndexError):
+            title = None
+    ledger_entry = None
+    for entry in ledger_entries():
+        if entry.get("id") == rid:
+            ledger_entry = entry
+    verify = result.get("verify") or {}
+    return {"run_id": rid, "state": digest.get("state"), "status": digest.get("status"),
+            "title": title, "backend": digest.get("backend"),
+            "model": digest.get("model"),
+            "commit": digest.get("commit") or result.get("commit"),
+            "branch": result.get("branch"),
+            "elapsed_min": digest.get("elapsed_min"), "budget_min": digest.get("budget_min"),
+            "verify": {"rc": verify.get("rc"), "failing": verify.get("failing", [])} if verify else None,
+            "verify_evalid": result.get("verify_evalid"),
+            "error": result.get("error"), "error_class": result.get("error_class"),
+            "ledger_found": ledger_entry is not None, "ledger": ledger_entry,
+            "run_dir": rdir}
+
+
+def mcp_handle_request(request, policy):
+    """Handle one parsed JSON-RPC request; returns a response dict or None
+    (None = notification, no response). Never raises: handler bugs become a
+    -32603 response so the server stays up for the client."""
+    if not isinstance(request, dict):
+        return _mcp_error(-32600, "Invalid Request: expected a JSON-RPC object", None)
+    req_id = request.get("id")
+    method = request.get("method")
+    if not isinstance(method, str) or not method:
+        return _mcp_error(-32600, "Invalid Request: 'method' must be a non-empty string", req_id)
+    if method.startswith("notifications/"):
+        return None
+    params = request.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return _mcp_error(-32602, "'params' must be an object", req_id)
+    try:
+        if method == "initialize":
+            client_version = params.get("protocolVersion")
+            if not isinstance(client_version, str) or not client_version:
+                return _mcp_error(-32602, "initialize requires params.protocolVersion (a string, e.g. "
+                                 f"{MCP_PROTOCOL_VERSION!r}); this server speaks {MCP_PROTOCOL_VERSION}",
+                                  req_id)
+            return _mcp_result({"protocolVersion": MCP_PROTOCOL_VERSION,
+                                "capabilities": {"tools": {}},
+                                "serverInfo": {"name": MCP_SERVER_NAME,
+                                               "version": MCP_SERVER_VERSION}}, req_id)
+        if method == "ping":
+            return _mcp_result({}, req_id)
+        if method == "tools/list":
+            return _mcp_result({"tools": MCP_TOOLS}, req_id)
+        if method == "tools/call":
+            name = params.get("name")
+            if not isinstance(name, str) or not name:
+                return _mcp_error(-32602, "tools/call requires params.name (a string); "
+                                 "available tools are: dispatch, query", req_id)
+            tool = next((t for t in MCP_TOOLS if t["name"] == name), None)
+            if tool is None:
+                return _mcp_error(-32602, f"unknown tool {name!r}; available tools are: dispatch, query",
+                                  req_id)
+            arguments = params.get("arguments", {})
+            try:
+                arguments = _mcp_check_args(tool, arguments)
+            except ValueError as error:
+                return _mcp_error(-32602, str(error), req_id)
+            try:
+                if name == "dispatch":
+                    ok, payload = mcp_tool_dispatch(arguments, policy)
+                else:
+                    payload = mcp_tool_query(arguments)
+                    ok = True
+            except ValueError as error:
+                return _mcp_text_result({"error": str(error)}, req_id, is_error=True)
+            except Exception as error:  # tool blew up: report, don't kill the server
+                return _mcp_text_result({"error": f"tool {name!r} failed: {error}; "
+                                         "check the run directory or rerun the equivalent "
+                                         "`openswarm run` / `openswarm runs` command from a shell"},
+                                        req_id, is_error=True)
+            return _mcp_text_result(payload, req_id, is_error=not ok)
+        return _mcp_error(-32601, f"Method not found: {method!r}; this server implements "
+                          "initialize, ping, tools/list, tools/call", req_id)
+    except Exception as error:  # pragma: no cover - defensive; keep the server up
+        return _mcp_error(-32603, f"Internal error: {error}", req_id)
+
+
+def mcp_handle_line(line, policy):
+    """Handle one stdio line; returns the response JSON string or None."""
+    if not line.strip():
+        return None
+    try:
+        request = json.loads(line)
+    except ValueError:
+        return json.dumps(_mcp_error(-32700, "Parse error: expected one JSON-RPC object per line", None),
+                          ensure_ascii=False)
+    response = mcp_handle_request(request, policy)
+    return None if response is None else json.dumps(response, ensure_ascii=False)
+
+
+def cmd_mcp_serve(args, policy):
+    """Serve MCP over stdio until EOF. Only stdout carries protocol frames;
+    all diagnostics go to stderr so a client never sees a corrupt frame."""
+    try:
+        for line in sys.stdin:
+            try:
+                response = mcp_handle_line(line, policy)
+            except Exception as error:  # pragma: no cover - defensive
+                response = json.dumps(_mcp_error(-32603, f"Internal error: {error}", None),
+                                      ensure_ascii=False)
+            if response is not None:
+                sys.stdout.write(response + "\n")
+                sys.stdout.flush()
+    except KeyboardInterrupt:
+        pass
+
+
 def cmd_trace_export(args, policy):
     endpoint = args.endpoint if args.endpoint is not None else envvar("OTLP_ENDPOINT")
     if args.endpoint == "":
@@ -22621,6 +22912,7 @@ def main():
     tp.add_argument("--no-file", action="store_true",
                     help="do not write the local OTLP JSON file (requires --endpoint)")
     tp.add_argument("--timeout", type=float, default=10.0, help="OTLP/HTTP POST timeout in seconds (default: 10)")
+    sp = sub.add_parser("mcp", help="start an MCP server on stdio (M37 slice 1, #285)")
 
     sp = sub.add_parser("resume", help="list active runs and busy lanes after planner restart")
     sp.add_argument("--since-hours", type=float, default=6,
@@ -23016,6 +23308,8 @@ def main():
     elif a.cmd == "trace":
         if a.trace_cmd == "export":
             cmd_trace_export(a, policy)
+    elif a.cmd == "mcp":
+        cmd_mcp_serve(a, policy)
     elif a.cmd == "resume":
         try:
             cmd_resume(a)
