@@ -7353,6 +7353,318 @@ def enforced_risk(event, policy, worktree, scope="repo"):
     return warning
 
 
+# ---------------------------------------------------------------- approval gate (M38 slice 1, #289)
+#
+# Run-time approval gate for irreversible actions (push / publish /
+# destructive / suspected secret print). It builds on the existing risk
+# detection: `enforced_risk` classifies an executor event, and this gate
+# maps the finding to one of four approval categories. With
+# approval.enabled=false (the default) nothing is intercepted and behaviour
+# is byte-identical to today (enforced risks still hard-block); with the
+# gate on, a matching action pauses *before* execution on permission-request
+# protocols, waits for `openswarm approval approve|reject <id>`, then
+# resumes from the pause point or skips the action. One-shot runs have no
+# permission-request channel, so they keep the enforcement block.
+APPROVAL_CATEGORIES = ("push", "publish", "destructive", "secret")
+# enforced_risk finding name -> approval category. "bypass/force flag",
+# "keychain access" and "computer use" are not irreversible-action classes
+# and stay on the enforcement path.
+APPROVAL_RISK_CATEGORIES = {"push": "push", "publish": "publish",
+                            "rm outside worktree": "destructive",
+                            "secret print": "secret", "sudo": "destructive"}
+APPROVALS = f"{DATA}/approvals.json"
+# Permission-request methods whose reply can be held while a human decides.
+# session/request_permission is ACP (cursor/hermes/copilot lanes); the two
+# item/exec methods are Codex app-server lanes. Other approval methods
+# (fileChange, permissions) have no in-code approved reply shape, so they
+# keep the enforcement block.
+APPROVAL_METHODS = ("session/request_permission", "item/commandExecution/requestApproval",
+                    "execCommandApproval")
+APPROVAL_DECISIONS = ("approved", "rejected")
+
+
+def approval_config(policy):
+    """Effective approval-gate config: enabled flag, enabled categories, wait budget."""
+    cfg = (policy or {}).get("approval") or {}
+    categories = cfg.get("categories", list(APPROVAL_CATEGORIES))
+    if not isinstance(categories, list):
+        categories = list(APPROVAL_CATEGORIES)
+    categories = [c for c in categories if c in APPROVAL_CATEGORIES]
+    try:
+        wait = float(cfg.get("wait_seconds", 1800))
+    except (TypeError, ValueError):
+        wait = 1800
+    return {"enabled": bool(cfg.get("enabled", False)), "categories": categories,
+            "wait_seconds": max(0, wait)}
+
+
+def _approval_git_destructive(event, worktree):
+    """Git destructive verbs (reset --hard, checkout -f, clean -f).
+
+    They share the watch DEFAULT_RISKS[0] pattern with push but are not
+    enforced risks, so the gate reuses that same pattern here instead of
+    a second detector. Returns a gate dict or None.
+    """
+    pattern = DEFAULT_RISKS[0][0]
+    for command in event_commands(event):
+        for words, _ in shell_invocations(command, worktree):
+            if os.path.basename(words[0]) != "git":
+                continue
+            match = re.search(pattern, " ".join(words), re.I)
+            if match and not str(match.group(1)).lower().startswith("push"):
+                return {"category": "destructive", "risk": "git destructive",
+                        "command": redact_command(command)}
+    return None
+
+
+def approval_gate_for_block(block, policy):
+    """Map one enforced_risk finding to a gate dict, or None.
+
+    None when the gate is off, the finding is a host-scope warning, or the
+    risk class is not in the enabled categories.
+    """
+    if not isinstance(block, dict) or block.get("enforced") is False:
+        return None
+    cfg = approval_config(policy)
+    if not cfg["enabled"]:
+        return None
+    category = APPROVAL_RISK_CATEGORIES.get(block.get("risk"))
+    if category is None or category not in cfg["categories"]:
+        return None
+    return {"category": category, "risk": block["risk"], "command": block.get("command")}
+
+
+def approval_risk(event, policy, worktree, scope="repo"):
+    """Classify one executor event for the approval gate, or None.
+
+    Builds on enforced_risk (same detection, same redaction). Returns None
+    when the gate is off, the finding is a host-scope warning, the risk
+    class is not gated, or the event matches nothing.
+    """
+    cfg = approval_config(policy)
+    if not cfg["enabled"] or not cfg["categories"]:
+        return None
+    finding = enforced_risk(event, policy, worktree, scope=scope)
+    gate = approval_gate_for_block(finding, policy)
+    if gate:
+        return gate
+    if finding is None and "destructive" in cfg["categories"]:
+        return _approval_git_destructive(event, worktree)
+    return None
+
+
+def approval_load_all():
+    data = jload(APPROVALS, {}) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def approval_save_all(records):
+    jsave(APPROVALS, records)
+
+
+def approval_load_run(rdir):
+    entries = jload(os.path.join(rdir, "approvals.json"), []) or []
+    return entries if isinstance(entries, list) else []
+
+
+def approval_save_run(rdir, entries):
+    jsave(os.path.join(rdir, "approvals.json"), entries)
+
+
+def approval_ledger_entry(record, kind):
+    # No backend/model: routing-stat readers skip backend-less ledger lines,
+    # so approval records never inflate run counts or pass rates.
+    return {"type": kind, "ts": NOW(), "status": f"approval_{record['status']}",
+            "run_id": record["run_id"],
+            "title": f"approval {record['id']} ({record['category']}/{record['risk']})",
+            "approval_id": record["id"], "approval_category": record["category"],
+            "approval_risk": record["risk"], "command": record.get("command")}
+
+
+def request_approval(run_id, rdir, finding, pause_point=None, event_file=None):
+    """Record a pending approval: run file + global index + ledger + event log.
+
+    finding is an approval_risk/approval_gate_for_block dict (category,
+    risk, command). pause_point is an opaque resume pointer (run id,
+    request id, method, command); it is stored verbatim so a decider can
+    see exactly where execution paused, and the lane loop resumes from it.
+    Returns the record.
+    """
+    record = {"id": "appr-" + uuid.uuid4().hex[:12], "run_id": run_id,
+              "status": "pending", "category": finding["category"], "risk": finding["risk"],
+              "command": finding.get("command"), "pause_point": pause_point or {},
+              "created_ts": NOW(), "decided_ts": None, "decision": None,
+              "decided_by": None, "reason": None}
+    entries = approval_load_run(rdir)
+    entries.append(record)
+    approval_save_run(rdir, entries)
+    index = approval_load_all()
+    index[record["id"]] = record
+    approval_save_all(index)
+    append_ledger(approval_ledger_entry(record, "approval_requested"))
+    if event_file:
+        lane_record_event(event_file, {"type": "approval_requested", **record})
+    return record
+
+
+def decide_approval(approval_id, decision, by=None, reason=None):
+    """Decide a pending approval. Raises ValueError on unknown id or when already decided."""
+    if decision not in APPROVAL_DECISIONS:
+        raise ValueError(f"unknown approval decision: {decision}")
+    index = approval_load_all()
+    record = index.get(approval_id)
+    if record is None:
+        raise ValueError(f"unknown approval id: {approval_id}")
+    if record.get("status") != "pending":
+        raise ValueError(f"approval {approval_id} is already {record.get('status')}")
+    record = dict(record)
+    record.update({"status": decision, "decision": decision, "decided_ts": NOW(),
+                   "decided_by": by, "reason": reason})
+    index[approval_id] = record
+    approval_save_all(index)
+    rdir = os.path.join(RUNS, record["run_id"])
+    entries = approval_load_run(rdir)
+    for i, entry in enumerate(entries):
+        if entry.get("id") == approval_id:
+            entries[i] = record
+    approval_save_run(rdir, entries)
+    append_ledger(approval_ledger_entry(record, f"approval_{decision}"))
+    return record
+
+
+def list_approvals(status=None, run_id=None):
+    """Approval records, pending first (oldest first), then decided ones."""
+    records = [r for r in approval_load_all().values() if isinstance(r, dict)]
+    if status and status != "all":
+        records = [r for r in records if r.get("status") == status]
+    if run_id:
+        records = [r for r in records if r.get("run_id") == run_id]
+    order = {"pending": 0, "approved": 1, "rejected": 2}
+    records.sort(key=lambda r: (order.get(r.get("status"), 3), r.get("created_ts") or 0))
+    return records
+
+
+def wait_for_approval(approval_id, timeout_seconds, poll_seconds=1.0):
+    """Poll the approvals index until the request is decided or the timeout lapses.
+
+    Returns the decided record, or None on timeout.
+    """
+    deadline = NOW() + max(0, timeout_seconds)
+    while True:
+        record = approval_load_all().get(approval_id)
+        if record and record.get("status") in APPROVAL_DECISIONS:
+            return record
+        if NOW() >= deadline:
+            return None
+        time.sleep(poll_seconds)
+
+
+def lane_approval_reply(child, msg, approved, event_file=None):
+    """Send the reply for a permission request held by the approval gate.
+
+    Returns the outcome sent, or None when the method has no known reply
+    shape (caller keeps the enforcement block). The approved reply strings
+    reuse the ones the codebase already sends for host-warning approvals
+    ("accept"/"approved"/selected ACP option).
+    """
+    method = msg.get("method", "")
+    req_id = msg.get("id")
+    if "id" not in msg:
+        return None
+    if method == "session/request_permission":
+        if approved:
+            selected = lane_acp_select_option(child, msg)
+            if selected is None:
+                # No allow option was offered: the safe direction is to deny,
+                # even though the human approved (recorded on the event log).
+                outcome = {"outcome": "cancelled"}
+                sent = "cancelled (no allow option offered)"
+            else:
+                outcome = {"outcome": "selected", "optionId": selected.get("optionId")}
+                sent = "selected:" + str(selected.get("optionId"))
+        else:
+            outcome = {"outcome": "cancelled"}
+            sent = "cancelled"
+        child.send({"jsonrpc": "2.0", "id": req_id, "result": {"outcome": outcome}})
+    elif method == "item/commandExecution/requestApproval":
+        child.send({"jsonrpc": "2.0", "id": req_id,
+                    "result": {"decision": "accept" if approved else "decline"}})
+        sent = "accept" if approved else "decline"
+    elif method == "execCommandApproval":
+        child.send({"jsonrpc": "2.0", "id": req_id,
+                    "result": {"decision": "approved" if approved else "abort"}})
+        sent = "approved" if approved else "abort"
+    else:
+        return None
+    if event_file:
+        lane_record_event(event_file, {"type": "approval_reply", "method": method,
+                                       "request_id": req_id, "sent": sent})
+    return sent
+
+
+def lane_approval_pause(child, spec, msg, gate, rdir, event_file, deadline, policy):
+    """Pause a lane turn on a gated action and wait for a human decision.
+
+    Records the pending approval (run file + global index + ledger + event
+    log), then waits for `openswarm approval approve|reject`. Approved:
+    replies to the held permission request and returns True, so the caller
+    resumes the loop from the pause point. Rejected or timed out: replies
+    with a denial and returns False, so the caller takes the enforcement
+    block and the action never executes. A timeout is recorded as a
+    rejection with reason "timeout": the safe direction is to not run it.
+    """
+    pause_point = {"run_id": spec["run_id"], "request_id": msg.get("id"),
+                   "method": msg.get("method"), "command": gate.get("command"),
+                   "risk": gate["risk"], "category": gate["category"],
+                   "event_file": event_file}
+    record = request_approval(spec["run_id"], rdir, gate, pause_point=pause_point,
+                              event_file=event_file)
+    set_status(rdir, approval_pending=[record["id"]])
+    cfg = approval_config(policy)
+    wait = cfg["wait_seconds"]
+    if deadline:
+        wait = min(wait, max(0, deadline - NOW()))
+    decided = wait_for_approval(record["id"], wait)
+    if decided is None:
+        decided = decide_approval(record["id"], "rejected", reason="timeout")
+    set_status(rdir, approval_pending=[])
+    if decided["status"] == "approved":
+        lane_record_event(event_file, {"type": "approval_approved",
+                                       "approval_id": record["id"],
+                                       "category": gate["category"]})
+        lane_approval_reply(child, msg, True, event_file)
+        return True
+    lane_record_event(event_file, {"type": "approval_rejected",
+                                   "approval_id": record["id"],
+                                   "category": gate["category"],
+                                   "reason": decided.get("reason")})
+    lane_approval_reply(child, msg, False, event_file)
+    return False
+
+
+def cmd_approval_list(args):
+    records = list_approvals(status=None if args.status == "all" else args.status,
+                             run_id=args.run)
+    if args.json:
+        print(json.dumps(records, indent=2, ensure_ascii=False))
+        return
+    if not records:
+        print("no approval requests")
+        return
+    for r in records:
+        print(f"{r['id']} {r['status']:<9} {r['category']:<12} {r['risk']:<22} "
+              f"run={r['run_id']} {short(r.get('command') or '', 80)}")
+
+
+def cmd_approval_decide(args, decision):
+    record = decide_approval(args.approval_id, decision, by=args.by, reason=args.reason)
+    if args.json:
+        print(json.dumps(record, indent=2, ensure_ascii=False))
+    else:
+        print(f"{decision}: {record['id']} ({record['category']}/{record['risk']}) "
+              f"run={record['run_id']}")
+
+
 def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None, stream_filter=None):
     _tmpdir, env = configure_executor_environment(cwd, env)
     try:
@@ -11461,13 +11773,12 @@ def lane_cursor_cancel(child, turn):
         turn["cursor_cancel_sent"] = True
 
 
-def lane_acp_request(child, msg, event_file):
-    if msg.get("method") != "session/request_permission":
-        return False
+def lane_acp_select_option(child, msg):
+    """The allow option lane_acp_request would grant for this permission request, or None."""
     params = msg.get("params") or {}
     options = params.get("options") or []
     kinds = ("allow_once",) if getattr(child, "lane", {}).get("backend") == "copilot" else ("allow_always", "allow_once")
-    tool_call = params.get("toolCall") or {}
+
     def sandbox_bypass(value):
         if isinstance(value, dict):
             return any((key in ("requestSandboxBypass", "request_sandbox_bypass") and item is True)
@@ -11476,8 +11787,16 @@ def lane_acp_request(child, msg, event_file):
             return any(sandbox_bypass(item) for item in value)
         return False
     bypass = getattr(child, "lane", {}).get("backend") == "copilot" and sandbox_bypass(params)
-    selected = None if bypass else next((option for kind in kinds for option in options
-                     if isinstance(option, dict) and option.get("kind") == kind), None)
+    return None if bypass else next((option for kind in kinds for option in options
+                                     if isinstance(option, dict) and option.get("kind") == kind), None)
+
+
+def lane_acp_request(child, msg, event_file):
+    if msg.get("method") != "session/request_permission":
+        return False
+    params = msg.get("params") or {}
+    tool_call = params.get("toolCall") or {}
+    selected = lane_acp_select_option(child, msg)
     title = tool_call.get("title")
     lane_record_event(event_file, {"type": "permission_request", "title": title,
                                    "tool_call_id": tool_call.get("toolCallId"), "kind": tool_call.get("kind"),
@@ -11625,18 +11944,39 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
         block = enforced_risk(msg, risk_policy, ws["path"], scope=spec.get("scope", "repo"))
         if block and block.get("enforced") is False:
             lane_record_event(event_file, {"type": "risk_warning", **block})
-        elif block:
-            spec.setdefault("risk_blocks", []).append(block)
-            spec["abort_requested"] = True
-            set_status(rdir, risk_blocks=spec["risk_blocks"])
-            lane_record_event(event_file, {"type": "risk_blocked", **block})
-            if msg.get("method") == "session/request_permission" and "id" in msg:
-                child.send({"jsonrpc": "2.0", "id": msg["id"], "result": {"outcome": {"outcome": "cancelled"}}})
-            elif "id" in msg:
-                lane_approval_response(child, msg, event_file)
-            lane_abort_child(lane, child, turn)
-            abort_deadline = abort_deadline or NOW() + 30
-            continue
+        elif block or (msg.get("method") in APPROVAL_METHODS and "id" in msg):
+            # M38 (#289): with the approval gate on, a gated action pauses
+            # here instead of hard-blocking; approved resumes from the pause
+            # point, rejected falls through to the block below. Git
+            # destructive verbs are not enforced risks, so they arrive with
+            # no block and are classified by approval_risk (same detector).
+            gate = approval_gate_for_block(block, risk_policy) if block else None
+            if gate is None and msg.get("method") in APPROVAL_METHODS and "id" in msg:
+                gate = approval_risk(msg, risk_policy, ws["path"], scope=spec.get("scope", "repo"))
+            replied = False
+            if gate:
+                if lane_approval_pause(child, spec, msg, gate, rdir, event_file,
+                                       deadline, risk_policy):
+                    continue
+                # Rejected (or timed out): the denial reply was already sent
+                # by lane_approval_pause; only the block bookkeeping below
+                # still runs, so the action never executes.
+                replied = True
+                if block is None:
+                    block = {"risk": gate["risk"], "command": gate.get("command")}
+            if block:
+                spec.setdefault("risk_blocks", []).append(block)
+                spec["abort_requested"] = True
+                set_status(rdir, risk_blocks=spec["risk_blocks"])
+                lane_record_event(event_file, {"type": "risk_blocked", **block})
+                if not replied:
+                    if msg.get("method") == "session/request_permission" and "id" in msg:
+                        child.send({"jsonrpc": "2.0", "id": msg["id"], "result": {"outcome": {"outcome": "cancelled"}}})
+                    elif "id" in msg:
+                        lane_approval_response(child, msg, event_file)
+                lane_abort_child(lane, child, turn)
+                abort_deadline = abort_deadline or NOW() + 30
+                continue
         if lane["backend"] == "codex":
             if "method" in msg and "id" in msg:
                 if lane_approval_response(child, msg, event_file,
@@ -23205,6 +23545,23 @@ def main():
     lp.add_argument("--fleet", action="store_true", help="update the merged fleet ledger")
     lp.add_argument("--recompute", action="store_true", help="recompute exec_pass for every finished ledger record")
 
+    sp = sub.add_parser("approval", help="list and decide run-time approval requests (M38, #289)")
+    approval_sub = sp.add_subparsers(dest="approval_cmd", required=True)
+    app = approval_sub.add_parser("list", help="list approval requests (pending by default)")
+    app.add_argument("--status", choices=("pending", "approved", "rejected", "all"), default="pending")
+    app.add_argument("--run", help="only this run id")
+    app.add_argument("--json", action="store_true")
+    app = approval_sub.add_parser("approve", help="approve a pending request; the paused run resumes")
+    app.add_argument("approval_id")
+    app.add_argument("--by", help="who approved (recorded on the decision)")
+    app.add_argument("--reason", help="recorded reason")
+    app.add_argument("--json", action="store_true")
+    app = approval_sub.add_parser("reject", help="reject a pending request; the action is skipped")
+    app.add_argument("approval_id")
+    app.add_argument("--by", help="who rejected (recorded on the decision)")
+    app.add_argument("--reason", help="recorded reason")
+    app.add_argument("--json", action="store_true")
+
     a = ap.parse_args()
     policy = load_policy()
     os.makedirs(DATA, exist_ok=True)
@@ -23416,6 +23773,17 @@ def main():
             sys.exit(2)
     elif a.cmd == "ingest-claude":
         ingest_claude(a)
+    elif a.cmd == "approval":
+        try:
+            if a.approval_cmd == "list":
+                cmd_approval_list(a)
+            elif a.approval_cmd == "approve":
+                cmd_approval_decide(a, "approved")
+            else:
+                cmd_approval_decide(a, "rejected")
+        except ValueError as error:
+            print(f"openswarm: {error}", file=sys.stderr)
+            sys.exit(2)
     elif a.cmd == "ledger":
         if a.ledger_cmd == "ingest":
             try:

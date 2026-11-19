@@ -290,6 +290,17 @@
     "timeout_seconds": 2400,
     "fallback": true
   },
+  "approval": {
+    "_doc": "M38 (#288): run-time approval gate for irreversible actions. Disabled by default: with enabled=false nothing is intercepted and behaviour is byte-identical to today (risk enforcement still blocks). When enabled, a matching high-risk action pauses before execution and waits for `openswarm approval approve|reject <id>`; approval resumes from the pause point, rejection skips the action. Categories: push, publish, destructive (rm outside worktree, git reset --hard / checkout -f / clean -f, sudo), secret (suspected secret print). Override in ~/.claude/openswarm/policy.local.json.",
+    "enabled": false,
+    "categories": [
+      "push",
+      "publish",
+      "destructive",
+      "secret"
+    ],
+    "wait_seconds": 1800
+  },
   "review": {
     "_doc": "Cross-family peer review uses read-only reviewer modes; automatic reviews run asynchronously within the concurrency, time, and diff-size caps.",
     "prefer": ["codex", "agy", "pi", "cursor"],

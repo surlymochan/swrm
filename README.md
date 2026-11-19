@@ -1002,6 +1002,16 @@ and `risk_blocks` with redacted commands. An empty list disables enforcement.
 This is event-based containment: backends that emit commands after execution cannot
 prevent the command's initial side effects. Executor sandbox restrictions still matter.
 
+With `approval.enabled` (M38, #288), matching high-risk actions (policy `approval.categories`:
+`push`, `publish`, `destructive`, `secret`; default all four, gate itself default off) pause
+*before* execution on permission-request protocols instead of hard-blocking: the request is
+recorded in the ledger and the run waits for `openswarm approval approve|reject <id>`
+(`openswarm approval list` shows pending items). Approval resumes the run from the pause
+point; rejection or timeout skips the action and the run stops as `risk_blocked`. With the
+gate off, behaviour is byte-identical to today. One-shot runs have no permission-request
+channel and keep the enforcement block; Codex `fileChange`/`permissions` approval methods
+likewise keep the block.
+
 Use `--scope host` for explicitly authorized host operations with `run`, `lane assign`, or `batch`.
 The default `--scope repo` keeps the executor inside its worktree. Host scope allows task-card-listed
 paths outside the worktree and remote hosts. Both must be explicitly listed in the task card;

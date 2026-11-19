@@ -197,6 +197,9 @@ or reduce the task budget. Timezone is `budget.timezone` (local by default).
 `risk.enforce` stops matching executor commands automatically (default: push, publish,
 secret print, rm outside worktree, sudo). Review redacted `risk_blocks` for stopped runs;
 post-execution command events cannot prevent initial side effects.
+`approval.enabled` (M38, #288, default off) pauses matching irreversible actions before
+execution instead of hard-blocking: `openswarm approval list|approve|reject` decides, the
+run resumes from the pause point on approval and skips the action on rejection/timeout.
 
 Use `--scope host` for task-card-authorized host maintenance with `run`, `lane assign`, or `batch`.
 The default `--scope repo` keeps the existing worktree-only prompt. Host scope permits listed
