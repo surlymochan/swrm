@@ -45,14 +45,14 @@ swrm.run                          根 span；status.json started..finished
 | `status.json` started / finished | 根 span 起止（纳秒，OTLP JSON 里为字符串） |
 | `status.json` execution_started / queued_seconds | dispatch span 止点（无 execution_started 时用 started + queued_seconds，夹在根 span 内） |
 | `result.json` attempts[]（顺序） | 每个 attempt 一个 span；绝对开始时间未记录，故按顺序串联：上一个结束＝下一个开始，首个始于 dispatch 止点；`seconds` 为时长；超出根 span 结束时截断到根 span 结束 |
-| attempt `meta.usage` / `events` 文件 | 属性 `swrm.usage.*`（input/output/cacheRead/cacheWrite）；事件文件只计行数与按 `type` 计的分类数（`swrm.events.lines / types`），**不读事件正文、不把任务文本/标题带入 span** |
+| attempt `meta.usage` / `events` 文件 | 属性 `swrm.usage.*`（input/output/cacheRead/cacheWrite）；键名兼容两种后端写法（pi 式 `input/output/cacheRead/cacheWrite` 与 agy 式 `input_tokens/output_tokens/cache_read_tokens/cache_write_tokens`，切片 2 真实 run 补）；事件文件只计行数与按 `type` 计的分类数（`swrm.events.lines / types`），**不读事件正文、不把任务文本/标题带入 span** |
 | attempt `rc` / `error_class` | attempt span 的 OTel status：rc ≠ 0 或有 error_class → ERROR（message 为 error_class），否则 OK |
-| `auto_rework.attempts = N` | rework span 覆盖末 N 条 attempt span（每次 rework 派单至少产生一条 attempt，故尾部 N 条必为 rework）；属性 `swrm.rework.attempts / max_attempts / recovered / final_verify_rc`，links 指向这 N 条 attempt span |
-| `result.json` verify `{phase, rc, seconds, failing}` | verify span：止于根 span 结束，始于 `max(末 attempt 结束, 结束 − seconds)`；`swrm.verify.rc / phase / seconds / failing_count`；rc ≠ 0 → ERROR |
+| `auto_rework.attempts = N` | rework span 覆盖末 N 条 attempt span（每次 rework 派单至少产生一条 attempt，故尾部 N 条必为 rework）；若 `auto_rework.escalation` 存在，升级又多派 attempt、N 不再覆盖整条 rework 链，此时覆盖全部非首轮 attempt（切片 2 真实 run 补）；属性 `swrm.rework.attempts / max_attempts / recovered / final_verify_rc`，links 指向被覆盖的 attempt span |
+| `result.json` verify `{phase, rc, seconds, failing}` | verify span：止于根 span 结束，始于 `max(末 attempt 结束, 结束 − seconds)`；`swrm.verify.rc / phase / seconds / failing_count`；rc ≠ 0 → ERROR。真实 run 的 verify 常无 `seconds`（切片 2 三 run 皆无），此时 span 为结束时刻的一个零长点、只标记 verify 完成瞬间，不虚构时长 |
 | `result.json` verify_evalid.verdict | 根 span 属性 `swrm.verify_evalid.verdict` |
 | `result.json` status / error_class | 根 span status：有 error_class，或 status 为 failed/stopped，或 verify rc ≠ 0 → ERROR，否则 OK |
-| ledger 行 | 扫描 `$OPENSWARM_HOME/ledger.jsonl` 取末一条匹配行：根 span 属性 `swrm.ledger.line`（1 起行号）、`swrm.ledger.offset`（字节偏移）、`swrm.ledger.found`；无匹配行时只记 `found=false`，不报错 |
-| `result.json` 其余结构化字段 | 根 span 属性：`swrm.backend / model / effort / card_type / rework_of / commit / branch / run.seconds / usage.input_tokens / usage.output_tokens` |
+| ledger 行 | 扫描 `$OPENSWARM_HOME/ledger.jsonl` 取 run 自身的行：`id == run_id` 的末一条优先；无自身行时才回落到引用该 run 的行（`run_id == run_id`，如 fleet 派单行，切片 2 真实 run 补）：根 span 属性 `swrm.ledger.line`（1 起行号）、`swrm.ledger.offset`（字节偏移）、`swrm.ledger.found`；无匹配行时只记 `found=false`，不报错 |
+| `result.json` 其余结构化字段 | 根 span 属性：`swrm.backend / model / effort / card_type / rework_of / commit / branch / run.seconds / usage.input_tokens / usage.output_tokens`（根 usage 键名同样兼容 agy 式 `input_tokens/output_tokens`，切片 2 真实 run 补） |
 
 时间回退链（按序取第一个可用值）：started 取 `status.json` started，
 缺失时取 `result.json` 文件 mtime − wall seconds；finished 缺失时取
