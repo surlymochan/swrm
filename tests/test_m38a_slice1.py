@@ -213,9 +213,10 @@ class InstallArmTests(PreexecBase):
         bin_dir = os.path.join(tmpdir, "bin")
         self.assertTrue(env["PATH"].startswith(bin_dir + os.pathsep))
         for verb in xs.PREEXEC_GATE_VERBS:
-            dest = os.path.join(bin_dir, verb)
+            dest = os.path.join(bin_dir, verb + ".cmd" if os.name == "nt" else verb)
             self.assertTrue(os.path.isfile(dest), verb)
-            self.assertTrue(os.access(dest, os.X_OK), verb)
+            if os.name != "nt":
+                self.assertTrue(os.access(dest, os.X_OK), verb)
         # Idempotent: a second install leaves the same files.
         again = xs.install_preexec_gate_shims(str(self.wt), tmpdir)
         self.assertEqual(again, bin_dir)
@@ -327,6 +328,8 @@ class ShimEndToEndTests(PreexecBase):
         return policy
 
     def _run_shim(self, verb, *args):
+        if os.name == "nt":
+            verb = verb + ".cmd"
         return subprocess.run([os.path.join(self.shim_bin, verb), *args],
                               cwd=str(self.wt), env=self.env,
                               capture_output=True, text=True, timeout=60)
@@ -448,7 +451,9 @@ class ShimEndToEndTests(PreexecBase):
         self.env["PATH"] = (self.shim_bin + os.pathsep + "/usr/bin"
                             + os.pathsep + "/bin")
         # twine has no real binary on PATH here: 127 before any record.
-        result = subprocess.run([os.path.join(self.shim_bin, "twine"), "upload", "dist/*"],
+        shim = os.path.join(
+            self.shim_bin, "twine.cmd" if os.name == "nt" else "twine")
+        result = subprocess.run([shim, "upload", "dist/*"],
                                 cwd=str(self.wt), env=self.env,
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 127)

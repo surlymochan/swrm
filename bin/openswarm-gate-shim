@@ -105,7 +105,7 @@ def command_key(argv):
 def _rm_target_path_class(target, cwd, root, tmpdir):
     """Mirror rm_target_path_class() in bin/openswarm."""
     for name in ("TMPDIR", "TMP", "TEMP"):
-        target = re.sub(rf"\$\{{{name}\}}|\${name}\b", tmpdir, target)
+        target = re.sub(rf"\$\{{{name}\}}|\${name}\b", lambda _match: tmpdir, target)
     target = os.path.expanduser(target)
     target = os.path.expandvars(target)
     if "$" in target:
