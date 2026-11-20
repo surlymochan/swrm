@@ -25,6 +25,9 @@ prepend 到执行器子进程 PATH 首位。后端经 shell 执行的每一条�
 `.openswarm-tmp/gate.json`（run_id、类别、wait、deadline、approvals 索引/
 run 文件/ledger/事件文件路径）；`lane_do_run` finally 与 `exec_hermes`
 finally disarm。gate.json 缺失/过期/门关时 shim 直接 exec 真实命令。
+arm 时门开则先重装 shim（幂等）：`lane_prepare_workspace` 每轮派单都
+跑 `git clean -fdx`，会删掉 supervisor 启动时装的 shim，只靠 arm 前
+检查 bin/ 是否存在、门在真实 lane run 中永远无法 armed（#296）。
 
 ## 做了什么
 

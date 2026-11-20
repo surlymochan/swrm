@@ -8024,7 +8024,7 @@ def preexec_approved_resume(msg, worktree, run_id):
 def arm_preexec_gate(worktree, run_id, rdir, event_file, deadline, policy):
     """Write gate.json for this run; the gate dict, or None.
 
-    None when the gate is off or the shims were not installed (the
+    None when the gate is off or the shims could not be installed (the
     event-loop pause remains the backstop). The shim treats a missing
     or expired gate.json as pass-through.
     """
@@ -8032,7 +8032,15 @@ def arm_preexec_gate(worktree, run_id, rdir, event_file, deadline, policy):
     if not cfg["enabled"]:
         return None
     state_dir = preexec_gate_state_dir(worktree)
-    if not os.path.isdir(os.path.join(state_dir, "bin")):
+    # M38-A fix (#296): lane_prepare_workspace runs `git clean -fdx` on
+    # every dispatch, which deletes the shims installed at supervisor
+    # start; its trailing configure_executor_environment(wt) carries no
+    # policy and does not reinstall them, so a gate that only checks for
+    # bin/ can never arm in a real lane run. Reinstall here (idempotent)
+    # so the gate is armed before the first backend command of the turn;
+    # a later deletion is repaired the same way at the next turn.
+    bin_dir = install_preexec_gate_shims(worktree)
+    if not bin_dir or not os.path.isdir(bin_dir):
         return None
     gate = {"version": 1, "run_id": run_id, "enabled": True,
             "categories": cfg["categories"], "wait_seconds": cfg["wait_seconds"],
