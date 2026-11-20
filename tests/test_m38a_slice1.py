@@ -242,12 +242,25 @@ class InstallArmTests(PreexecBase):
         self.assertFalse(os.path.exists(
             os.path.join(str(self.wt), ".openswarm-tmp", "gate.json")))
 
-    def test_arm_noop_when_gate_off_or_shims_absent(self):
+    def test_arm_noop_when_gate_off(self):
         self.assertIsNone(xs.arm_preexec_gate(str(self.wt), "run-1", str(self.rdir),
                                               self.event_file, time.time() + 3600, POL_OFF))
-        # Gate on but no shims installed: no gate.json (shim cannot run).
-        self.assertIsNone(xs.arm_preexec_gate(str(self.wt), "run-1", str(self.rdir),
-                                              self.event_file, time.time() + 3600, POL_ON))
+        self.assertFalse(os.path.exists(
+            os.path.join(str(self.wt), ".openswarm-tmp", "bin")))
+
+    def test_arm_installs_shims_when_gate_on_and_shims_absent(self):
+        # #296: arm used to return None here; lane_prepare_workspace's
+        # `git clean -fdx` deletes the shims on every dispatch, so the
+        # gate could never arm in a real lane run. arm reinstalls instead.
+        gate = xs.arm_preexec_gate(str(self.wt), "run-1", str(self.rdir),
+                                   self.event_file, time.time() + 3600, POL_ON)
+        self.assertIsNotNone(gate)
+        self.assertTrue(os.path.isfile(
+            os.path.join(str(self.wt), ".openswarm-tmp", "gate.json")))
+        for verb in xs.PREEXEC_GATE_VERBS:
+            dest = os.path.join(str(self.wt), ".openswarm-tmp", "bin",
+                                verb + ".cmd" if os.name == "nt" else verb)
+            self.assertTrue(os.path.isfile(dest), verb)
 
 
 # -- loop resume: a shim-approved command is not paused twice ---------------
@@ -526,6 +539,116 @@ class AbortGraceTests(PreexecBase):
         self.assertIn("5s", detail)
         self.assertLess(elapsed, 15)
         self.assertGreaterEqual(elapsed, 4.5)
+
+
+# -- prepare -> arm regression (#296): git clean -fdx must not disarm -----
+
+class PrepareArmRegressionTests(PreexecBase):
+    """Real lane_prepare_workspace (git clean -fdx) then arm must arm.
+
+    Slice 1 installed the shims at supervisor start (LaneChild init) and
+    arm only checked for bin/: prepare's clean deleted bin/ on every
+    dispatch, so arm returned None and the gate never engaged in a real
+    lane run (#296). arm must reinstall the shims when the gate is on.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.realbin = self.root / "realbin"
+        self.realbin.mkdir()
+        if os.name == "nt":
+            # Same %-free fake binary as ShimEndToEndTests (cmd.exe would
+            # expand '%' in the -c code as a variable); only %* forwards.
+            path = self.realbin / "git.cmd"
+            code = ("import os,sys,time;"
+                    "open(os.environ['FAKE_GIT_LOG'],'a',encoding='utf-8')"
+                    ".write(str(time.time())+' '+' '.join(sys.argv[1:])+'\\n');"
+                    "print('fake binary ran')")
+            path.write_text('@\"' + sys.executable + '\" -c \"' + code + '\" %*\n')
+        else:
+            path = self.realbin / "git"
+            path.write_text(FAKE_BIN)
+            path.chmod(0o755)
+        self.fake_log = self.root / "fake-git.log"
+        self.env = dict(os.environ, FAKE_GIT_LOG=str(self.fake_log))
+
+    def _git(self, *args, cwd):
+        subprocess.run(["git", *args], cwd=cwd, check=True,
+                       capture_output=True, text=True, timeout=60)
+
+    def _make_repo(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        self._git("init", "-q", cwd=repo)
+        self._git("config", "user.email", "test@example.invalid", cwd=repo)
+        self._git("config", "user.name", "test", cwd=repo)
+        (repo / "README.md").write_text("test repo\n")
+        self._git("add", ".", cwd=repo)
+        self._git("commit", "-qm", "initial", cwd=repo)
+        return repo
+
+    def _run_shim(self, verb, *args):
+        if os.name == "nt":
+            verb = verb + ".cmd"
+        return subprocess.run([os.path.join(self.shim_bin, verb), *args],
+                              cwd=str(self.wt), env=self.env,
+                              capture_output=True, text=True, timeout=60)
+
+    def _fake_log_lines(self):
+        if not self.fake_log.exists():
+            return []
+        return [line for line in self.fake_log.read_text().splitlines() if line.strip()]
+
+    def test_prepare_then_arm_arms_gate(self):
+        repo = self._make_repo()
+        lane = {"name": "testlane", "repo": str(repo)}
+        rid = "20261121-020000-test"
+        # Supervisor start: child construction installs the shims.
+        ws = xs.lane_prepare_workspace(lane, rid)
+        wt = ws["path"]
+        xs.configure_executor_environment(wt, policy=POL_ON)
+        bin_dir = os.path.join(wt, ".openswarm-tmp", "bin")
+        shim_name = "git.cmd" if os.name == "nt" else "git"
+        self.assertTrue(os.path.isfile(os.path.join(bin_dir, shim_name)))
+        # Next dispatch: prepare's `git clean -fdx` wipes .openswarm-tmp.
+        xs.lane_prepare_workspace(lane, rid)
+        self.assertFalse(os.path.exists(bin_dir))
+        # arm must reinstall the shims and write gate.json (pre-fix: None).
+        policy = {"approval": {"enabled": True,
+                               "categories": ["push", "publish", "destructive", "secret"],
+                               "wait_seconds": 1}}
+        gate = xs.arm_preexec_gate(wt, "run-1", str(self.rdir),
+                                   self.event_file, time.time() + 3600, policy)
+        self.assertIsNotNone(gate)
+        self.assertTrue(gate["enabled"])
+        self.assertTrue(os.path.isfile(os.path.join(bin_dir, shim_name)))
+        self.assertTrue(os.path.isfile(os.path.join(wt, ".openswarm-tmp", "gate.json")))
+        # Takeover effective, not just files present: a gated push times
+        # out (wait 1s) instead of passing through to the real binary.
+        self.shim_bin = bin_dir
+        self.env["PATH"] = (bin_dir + os.pathsep + str(self.realbin)
+                            + os.pathsep + "/usr/bin" + os.pathsep + "/bin")
+        started = time.time()
+        result = self._run_shim("git", "push", "origin", "main")
+        self.assertEqual(result.returncode, 130, result.stderr)
+        self.assertGreaterEqual(time.time() - started, 1.0)
+        self.assertEqual(self._fake_log_lines(), [])
+        records = xs.approval_load_all()
+        self.assertEqual(len(records), 1)
+        record = next(iter(records.values()))
+        self.assertEqual(record["status"], "rejected")
+        self.assertEqual(record["reason"], "timeout")
+        self.assertEqual(record["pause_point"]["method"], "preexec")
+
+    def test_arm_gate_off_installs_nothing(self):
+        repo = self._make_repo()
+        lane = {"name": "testlane", "repo": str(repo)}
+        ws = xs.lane_prepare_workspace(lane, "20261121-020000-test")
+        wt = ws["path"]
+        gate = xs.arm_preexec_gate(wt, "run-1", str(self.rdir),
+                                   self.event_file, time.time() + 3600, POL_OFF)
+        self.assertIsNone(gate)
+        self.assertFalse(os.path.exists(os.path.join(wt, ".openswarm-tmp", "bin")))
 
 
 if __name__ == "__main__":
