@@ -33,6 +33,7 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -534,6 +535,20 @@ def load_gate(state_dir):
     return gate
 
 
+def _exec_real(real, argv):
+    """Run the real binary, returning its exit code on Windows.
+
+    POSIX keeps os.execv (this process becomes the real binary, stdio
+    and signals unchanged). Windows cannot exec a .cmd target with
+    os.execv — the process hangs — so run it as a child and return its
+    exit code verbatim.
+    """
+    if os.name == "nt":
+        return subprocess.run([real, *argv[1:]]).returncode
+    os.execv(real, argv)
+    return EXIT_NOT_FOUND
+
+
 def main(argv):
     # Invoked as <verb> (installed copy) or `openswarm-gate-shim <verb>`
     # (Windows .cmd wrapper) or with an explicit --state-dir (wrapper only).
@@ -563,15 +578,13 @@ def main(argv):
         if real is None:
             print(f"{verb}: command not found", file=sys.stderr)
             return EXIT_NOT_FOUND
-        os.execv(real, argv_full)
-        return EXIT_NOT_FOUND
+        return _exec_real(real, argv_full)
     if real is None:
         print(f"{verb}: command not found", file=sys.stderr)
         return EXIT_NOT_FOUND
     if Gate(gate, verb, argv_full).run() != 0:
         return EXIT_REJECTED
-    os.execv(real, argv_full)
-    return EXIT_NOT_FOUND
+    return _exec_real(real, argv_full)
 
 
 if __name__ == "__main__":
