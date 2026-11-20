@@ -4945,6 +4945,9 @@ def exec_hermes(d, st, prompt, wd, rdir, timeout, evp):
     except (OSError, RuntimeError) as exc:
         return 1, None, {"usage": {}}, str(exc)
     finally:
+        # M38-A slice 1: drop this run's gate arming (the child is closed
+        # right after; a stale gate.json is also expiry-guarded by the shim).
+        disarm_preexec_gate(wd)
         if child:
             child.close()
 
@@ -7110,8 +7113,15 @@ def executor_worktree_root(path):
     return path
 
 
-def configure_executor_environment(worktree, env=None):
-    """Create and locally exclude the executor temp directory, returning its path and environment."""
+def configure_executor_environment(worktree, env=None, policy=None):
+    """Create and locally exclude the executor temp directory, returning its path and environment.
+
+    With policy given and the approval gate on (M38-A slice 1), gate shims
+    are also installed into <worktree>/.openswarm-tmp/bin and put first on
+    the child PATH, so a backend-chosen high-risk command runs swrm-owned
+    code before the real binary. With the gate off the environment is
+    byte-identical to today (no shim dir on PATH at all).
+    """
     root = executor_worktree_root(worktree)
     tmpdir = os.path.join(root, ".openswarm-tmp")
     if os.path.lexists(tmpdir) and (os.path.islink(tmpdir) or not os.path.isdir(tmpdir)):
@@ -7150,6 +7160,10 @@ def configure_executor_environment(worktree, env=None):
                 executor_env[name] = os.environ[name]
     for name in ("TMPDIR", "TMP", "TEMP"):
         executor_env[name] = tmpdir
+    if policy is not None and approval_config(policy)["enabled"]:
+        bin_dir = install_preexec_gate_shims(worktree, tmpdir)
+        if bin_dir:
+            executor_env["PATH"] = bin_dir + os.pathsep + executor_env.get("PATH", "")
     return tmpdir, executor_env
 
 
@@ -7454,6 +7468,9 @@ APPROVAL_RISK_CATEGORIES = {"push": "push", "publish": "publish",
                             "rm outside worktree": "destructive",
                             "secret print": "secret", "sudo": "destructive"}
 APPROVALS = f"{DATA}/approvals.json"
+# Lock serializing approvals-index writers (lane pause, CLI decide, and
+# the pre-exec gate shim, which can create records from parallel shells).
+APPROVALS_LOCK = f"{DATA}/approvals.lock"
 # Permission-request methods whose reply can be held while a human decides.
 # session/request_permission is ACP (cursor/hermes/copilot lanes); the two
 # item/exec methods are Codex app-server lanes. item/fileChange has a known
@@ -7572,6 +7589,33 @@ def approval_load_all():
     return data if isinstance(data, dict) else {}
 
 
+@contextlib.contextmanager
+def _approval_lock():
+    """Serialize approvals-index writers (lane pause, CLI decide, gate shim).
+
+    The pre-exec shim can create records from parallel backend shells,
+    so index read-modify-write must not interleave with a CLI decision.
+    Best-effort: a lock failure degrades to unlocked, never to a lost decision.
+    """
+    try:
+        os.makedirs(os.path.dirname(APPROVALS_LOCK), exist_ok=True)
+        fh = open(APPROVALS_LOCK, "a", encoding="utf-8")
+    except OSError:
+        yield
+        return
+    try:
+        try:
+            _flock(fh, LOCK_EX)
+        except OSError:
+            pass
+        yield
+    finally:
+        try:
+            fh.close()
+        except OSError:
+            pass
+
+
 def approval_save_all(records):
     jsave(APPROVALS, records)
 
@@ -7609,7 +7653,9 @@ def request_approval(run_id, rdir, finding, pause_point=None, event_file=None):
     """
     record = {"id": "appr-" + uuid.uuid4().hex[:12], "run_id": run_id,
               "status": "pending", "category": finding["category"], "risk": finding["risk"],
-              "command": finding.get("command"), "pause_point": pause_point or {},
+              "command": finding.get("command"),
+              "command_key": preexec_command_key(finding.get("command") or ""),
+              "pause_point": pause_point or {},
               "created_ts": NOW(), "decided_ts": None, "decision": None,
               "decided_by": None, "reason": None}
     if event_file:
@@ -7623,12 +7669,13 @@ def request_approval(run_id, rdir, finding, pause_point=None, event_file=None):
             line_no = None
         if line_no is not None:
             record["event_ref"] = {"file": event_file, "line": line_no}
-    entries = approval_load_run(rdir)
-    entries.append(record)
-    approval_save_run(rdir, entries)
-    index = approval_load_all()
-    index[record["id"]] = record
-    approval_save_all(index)
+    with _approval_lock():
+        entries = approval_load_run(rdir)
+        entries.append(record)
+        approval_save_run(rdir, entries)
+        index = approval_load_all()
+        index[record["id"]] = record
+        approval_save_all(index)
     append_ledger(approval_ledger_entry(record, "approval_requested"))
     if event_file:
         lane_record_event(event_file, {"type": "approval_requested", **record})
@@ -7639,23 +7686,24 @@ def decide_approval(approval_id, decision, by=None, reason=None):
     """Decide a pending approval. Raises ValueError on unknown id or when already decided."""
     if decision not in APPROVAL_DECISIONS:
         raise ValueError(f"unknown approval decision: {decision}")
-    index = approval_load_all()
-    record = index.get(approval_id)
-    if record is None:
-        raise ValueError(f"unknown approval id: {approval_id}")
-    if record.get("status") != "pending":
-        raise ValueError(f"approval {approval_id} is already {record.get('status')}")
-    record = dict(record)
-    record.update({"status": decision, "decision": decision, "decided_ts": NOW(),
-                   "decided_by": by, "reason": reason})
-    index[approval_id] = record
-    approval_save_all(index)
-    rdir = os.path.join(RUNS, record["run_id"])
-    entries = approval_load_run(rdir)
-    for i, entry in enumerate(entries):
-        if entry.get("id") == approval_id:
-            entries[i] = record
-    approval_save_run(rdir, entries)
+    with _approval_lock():
+        index = approval_load_all()
+        record = index.get(approval_id)
+        if record is None:
+            raise ValueError(f"unknown approval id: {approval_id}")
+        if record.get("status") != "pending":
+            raise ValueError(f"approval {approval_id} is already {record.get('status')}")
+        record = dict(record)
+        record.update({"status": decision, "decision": decision, "decided_ts": NOW(),
+                       "decided_by": by, "reason": reason})
+        index[approval_id] = record
+        approval_save_all(index)
+        rdir = os.path.join(RUNS, record["run_id"])
+        entries = approval_load_run(rdir)
+        for i, entry in enumerate(entries):
+            if entry.get("id") == approval_id:
+                entries[i] = record
+        approval_save_run(rdir, entries)
     append_ledger(approval_ledger_entry(record, f"approval_{decision}"))
     return record
 
@@ -7797,6 +7845,214 @@ def cmd_approval_decide(args, decision):
     else:
         print(f"{decision}: {record['id']} ({record['category']}/{record['risk']}) "
               f"run={record['run_id']}")
+
+
+# ---------------------------------------------------------------- pre-exec gate (M38-A slice 1, #288/#292)
+#
+# Takeover point: `configure_executor_environment()` installs gate shims
+# into `<worktree>/.openswarm-tmp/bin/` and puts that dir first on the
+# executor child's PATH, so a backend-chosen high-risk shell command runs
+# swrm-owned code *before* the real binary. The event loop cannot be the
+# takeover point: codex 0.166.0 sends no permission request for
+# push/publish/everyday commands, and `item/started` arrives after the
+# command has already run (three裁定, #294 evidence: push landed 22-26s
+# before the decision). The shim (bin/openswarm-gate-shim, stdlib-only:
+# bin/openswarm takes ~0.7s to import, unaffordable per shell call)
+# classifies the invocation with the same four categories, records the
+# pending approval through the slice-1 record chain, waits for the CLI
+# decision, and only then execs the real binary; rejected/timed-out
+# exits 130 without executing. `decided_ts` is therefore always earlier
+# than the real execution. The event-loop pause stays as the backstop
+# for native permission requests (rm -rf and ACP), and a fresh approval
+# for the same run + command key is honoured in both directions so one
+# action is never paused twice (see preexec_approved_resume).
+PREEXEC_GATE_VERBS = ("git", "npm", "pnpm", "yarn", "twine", "gh", "rm", "sudo",
+                      "cat", "less", "more", "head", "tail", "bat", "printenv")
+# Window in which an approval for the same run + command key is reused
+# instead of pausing again (covers the loop-first order: native request
+# approved, then the shell runs the same invocation).
+PREEXEC_APPROVAL_REUSE_SECONDS = 120
+# Window in which a rejection for the same run + command key fails fast
+# with no new record (a retrying backend must not hang the lane).
+PREEXEC_DENIAL_REPEAT_SECONDS = 600
+# Abort escalation (M38-A): turn/interrupt is advisory and the probe run
+# showed an executor ignoring it for 30s. After this grace the lane
+# kills the executor tree instead of waiting out the old 30s budget.
+ABORT_STOP_GRACE_SECONDS = 5
+_PREEXEC_SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
+_PREEXEC_TRANSPARENT = {"env", "timeout", "nice", "exec", "command", "nohup", "!"}
+
+
+def preexec_gate_shim_source():
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), "openswarm-gate-shim")
+
+
+def preexec_gate_state_dir(worktree):
+    return os.path.join(executor_worktree_root(worktree), ".openswarm-tmp")
+
+
+def preexec_gate_cmd_wrapper(verb, shim_src, state_dir):
+    """Windows .cmd wrapper text for one shimmed verb."""
+    return (f'@"{sys.executable}" "{shim_src}" --state-dir '
+            f'"{state_dir}" {verb} %*\r\n')
+
+
+def install_preexec_gate_shims(worktree, tmpdir=None):
+    """Install gate shims into <worktree>/.openswarm-tmp/bin; the dir, or None.
+
+    Copies (not symlinks) so the shim's own path resolves to the state
+    dir it must read gate.json from. Idempotent; safe to call on every
+    lane-child construction while the gate is on.
+    """
+    src = preexec_gate_shim_source()
+    if not os.path.isfile(src):
+        return None
+    state_dir = tmpdir or preexec_gate_state_dir(worktree)
+    bin_dir = os.path.join(state_dir, "bin")
+    try:
+        os.makedirs(bin_dir, exist_ok=True)
+        if os.name == "nt":
+            for verb in PREEXEC_GATE_VERBS:
+                with open(os.path.join(bin_dir, verb + ".cmd"), "w", encoding="utf-8") as fh:
+                    fh.write(preexec_gate_cmd_wrapper(verb, src, state_dir))
+        else:
+            for verb in PREEXEC_GATE_VERBS:
+                dest = os.path.join(bin_dir, verb)
+                shutil.copyfile(src, dest)
+                os.chmod(dest, 0o755)
+    except OSError:
+        return None
+    return bin_dir
+
+
+def _preexec_unwrap_words(words, cwd):
+    """Innermost invocation after shell -c / transparent-wrapper unwrap.
+
+    `sudo` is deliberately NOT unwrapped: it is a shimmed verb itself,
+    so the shim sees the sudo argv. Shells are unwrapped because the
+    shim never sees the parent shell, only the inner command it runs.
+    """
+    depth = 0
+    while words and depth < 16:
+        depth += 1
+        if re.match(r"^[A-Za-z_]\w*=", words[0]):
+            words = words[1:]
+            continue
+        op = os.path.basename(words[0])
+        if op in _PREEXEC_SHELLS:
+            body = None
+            for i, word in enumerate(words[1:], 1):
+                if word in ("-c", "--command") or re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", word):
+                    body = words[i + 1] if i + 1 < len(words) else None
+                    break
+            if body is None:
+                return words
+            try:
+                words = shlex.split(body)
+            except ValueError:
+                return words
+            continue
+        if op in _PREEXEC_TRANSPARENT:
+            inner = shell_wrapper_command(words, cwd)
+            if inner is None:
+                return words
+            words, cwd = inner
+            continue
+        return words
+    return words
+
+
+def preexec_command_keys(command):
+    """Normalized token-join keys, one per ;-separated segment, in order."""
+    keys = []
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return keys
+    segments, segment = [], []
+    for token in tokens + [";"]:
+        if token and all(c in ";&|()\n" for c in token):
+            if segment:
+                segments.append(segment)
+            segment = []
+        else:
+            segment.append(token)
+    for words in segments:
+        unwrapped = _preexec_unwrap_words(words, "/")
+        if unwrapped:
+            key = "\x1f".join(unwrapped)
+            if key not in keys:
+                keys.append(key)
+    return keys
+
+
+def preexec_command_key(command):
+    """Single key for one command (first segment), or None."""
+    keys = preexec_command_keys(command or "")
+    return keys[0] if keys else None
+
+
+def preexec_approved_resume(msg, worktree, run_id):
+    """Approved record covering this event's command, or None.
+
+    The pre-exec shim already held this exact invocation (same run,
+    same normalized key, decided within the reuse window): the event
+    loop must not pause a second time for it.
+    """
+    keys = set()
+    for command in event_commands(msg):
+        keys.update(preexec_command_keys(command))
+    if not keys or not run_id:
+        return None
+    now = NOW()
+    for record in approval_load_all().values():
+        if not isinstance(record, dict):
+            continue
+        if record.get("run_id") != run_id or record.get("status") != "approved":
+            continue
+        if record.get("command_key") not in keys:
+            continue
+        decided = record.get("decided_ts") or 0
+        if 0 <= now - decided <= PREEXEC_APPROVAL_REUSE_SECONDS:
+            return record
+    return None
+
+
+def arm_preexec_gate(worktree, run_id, rdir, event_file, deadline, policy):
+    """Write gate.json for this run; the gate dict, or None.
+
+    None when the gate is off or the shims were not installed (the
+    event-loop pause remains the backstop). The shim treats a missing
+    or expired gate.json as pass-through.
+    """
+    cfg = approval_config(policy)
+    if not cfg["enabled"]:
+        return None
+    state_dir = preexec_gate_state_dir(worktree)
+    if not os.path.isdir(os.path.join(state_dir, "bin")):
+        return None
+    gate = {"version": 1, "run_id": run_id, "enabled": True,
+            "categories": cfg["categories"], "wait_seconds": cfg["wait_seconds"],
+            "deadline": deadline, "approvals_index": APPROVALS,
+            "run_approvals": os.path.join(rdir, "approvals.json"),
+            "ledger": LEDGER, "lock_file": APPROVALS_LOCK,
+            "event_file": event_file, "worktree": os.path.realpath(worktree)}
+    try:
+        jsave(os.path.join(state_dir, "gate.json"), gate)
+    except OSError:
+        return None
+    return gate
+
+
+def disarm_preexec_gate(worktree):
+    """Remove gate.json (best effort); a stale file is also expiry-guarded."""
+    try:
+        os.unlink(os.path.join(preexec_gate_state_dir(worktree), "gate.json"))
+    except OSError:
+        pass
 
 
 def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None, stream_filter=None):
@@ -11294,7 +11550,7 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
 class LaneChild:
     def __init__(self, lane, cwd, policy):
         self.lane, self.cwd = lane, cwd
-        _tmpdir, self.env = configure_executor_environment(cwd)
+        _tmpdir, self.env = configure_executor_environment(cwd, policy=policy)
         self.events = queue.Queue()
         self.backlog = []
         self.write_lock = threading.Lock()
@@ -11472,7 +11728,7 @@ class AgyChild:
 
     def __init__(self, lane, cwd, policy):
         self.lane, self.cwd = lane, cwd
-        _tmpdir, self.env = configure_executor_environment(cwd)
+        _tmpdir, self.env = configure_executor_environment(cwd, policy=policy)
         self.proc = None
         self.events = queue.Queue()
         self.stderr_lines = []
@@ -12232,12 +12488,17 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
     if not os.path.exists(event_file):
         open(event_file, "w", encoding="utf-8").close()
     deadline = spec["started"] + max(0, float(spec["budget_minutes"] or 0)) * 60
+    # One-shot hermes runs have no spec run_id; the run dir basename is the id.
+    run_id = spec.get("run_id") or os.path.basename(os.path.normpath(rdir))
     provider = execution_provider(lane["backend"], policy=load_policy(), lane=lane)
     set_status(rdir, state="running", lane=lane["name"], backend=lane["backend"], model=lane["model"],
                effort=lane.get("effort"), provider=provider, concurrency_keys=concurrency_keys(lane["backend"], provider),
                workspace=ws["path"], events=event_file, attempt=attempt, deadline=deadline,
                executor_pid=child.pid)
     lane_record_event(event_file, {"type": "lane_start", "lane": lane["name"]})
+    # M38-A slice 1: arm the pre-exec gate before the first backend command
+    # can run (no-op when the gate is off or the shims were not installed).
+    arm_preexec_gate(ws["path"], run_id, rdir, event_file, deadline, load_policy())
     if continuation:
         lane_continue_turn(lane, child, prompt, event_file, turn)
     else:
@@ -12296,29 +12557,33 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
 
     if budget_hit:
         lane_abort_child(lane, child, turn)
-        abort_deadline = NOW() + 30
+        abort_deadline = NOW() + ABORT_STOP_GRACE_SECONDS
     elif spec.get("abort_requested"):
         lane_abort_child(lane, child, turn)
-        abort_deadline = NOW() + 30
+        abort_deadline = NOW() + ABORT_STOP_GRACE_SECONDS
     while not ended:
         lane_control_messages(server, lane, spec, child, turn, pending)
         now = NOW()
         if not budget_hit and now >= deadline:
             budget_hit = True
             lane_abort_child(lane, child, turn)
-            abort_deadline = now + 30
+            abort_deadline = now + ABORT_STOP_GRACE_SECONDS
             set_status(rdir, budget_expired=now)
         if spec.get("abort_requested") and not abort_deadline:
             lane_abort_child(lane, child, turn)
-            abort_deadline = now + 30
+            abort_deadline = now + ABORT_STOP_GRACE_SECONDS
         if budget_hit and abort_deadline and now >= abort_deadline:
-            lane_record_event(event_file, {"type": "error", "error": "executor did not stop within 30s after interrupt"})
+            error = (f"executor did not stop within {ABORT_STOP_GRACE_SECONDS}s "
+                     "after interrupt; killed")
+            lane_record_event(event_file, {"type": "error", "error": error})
             child.close()
-            return None, usage, "budget_exceeded", 124, event_file, "executor did not stop within 30s after interrupt"
+            return None, usage, "budget_exceeded", 124, event_file, error
         if spec.get("abort_requested") and not budget_hit and abort_deadline and now >= abort_deadline:
-            lane_record_event(event_file, {"type": "error", "error": "executor did not stop within 30s after abort"})
+            error = (f"executor did not stop within {ABORT_STOP_GRACE_SECONDS}s "
+                     "after abort; killed")
+            lane_record_event(event_file, {"type": "error", "error": error})
             child.close()
-            return None, usage, "risk_blocked" if spec.get("risk_blocks") else "stopped", 130, event_file, "executor did not stop within 30s after abort"
+            return None, usage, "risk_blocked" if spec.get("risk_blocks") else "stopped", 130, event_file, error
         msg = child.next_event(0.15)
         if msg is False:
             if not child.alive():
@@ -12353,6 +12618,17 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
             gate = approval_risk(msg, risk_policy, ws["path"], scope=spec.get("scope", "repo"))
             replied = False
             if gate:
+                resumed = preexec_approved_resume(msg, ws["path"], run_id)
+                if resumed:
+                    # M38-A: the pre-exec shim already held this exact
+                    # invocation and it was approved. Accept any pending
+                    # native request and continue without a second pause.
+                    if msg.get("method") in APPROVAL_METHODS and "id" in msg:
+                        lane_approval_reply(child, msg, True, event_file)
+                    lane_record_event(event_file, {"type": "preexec_resumed",
+                                                   "approval_id": resumed["id"],
+                                                   "category": gate["category"]})
+                    continue
                 if lane_approval_pause(child, spec, msg, gate, rdir, event_file,
                                        deadline, risk_policy):
                     continue
@@ -12373,7 +12649,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                     elif "id" in msg:
                         lane_approval_response(child, msg, event_file)
                 lane_abort_child(lane, child, turn)
-                abort_deadline = abort_deadline or NOW() + 30
+                abort_deadline = abort_deadline or NOW() + ABORT_STOP_GRACE_SECONDS
                 continue
         if lane["backend"] == "codex":
             if "method" in msg and "id" in msg:
@@ -12389,7 +12665,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
             if io_lost:
                 lane_record_event(event_file, {"type": "error", "error": io_lost, "streak": codex_io_streak})
                 lane_abort_child(lane, child, turn)
-                abort_deadline = NOW() + 30
+                abort_deadline = NOW() + ABORT_STOP_GRACE_SECONDS
                 return None, usage, "executor_io_lost", 134, event_file, (
                     "codex shell returned exit 0 with empty output repeatedly")
             if method == "item/completed" and item.get("type") in ("agentMessage", "agent_message"):
@@ -12851,6 +13127,11 @@ def lane_do_run(lane, spec, child, server, current):
                            **exec_pass_fields(False, False, bool(spec.get("verify")), None)})
             return status
         return lane_finalize_run(lane, spec, ws, None, {}, error_class, 1, evp)
+    finally:
+        # M38-A slice 1: drop this run's gate arming (the next run re-arms
+        # in lane_run_turn before its first backend command).
+        if ws:
+            disarm_preexec_gate(ws["path"])
 
 
 def agy_quota_available(lane, child):

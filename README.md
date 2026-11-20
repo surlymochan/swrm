@@ -1004,12 +1004,16 @@ prevent the command's initial side effects. Executor sandbox restrictions still 
 
 With `approval.enabled` (M38, #288), matching high-risk actions (policy `approval.categories`:
 `push`, `publish`, `destructive`, `secret`; default all four, gate itself default off) pause
-*before* execution on permission-request protocols instead of hard-blocking: the request is
-recorded in the ledger and the run waits for `openswarm approval approve|reject <id>`
-(`openswarm approval list` shows pending items). Approval resumes the run from the pause
+*before* execution instead of hard-blocking: when the gate is on, the executor's PATH is
+prefixed with a swrm-owned shim directory (`bin/openswarm-gate-shim`, M38-A slice 1), so a
+high-risk shell command reaches the shim first; the shim records the request in the ledger
+and waits for `openswarm approval approve|reject <id>` (`openswarm approval list` shows
+pending items) before it execs the real binary. Approval resumes the run from the pause
 point; rejection or timeout skips the action and the run stops as `risk_blocked`. With the
-gate on, a Codex thread starts with `approvalPolicy: on-request`, so high-risk commands raise
-a permission request before executing; non-gated command requests are auto-approved only when
+gate on, a Codex thread still starts with `approvalPolicy: on-request` (M38 follow-up
+#292), so high-risk commands that do raise a native permission request are answered from
+the same approvals record (a request for an already-approved command is accepted without
+pausing twice); non-gated command requests are auto-approved only when
 every invocation is in the safe set (read-only git/view, in-worktree tests/builds and git
 writes — M38 follow-up #292), in-worktree file changes are auto-approved, and anything else
 (including `permissions`) stays declined, with each auto decision logged in the event file.
