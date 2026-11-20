@@ -198,11 +198,14 @@ or reduce the task budget. Timezone is `budget.timezone` (local by default).
 secret print, rm outside worktree, sudo). Review redacted `risk_blocks` for stopped runs;
 post-execution command events cannot prevent initial side effects.
 `approval.enabled` (M38, #288, default off) pauses matching irreversible actions before
-execution instead of hard-blocking: `openswarm approval list|approve|reject` decides, the
-run resumes from the pause point on approval and skips the action on rejection/timeout.
-With the gate on, a Codex thread starts with `approvalPolicy: on-request` (M38 follow-up
-#292), so high-risk commands ask first; safe non-gated commands and in-worktree file
-changes are auto-approved, anything else stays declined.
+execution instead of hard-blocking: with the gate on, the executor's PATH is prefixed with
+a swrm-owned shim directory, so a high-risk shell command reaches the shim first and waits
+for `openswarm approval list|approve|reject` to decide; the run resumes from the pause point
+on approval and skips the action on rejection/timeout. With the gate on, a Codex thread
+still starts with `approvalPolicy: on-request` (M38 follow-up #292), so high-risk commands
+that raise a native permission request are answered from the same approvals record; safe
+non-gated commands and in-worktree file changes are auto-approved, anything else stays
+declined.
 
 Use `--scope host` for task-card-authorized host maintenance with `run`, `lane assign`, or `batch`.
 The default `--scope repo` keeps the existing worktree-only prompt. Host scope permits listed
