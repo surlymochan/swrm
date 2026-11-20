@@ -123,6 +123,12 @@ CLASSIFY_CASES = [
 class ClassifyAgreementTests(PreexecBase):
     def test_shim_classify_matches_approval_risk(self):
         for argv, expected in CLASSIFY_CASES:
+            # Windows: "/tmp" gains the cwd drive when joined, so the
+            # dirname is "\tmp", which is not in the scratch-tmp set;
+            # both the shim and approval_risk call this destructive.
+            # The corpus expectation (None) is POSIX-only.
+            if os.name == "nt" and argv == ["rm", "/tmp/single-file"]:
+                expected = ("destructive", "rm outside worktree")
             with self.subTest(argv=argv):
                 got = shim.classify(argv, str(self.wt))
                 self.assertEqual(got, expected)
@@ -306,9 +312,21 @@ class ShimEndToEndTests(PreexecBase):
         self.realbin = self.root / "realbin"
         self.realbin.mkdir()
         for verb in ("git", "npm", "cat"):
-            path = self.realbin / verb
-            path.write_text(FAKE_BIN)
-            path.chmod(0o755)
+            if os.name == "nt":
+                # Windows: shutil.which only matches PATHEXT extensions,
+                # so an extensionless fake binary is invisible to the shim
+                # (real binary not found -> 127). Use a .cmd wrapper that
+                # logs in the same format as FAKE_BIN (epoch float first).
+                path = self.realbin / (verb + ".cmd")
+                code = ("import os,sys,time;"
+                        "open(os.environ['FAKE_GIT_LOG'],'a',encoding='utf-8')"
+                        ".write('%.6f '%time.time()+' '.join(sys.argv[1:])+'\\n');"
+                        "print('fake binary ran')")
+                path.write_text('@\"' + sys.executable + '\" -c \"' + code + '\" %*\n')
+            else:
+                path = self.realbin / verb
+                path.write_text(FAKE_BIN)
+                path.chmod(0o755)
         self.fake_log = self.root / "fake-git.log"
         self.env = dict(os.environ, FAKE_GIT_LOG=str(self.fake_log))
         self.shim_bin = None
