@@ -125,7 +125,10 @@ def _is_scratch_tmp_file(target, cwd):
     if any(ch in target for ch in "*?[{~$"):
         return False
     path = os.path.normpath(os.path.join(cwd, target))
-    scratch = {os.path.splitdrive(d)[1] for d in
+    # Mirror bin/openswarm: SCRATCH_TMP_DIRS is normpath'd there, so on
+    # Windows "/tmp" compares as "\tmp". Comparing raw "/tmp" here would
+    # diverge (shim: destructive, main: scratch) for `rm /tmp/file`.
+    scratch = {os.path.splitdrive(os.path.normpath(d))[1] for d in
                _SCRATCH_TMP_DIRS + (__import__("tempfile").gettempdir(),)}
     if os.path.splitdrive(os.path.dirname(path))[1] not in scratch:
         return False
@@ -539,11 +542,18 @@ def _exec_real(real, argv):
     """Run the real binary, returning its exit code on Windows.
 
     POSIX keeps os.execv (this process becomes the real binary, stdio
-    and signals unchanged). Windows cannot exec a .cmd target with
-    os.execv — the process hangs — so run it as a child and return its
-    exit code verbatim.
+    and signals unchanged). Windows cannot exec a .cmd/.bat target with
+    os.execv — the process hangs — and CreateProcess cannot run one
+    directly either (WinError 193), so script targets go through
+    cmd.exe: list2cmdline quotes the path, shell=True adds the outer
+    quotes cmd /c needs, and the child's exit code comes back verbatim.
+    Native executables still run directly as a child.
     """
     if os.name == "nt":
+        if os.path.splitext(real)[1].lower() in (".cmd", ".bat"):
+            return subprocess.run(
+                subprocess.list2cmdline([real, *argv[1:]]),
+                shell=True).returncode
         return subprocess.run([real, *argv[1:]]).returncode
     os.execv(real, argv)
     return EXIT_NOT_FOUND

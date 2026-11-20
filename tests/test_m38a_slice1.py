@@ -123,12 +123,6 @@ CLASSIFY_CASES = [
 class ClassifyAgreementTests(PreexecBase):
     def test_shim_classify_matches_approval_risk(self):
         for argv, expected in CLASSIFY_CASES:
-            # Windows: "/tmp" gains the cwd drive when joined, so the
-            # dirname is "\tmp", which is not in the scratch-tmp set;
-            # both the shim and approval_risk call this destructive.
-            # The corpus expectation (None) is POSIX-only.
-            if os.name == "nt" and argv == ["rm", "/tmp/single-file"]:
-                expected = ("destructive", "rm outside worktree")
             with self.subTest(argv=argv):
                 got = shim.classify(argv, str(self.wt))
                 self.assertEqual(got, expected)
@@ -317,10 +311,12 @@ class ShimEndToEndTests(PreexecBase):
                 # so an extensionless fake binary is invisible to the shim
                 # (real binary not found -> 127). Use a .cmd wrapper that
                 # logs in the same format as FAKE_BIN (epoch float first).
+                # The -c code must contain no '%' (cmd.exe would expand it
+                # as a variable); only the trailing %* forwards arguments.
                 path = self.realbin / (verb + ".cmd")
                 code = ("import os,sys,time;"
                         "open(os.environ['FAKE_GIT_LOG'],'a',encoding='utf-8')"
-                        ".write('%.6f '%time.time()+' '.join(sys.argv[1:])+'\\n');"
+                        ".write(str(time.time())+' '+' '.join(sys.argv[1:])+'\\n');"
                         "print('fake binary ran')")
                 path.write_text('@\"' + sys.executable + '\" -c \"' + code + '\" %*\n')
             else:
@@ -380,7 +376,7 @@ class ShimEndToEndTests(PreexecBase):
         self.env["PATH"] = (self.shim_bin + os.pathsep + str(self.realbin)
                             + os.pathsep + "/usr/bin" + os.pathsep + "/bin")
         result = self._run_shim("git", "push", "origin", "main")
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self._fake_log_lines()), 1)
         self.assertEqual(xs.approval_load_all(), {})
         # A gate.json with enabled=false passes through the same way.
@@ -388,14 +384,14 @@ class ShimEndToEndTests(PreexecBase):
         Path(gate_path).write_text(json.dumps({"enabled": False}))
         self.fake_log.unlink()
         result = self._run_shim("git", "push", "origin", "main")
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self._fake_log_lines()), 1)
         self.assertEqual(xs.approval_load_all(), {})
 
     def test_nongated_command_runs_without_record(self):
         self._arm()
         result = self._run_shim("git", "status")
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self._fake_log_lines()), 1)
         self.assertEqual(xs.approval_load_all(), {})
 
@@ -404,7 +400,7 @@ class ShimEndToEndTests(PreexecBase):
         self._decide_after("approved")
         started = time.time()
         result = self._run_shim("git", "push", "origin", "main")
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 0, result.stderr)
         lines = self._fake_log_lines()
         self.assertEqual(len(lines), 1)
         # Decision before execution: decided_ts < real binary start.
@@ -459,7 +455,7 @@ class ShimEndToEndTests(PreexecBase):
         xs.decide_approval(record["id"], "approved", by="test")
         started = time.time()
         result = self._run_shim("git", "push", "origin", "main")
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertLess(time.time() - started, 2.0)
         self.assertEqual(len(xs.approval_load_all()), 1)
         self.assertEqual(len(self._fake_log_lines()), 1)
@@ -474,7 +470,7 @@ class ShimEndToEndTests(PreexecBase):
         result = subprocess.run([shim, "upload", "dist/*"],
                                 cwd=str(self.wt), env=self.env,
                                 capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 127)
+        self.assertEqual(result.returncode, 127, result.stderr)
         self.assertEqual(xs.approval_load_all(), {})
 
 
