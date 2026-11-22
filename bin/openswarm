@@ -7119,8 +7119,12 @@ def configure_executor_environment(worktree, env=None, policy=None):
     With policy given and the approval gate on (M38-A slice 1), gate shims
     are also installed into <worktree>/.openswarm-tmp/bin and put first on
     the child PATH, so a backend-chosen high-risk command runs swrm-owned
-    code before the real binary. With the gate off the environment is
-    byte-identical to today (no shim dir on PATH at all).
+    code before the real binary. The child also gets a ZDOTDIR pointing
+    at swrm-owned zsh startup stubs (see install_preexec_gate_zdotdir):
+    backend shell commands run through the user's zsh, whose startup
+    rebuilds PATH and would otherwise demote the shim dir behind the
+    real binaries. With the gate off the environment is byte-identical
+    to today (no shim dir on PATH at all, no ZDOTDIR).
     """
     root = executor_worktree_root(worktree)
     tmpdir = os.path.join(root, ".openswarm-tmp")
@@ -7164,6 +7168,10 @@ def configure_executor_environment(worktree, env=None, policy=None):
         bin_dir = install_preexec_gate_shims(worktree, tmpdir)
         if bin_dir:
             executor_env["PATH"] = bin_dir + os.pathsep + executor_env.get("PATH", "")
+            zdotdir = install_preexec_gate_zdotdir(
+                worktree, bin_dir, tmpdir, executor_env.get("ZDOTDIR"))
+            if zdotdir:
+                executor_env["ZDOTDIR"] = zdotdir
     return tmpdir, executor_env
 
 
@@ -7852,7 +7860,15 @@ def cmd_approval_decide(args, decision):
 # Takeover point: `configure_executor_environment()` installs gate shims
 # into `<worktree>/.openswarm-tmp/bin/` and puts that dir first on the
 # executor child's PATH, so a backend-chosen high-risk shell command runs
-# swrm-owned code *before* the real binary. The event loop cannot be the
+# swrm-owned code *before* the real binary. The PATH prepend alone does
+# not survive the backend's shell: codex executes through the user's
+# zsh, whose startup rebuilds PATH and demotes the shim dir behind the
+# real binaries (gocc probes 2026-11-21: `which -a git` listed the shim
+# last, approvals fell back to item/started). The child therefore also
+# gets ZDOTDIR=<state dir>/zdotdir with stubs that source the user's own
+# startup files and then restore the shim dir at the front of PATH
+# (install_preexec_gate_zdotdir; verified end-to-end on gocc 2026-11-23:
+# a real codex turn resolved git to the shim and executed it). The event loop cannot be the
 # takeover point: codex 0.166.0 sends no permission request for
 # push/publish/everyday commands, and `item/started` arrives after the
 # command has already run (three裁定, #294 evidence: push landed 22-26s
@@ -7923,6 +7939,51 @@ def install_preexec_gate_shims(worktree, tmpdir=None):
     except OSError:
         return None
     return bin_dir
+
+
+def preexec_gate_zdotdir(worktree, tmpdir=None):
+    """Dir holding the gate's zsh startup stubs for the executor child."""
+    state_dir = tmpdir or preexec_gate_state_dir(worktree)
+    return os.path.join(state_dir, "zdotdir")
+
+
+def install_preexec_gate_zdotdir(worktree, bin_dir, tmpdir=None, source_dir=None):
+    """Write zsh startup stubs that keep the shim dir first on PATH.
+
+    Root cause (M38-A PATH fix, gocc probes 2026-11-21/23): the spawn-env
+    PATH prepend above is not what backend shell commands see. Codex runs
+    commands through the user's zsh, whose startup rebuilds PATH —
+    ~/.zshenv prepends and the login shell's path_helper demote the
+    inherited shim dir behind the real binaries (`which -a git` listed
+    the shim last; approvals fell back to item/started). Setting ZDOTDIR
+    for the executor child to this stub dir is the layer that survives
+    that rebuild: every stub first sources the user's own startup file
+    of the same name (behaviour unchanged), then puts the shim dir back
+    at the front of PATH. Covers non-login, login and shell-snapshot
+    invocations (.zshenv/.zprofile/.zshrc/.zlogin). Non-zsh shells ignore
+    ZDOTDIR and keep today's behaviour. Idempotent.
+    """
+    zdotdir = preexec_gate_zdotdir(worktree, tmpdir)
+    if source_dir and os.path.realpath(source_dir) == os.path.realpath(zdotdir):
+        source_dir = None  # our own stub dir: never source ourselves
+    try:
+        os.makedirs(zdotdir, exist_ok=True)
+        for name in (".zshenv", ".zprofile", ".zshrc", ".zlogin"):
+            if source_dir:
+                src = shlex.quote(os.path.join(source_dir, name))
+            else:
+                src = '"$HOME/' + name + '"'
+            text = ("# openswarm pre-exec gate (M38-A): source the user's own\n"
+                    "# startup file first, then restore the gate shim dir at\n"
+                    "# the front of PATH (zsh startup otherwise demotes it).\n"
+                    f"[ -f {src} ] && . {src}\n"
+                    f"PATH={shlex.quote(bin_dir)}:\"$PATH\"\n"
+                    "export PATH\n")
+            with open(os.path.join(zdotdir, name), "w", encoding="utf-8") as fh:
+                fh.write(text)
+    except OSError:
+        return None
+    return zdotdir
 
 
 def _preexec_unwrap_words(words, cwd):
@@ -8042,6 +8103,13 @@ def arm_preexec_gate(worktree, run_id, rdir, event_file, deadline, policy):
     bin_dir = install_preexec_gate_shims(worktree)
     if not bin_dir or not os.path.isdir(bin_dir):
         return None
+    # The same wipe deletes the zsh startup stubs the child's ZDOTDIR
+    # points at (install_preexec_gate_zdotdir); rewrite them when missing
+    # so the per-turn PATH stays shim-first. Existing stubs are kept: a
+    # custom source dir baked in at child construction must survive.
+    zdotdir = preexec_gate_zdotdir(worktree)
+    if not os.path.isfile(os.path.join(zdotdir, ".zprofile")):
+        install_preexec_gate_zdotdir(worktree, bin_dir)
     gate = {"version": 1, "run_id": run_id, "enabled": True,
             "categories": cfg["categories"], "wait_seconds": cfg["wait_seconds"],
             "deadline": deadline, "approvals_index": APPROVALS,

@@ -29,6 +29,19 @@ arm 时门开则先重装 shim（幂等）：`lane_prepare_workspace` 每轮派�
 跑 `git clean -fdx`，会删掉 supervisor 启动时装的 shim，只靠 arm 前
 检查 bin/ 是否存在、门在真实 lane run 中永远无法 armed（#296）。
 
+## PATH 层修复（#296 后续，gocc 探针定位）
+
+#297 后文件层已生效，但真实 lane run 中 shim 仍排不进执行 PATH：
+子进程 spawn 环境里 shim 确在首位（`ps eww` 实测），可 codex 经用户
+zsh 执行命令，zsh 启动重建 PATH——`~/.zshenv` 前置与登录 shell 的
+path_helper 把继承来的 shim 目录压到最后（`which -a git` 中 shim
+垫底、审批回落 `item/started`）。修复：门开时子进程环境再加
+`ZDOTDIR=<state dir>/zdotdir`，垫片（`.zshenv`/`.zprofile`/`.zshrc`/
+`.zlogin`）先 source 用户同名启动文件（行为不变）、再把 shim 目录
+放回 PATH 首位；arm 时垫片缺失一并重装。gocc 实测（2026-11-23）：
+真实 codex turn 中 `git` 解析到 shim 并被执行。非 zsh 的 shell 不受
+ZDOTDIR 影响、行为与今天一致；门关时不设 ZDOTDIR、环境逐字节不变。
+
 ## 做了什么
 
 - **新文件 `bin/openswarm-gate-shim`**（stdlib-only，不 import openswarm：
