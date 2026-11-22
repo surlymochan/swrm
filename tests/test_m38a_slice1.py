@@ -322,6 +322,30 @@ class InstallArmTests(PreexecBase):
         self.assertEqual(stub.read_text(encoding="utf-8"), before)
 
 
+# -- sandbox policy: the shim's record chain vs codex workspace-write ------
+
+class SandboxPolicyTests(unittest.TestCase):
+    """The shim writes the record chain from inside codex's command
+    sandbox; only gate-armed workspace-write turns get the extra roots."""
+
+    def test_none_without_gate(self):
+        self.assertIsNone(xs.preexec_gate_sandbox_policy(
+            None, "workspace-write"))
+
+    def test_none_for_other_sandbox_modes(self):
+        gate = {"enabled": True}
+        for mode in ("danger-full-access", "read-only"):
+            self.assertIsNone(xs.preexec_gate_sandbox_policy(gate, mode))
+
+    def test_roots_for_armed_workspace_write(self):
+        policy = xs.preexec_gate_sandbox_policy(
+            {"enabled": True}, "workspace-write")
+        self.assertEqual(policy["type"], "workspaceWrite")
+        self.assertEqual(policy["writableRoots"],
+                         [str(xs.DATA), str(xs.RUNS)])
+        self.assertIs(policy["networkAccess"], False)
+
+
 # -- zdotdir chain: prepare -> arm -> subprocess PATH resolution ------------
 
 @unittest.skipUnless(os.name == "posix" and shutil.which("zsh"),

@@ -8131,6 +8131,31 @@ def disarm_preexec_gate(worktree):
         pass
 
 
+def preexec_gate_sandbox_policy(preexec_gate, sandbox_mode):
+    """turn/start sandboxPolicy for a gate-armed codex turn, or None.
+
+    The gate shim runs INSIDE the backend's command sandbox and must
+    write the approval record chain before the gated command executes
+    (run approvals + event appends under RUNS; global index, ledger and
+    lock under DATA). codex's workspace-write sandbox confines writes
+    to the worktree + TMPDIR, so without extra writable roots the shim
+    dies with EPERM on its first record write and the gated command
+    never runs (gocc probe 2026-11-23, run 20261123-014445-22ec8b: the
+    push WAS intercepted -- PATH/ZDOTDIR layer working -- then the
+    record write to runs/<id>/approvals.json.tmp failed with
+    "Operation not permitted"). Grant exactly the two chain roots, and
+    only for gate-armed turns under the workspace-write sandbox; gate
+    off, danger-full-access, read-only and other backends keep today's
+    sandbox untouched. networkAccess stays at codex's workspace-write
+    default (False), matching the thread-level mode string's effect.
+    """
+    if not preexec_gate or sandbox_mode != "workspace-write":
+        return None
+    return {"type": "workspaceWrite",
+            "writableRoots": [str(DATA), str(RUNS)],
+            "networkAccess": False}
+
+
 def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None, stream_filter=None):
     _tmpdir, env = configure_executor_environment(cwd, env)
     try:
@@ -12118,10 +12143,11 @@ def lane_agy_stop(child):
 
 def lane_begin_turn(lane, child, prompt, worktree, event_file, turn):
     if lane["backend"] == "codex":
+        sandbox_mode = load_policy().get("codex", {}).get("sandbox", "workspace-write")
         req_id = "thread-" + uuid.uuid4().hex
         child.send({"jsonrpc": "2.0", "id": req_id, "method": "thread/start",
                     "params": {"cwd": worktree, "model": lane["model"], "approvalPolicy": codex_approval_policy(),
-                               "sandbox": load_policy().get("codex", {}).get("sandbox", "workspace-write"),
+                               "sandbox": sandbox_mode,
                                "ephemeral": True}})
         reply = child.wait_response(req_id, 60, event_file)
         if reply.get("error"):
@@ -12131,9 +12157,13 @@ def lane_begin_turn(lane, child, prompt, worktree, event_file, turn):
         if not turn["thread_id"]:
             raise RuntimeError("codex thread/start response did not contain thread.id")
         req_id = "turn-" + uuid.uuid4().hex
+        turn_params = {"threadId": turn["thread_id"], "input": [{"type": "text", "text": prompt}],
+                       "effort": lane["effort"], "outputSchema": RESULT_SCHEMA}
+        sandbox_policy = preexec_gate_sandbox_policy(turn.get("preexec_gate"), sandbox_mode)
+        if sandbox_policy is not None:
+            turn_params["sandboxPolicy"] = sandbox_policy
         child.send({"jsonrpc": "2.0", "id": req_id, "method": "turn/start",
-                    "params": {"threadId": turn["thread_id"], "input": [{"type": "text", "text": prompt}],
-                               "effort": lane["effort"], "outputSchema": RESULT_SCHEMA}})
+                    "params": turn_params})
         reply = child.wait_response(req_id, 60, event_file)
         if reply.get("error"):
             raise RuntimeError(f"codex turn/start failed: {short(reply['error'], 300)}")
@@ -12201,9 +12231,15 @@ def lane_continue_turn(lane, child, prompt, event_file, turn):
     """Continue after a provider interruption without replacing the backend session/thread."""
     if lane["backend"] == "codex":
         req_id = "turn-" + uuid.uuid4().hex
+        turn_params = {"threadId": turn["thread_id"], "input": [{"type": "text", "text": prompt}],
+                       "effort": lane["effort"], "outputSchema": RESULT_SCHEMA}
+        sandbox_policy = preexec_gate_sandbox_policy(
+            turn.get("preexec_gate"),
+            load_policy().get("codex", {}).get("sandbox", "workspace-write"))
+        if sandbox_policy is not None:
+            turn_params["sandboxPolicy"] = sandbox_policy
         child.send({"jsonrpc": "2.0", "id": req_id, "method": "turn/start",
-                    "params": {"threadId": turn["thread_id"], "input": [{"type": "text", "text": prompt}],
-                               "effort": lane["effort"], "outputSchema": RESULT_SCHEMA}})
+                    "params": turn_params})
         reply = child.wait_response(req_id, 60, event_file)
         if reply.get("error"):
             raise RuntimeError(f"codex turn/start failed: {short(reply['error'], 300)}")
@@ -12574,7 +12610,11 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
     lane_record_event(event_file, {"type": "lane_start", "lane": lane["name"]})
     # M38-A slice 1: arm the pre-exec gate before the first backend command
     # can run (no-op when the gate is off or the shims were not installed).
-    arm_preexec_gate(ws["path"], run_id, rdir, event_file, deadline, load_policy())
+    # The armed gate travels on `turn` so the codex turn/start sites can
+    # widen the command sandbox for the shim's record chain (see
+    # preexec_gate_sandbox_policy).
+    turn["preexec_gate"] = arm_preexec_gate(
+        ws["path"], run_id, rdir, event_file, deadline, load_policy())
     if continuation:
         lane_continue_turn(lane, child, prompt, event_file, turn)
     else:
