@@ -262,6 +262,143 @@ class InstallArmTests(PreexecBase):
                                 verb + ".cmd" if os.name == "nt" else verb)
             self.assertTrue(os.path.isfile(dest), verb)
 
+    def test_gate_on_sets_zdotdir_with_stubs(self):
+        tmpdir, env = xs.configure_executor_environment(str(self.wt), policy=POL_ON)
+        bin_dir = os.path.join(tmpdir, "bin")
+        zdotdir = os.path.join(tmpdir, "zdotdir")
+        self.assertEqual(env.get("ZDOTDIR"), zdotdir)
+        for name in (".zshenv", ".zprofile", ".zshrc", ".zlogin"):
+            stub = os.path.join(zdotdir, name)
+            self.assertTrue(os.path.isfile(stub), name)
+            text = Path(stub).read_text(encoding="utf-8")
+            # The user's own startup file is sourced first, then the
+            # shim dir is put back at the front of PATH.
+            self.assertIn(name, text)
+            self.assertIn(bin_dir, text)
+            self.assertIn("export PATH", text)
+
+    def test_gate_off_no_zdotdir_no_stubs(self):
+        base = {k: v for k, v in os.environ.items() if k != "ZDOTDIR"}
+        tmpdir, env = xs.configure_executor_environment(
+            str(self.wt), env=base, policy=POL_OFF)
+        self.assertNotIn("ZDOTDIR", env)
+        self.assertFalse(os.path.isdir(os.path.join(tmpdir, "zdotdir")))
+
+    def test_zdotdir_stubs_source_custom_source_dir(self):
+        custom = self.root / "custom-zdot"
+        custom.mkdir()
+        base = dict(os.environ)
+        base["ZDOTDIR"] = str(custom)
+        tmpdir, env = xs.configure_executor_environment(
+            str(self.wt), env=base, policy=POL_ON)
+        text = Path(env["ZDOTDIR"], ".zprofile").read_text(encoding="utf-8")
+        self.assertIn(str(custom), text)
+        self.assertNotIn("$HOME", text)
+
+    def test_arm_reinstalls_zdotdir_after_wipe(self):
+        # Brief item 3: prepare / the serve loop wipe .openswarm-tmp
+        # between runs; arm must restore the stubs the child's ZDOTDIR
+        # points at, together with the shims and gate.json.
+        tmpdir, _env = xs.configure_executor_environment(str(self.wt), policy=POL_ON)
+        shutil.rmtree(tmpdir)
+        gate = xs.arm_preexec_gate(str(self.wt), "run-1", str(self.rdir),
+                                   self.event_file, time.time() + 3600, POL_ON)
+        self.assertIsNotNone(gate)
+        for name in (".zshenv", ".zprofile", ".zshrc", ".zlogin"):
+            self.assertTrue(os.path.isfile(os.path.join(tmpdir, "zdotdir", name)), name)
+
+    def test_arm_keeps_existing_zdotdir_stubs(self):
+        custom = self.root / "custom-zdot-keep"
+        custom.mkdir()
+        base = dict(os.environ)
+        base["ZDOTDIR"] = str(custom)
+        _tmpdir, env = xs.configure_executor_environment(
+            str(self.wt), env=base, policy=POL_ON)
+        stub = Path(env["ZDOTDIR"], ".zprofile")
+        before = stub.read_text(encoding="utf-8")
+        gate = xs.arm_preexec_gate(str(self.wt), "run-1", str(self.rdir),
+                                   self.event_file, time.time() + 3600, POL_ON)
+        self.assertIsNotNone(gate)
+        self.assertEqual(stub.read_text(encoding="utf-8"), before)
+
+
+# -- sandbox policy: the shim's record chain vs codex workspace-write ------
+
+class SandboxPolicyTests(unittest.TestCase):
+    """The shim writes the record chain from inside codex's command
+    sandbox; only gate-armed workspace-write turns get the extra roots."""
+
+    def test_none_without_gate(self):
+        self.assertIsNone(xs.preexec_gate_sandbox_policy(
+            None, "workspace-write"))
+
+    def test_none_for_other_sandbox_modes(self):
+        gate = {"enabled": True}
+        for mode in ("danger-full-access", "read-only"):
+            self.assertIsNone(xs.preexec_gate_sandbox_policy(gate, mode))
+
+    def test_roots_for_armed_workspace_write(self):
+        policy = xs.preexec_gate_sandbox_policy(
+            {"enabled": True}, "workspace-write")
+        self.assertEqual(policy["type"], "workspaceWrite")
+        self.assertEqual(policy["writableRoots"],
+                         [str(xs.DATA), str(xs.RUNS)])
+        self.assertIs(policy["networkAccess"], False)
+
+
+# -- zdotdir chain: prepare -> arm -> subprocess PATH resolution ------------
+
+@unittest.skipUnless(os.name == "posix" and shutil.which("zsh"),
+                     "needs a POSIX host with zsh")
+class ZdotdirChainTests(PreexecBase):
+    """The PATH fix end to end, against a hostile zsh startup.
+
+    The fake HOME's .zshenv/.zprofile prepend a user dir holding a fake
+    git — the exact demotion the gocc probes showed (spawn PATH shim-
+    first, effective PATH shim-last). With the gate env's ZDOTDIR the
+    shim must win in both plain and login shells; without ZDOTDIR the
+    demotion must reproduce (control, so the test can actually fail).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.userbin = self.root / "userbin"
+        self.userbin.mkdir()
+        fake_git = self.userbin / "git"
+        fake_git.write_text("#!/bin/sh\necho USER-GIT-MARKER\n", encoding="utf-8")
+        fake_git.chmod(0o755)
+        for name in (".zshenv", ".zprofile"):
+            Path(self.home, name).write_text(
+                f'PATH="{self.userbin}:$PATH"\nexport PATH\n', encoding="utf-8")
+
+    def _first_git(self, args, env):
+        out = subprocess.run(["zsh", *args, "which -a git"], env=env,
+                             capture_output=True, text=True, timeout=30)
+        lines = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+        return lines[0] if lines else ""
+
+    def test_shim_wins_under_hostile_zsh_startup(self):
+        base = dict(os.environ)
+        base["HOME"] = str(self.home)
+        base["PATH"] = str(self.userbin) + os.pathsep + base.get("PATH", "")
+        base.pop("ZDOTDIR", None)
+        tmpdir, env = xs.configure_executor_environment(
+            str(self.wt), env=base, policy=POL_ON)
+        gate = xs.arm_preexec_gate(str(self.wt), "run-1", str(self.rdir),
+                                   self.event_file, time.time() + 3600, POL_ON)
+        self.assertIsNotNone(gate)
+        bin_git = os.path.join(tmpdir, "bin", "git")
+        for args in (["-c"], ["-lc"]):
+            with self.subTest(args=args):
+                self.assertEqual(self._first_git(args, env), bin_git)
+        control = {k: v for k, v in env.items() if k != "ZDOTDIR"}
+        for args in (["-c"], ["-lc"]):
+            with self.subTest(args=args, control=True):
+                self.assertEqual(self._first_git(args, control),
+                                 str(self.userbin / "git"))
+
 
 # -- loop resume: a shim-approved command is not paused twice ---------------
 
