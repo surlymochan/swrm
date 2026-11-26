@@ -20,6 +20,7 @@ Subcommands:
   lane             manage long-lived Codex app-server / Cursor ACP / Pi RPC executor lanes
   fleet            inspect hosts, check fleet health, and forward openswarm commands over local / SSH / instabox transports
   batch            queue task cards across fleet hosts and collect their branches
+  graph validate   validate a declarative task-graph file (read-only; M39, #300)
   verify-remote    verify a fleet run on another host in a temporary worktree
   bus              initialize or inspect a GitHub issue bus repository
   intake           SuperAgent autonomy layer (M27): policy, ingest, replay, tickets, decisions, close
@@ -14970,6 +14971,414 @@ def topo_sort_cards(deps_by_card):
     return order
 
 
+# ---------------------------------------------------------------- task graph files (M39 slice 1, #300)
+# A declarative task graph is one YAML/JSON file describing a whole batch:
+# cards (id, backend, acceptance command), dependency edges (depends_on),
+# and optional defaults. Semantics match the M4 batch cards (depends_on
+# lists, topo order, a failed card blocks its dependents); slice 2 wires
+# the file into dispatch (`run --graph`), this slice only fixes the format
+# and validates it before anything is dispatched. The project is stdlib
+# only, so YAML is the repository's small subset (mappings, block/inline
+# lists, quoted/plain scalars, `#` comments, literal `|` blocks for task
+# text) — the same subset family as parse_lesson_yaml above.
+GRAPH_FORMAT_VERSION = 1
+GRAPH_TOP_FIELDS = {"version", "defaults", "cards"}
+GRAPH_DEFAULT_FIELDS = {"backend", "verify"}
+GRAPH_CARD_FIELDS = {"id", "backend", "verify", "depends_on", "task"}
+GRAPH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+
+
+def _graph_yaml_scalar(raw, allow_list=False):
+    """One scalar from the graph YAML subset.
+
+    Reuses lesson_yaml_scalar (quoted strings, ints, bools, inline lists),
+    but a plain unquoted value may contain `: ` — inside a graph value the
+    colon is unambiguous, so it falls back to the raw string instead of
+    failing like the lesson parser does.
+    """
+    value = raw.strip()
+    if allow_list and value.startswith("["):
+        return lesson_yaml_scalar(value, allow_list=True)
+    if not value:
+        raise ValueError("expected a scalar")
+    if value[0] in ("'", '"'):
+        return lesson_yaml_scalar(value)
+    try:
+        return lesson_yaml_scalar(value)
+    except ValueError:
+        return value
+
+
+def _graph_yaml_block_scalar(raw_lines, start_number, key_indent, style):
+    """Literal block scalar (`|` / `|-` / `|+`) starting after line `start_number`.
+
+    Consumes raw lines (comments are kept verbatim inside the block). Returns
+    (text, next_number): the 1-based number of the first line not consumed.
+    Blank lines inside the block are preserved; trailing blanks are dropped.
+    `|+` is treated like `|` (one trailing newline) — documented in
+    docs/task-graph-format.md.
+    """
+    parts, block_indent, number = [], None, start_number
+    while number <= len(raw_lines):
+        raw = raw_lines[number - 1]
+        if not raw.strip():
+            parts.append("")
+            number += 1
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        if indent <= key_indent:
+            break
+        if block_indent is None:
+            block_indent = indent
+        if indent < block_indent:
+            break
+        parts.append(raw[block_indent:])
+        number += 1
+    while parts and parts[-1] == "":
+        parts.pop()
+    text = "\n".join(parts)
+    if style == "|" and parts:
+        text += "\n"
+    return text, number
+
+
+def _graph_yaml_value(lines, raw_lines, i, key_indent, key, val, number):
+    """Value for `key: val` on line `number`; `i` is the index of the next line.
+
+    Returns (value, next_i).
+    """
+    if val in ("|", "|-", "|+"):
+        text, next_number = _graph_yaml_block_scalar(raw_lines, number + 1, key_indent, val)
+        next_i = next((k for k, entry in enumerate(lines) if entry[0] >= next_number), len(lines))
+        return text, next_i
+    if val != "":
+        return _graph_yaml_scalar(val, allow_list=True), i
+    if i >= len(lines) or lines[i][1] <= key_indent:
+        raise ValueError(f"line {number}: expected a nested mapping or list under {key!r}")
+    return _graph_yaml_parse_block(lines, raw_lines, i, lines[i][1])
+
+
+def _graph_yaml_parse_mapping(lines, raw_lines, i, indent, first=None):
+    """Parse a mapping block; `first` is an optional (number, content) pair
+    already consumed from a `- key: value` sequence line. Returns (dict, next_i)."""
+    result, pending = {}, first
+    while True:
+        if pending is not None:
+            number, content = pending
+            pending = None
+        else:
+            if i >= len(lines):
+                break
+            number, ind, content, _raw = lines[i]
+            if ind < indent:
+                break
+            if ind > indent:
+                raise ValueError(f"line {number}: unexpected indentation")
+            if content == "-" or content.startswith("- "):
+                break
+            i += 1
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]*(.*))?", content)
+        if not match:
+            raise ValueError(f"line {number}: expected 'key: value'")
+        key, val = match.group(1), (match.group(2) or "").strip()
+        if key in result:
+            raise ValueError(f"line {number}: duplicate key {key!r}")
+        value, i = _graph_yaml_value(lines, raw_lines, i, indent, key, val, number)
+        result[key] = value
+    return result, i
+
+
+def _graph_yaml_parse_sequence(lines, raw_lines, i, indent):
+    """Parse a `- ...` block. Returns (list, next_i)."""
+    items = []
+    while i < len(lines):
+        number, ind, content, _raw = lines[i]
+        if ind != indent or not (content == "-" or content.startswith("- ")):
+            break
+        rest = content[2:].strip() if content.startswith("- ") else ""
+        i += 1
+        if not rest:
+            if i >= len(lines) or lines[i][1] <= indent:
+                raise ValueError(f"line {number}: expected a value after '-'")
+            value, i = _graph_yaml_parse_block(lines, raw_lines, i, lines[i][1])
+            items.append(value)
+            continue
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]*(.*))?", rest)
+        if not match:
+            items.append(_graph_yaml_scalar(rest, allow_list=True))
+            continue
+        item, i = _graph_yaml_parse_mapping(lines, raw_lines, i, indent + 2, first=(number, rest))
+        items.append(item)
+    return items, i
+
+
+def _graph_yaml_parse_block(lines, raw_lines, i, indent):
+    """Parse the block starting at lines[i]. Returns (value, next_i)."""
+    content = lines[i][2]
+    if content == "-" or content.startswith("- "):
+        return _graph_yaml_parse_sequence(lines, raw_lines, i, indent)
+    return _graph_yaml_parse_mapping(lines, raw_lines, i, indent)
+
+
+def parse_graph_yaml(text):
+    """Parse a task-graph file from the repository's small YAML subset.
+
+    Returns nested dicts/lists of scalars. Raises ValueError naming the
+    offending line; tabs, duplicate keys, and unexpected indentation are
+    hard errors, never silently normalised.
+    """
+    raw_lines = text.splitlines()
+    lines = []
+    for number, original in enumerate(raw_lines, 1):
+        if "\t" in original:
+            raise ValueError(f"line {number}: tabs are not supported")
+        stripped = lesson_yaml_comment(original).rstrip()
+        if not stripped.strip():
+            continue
+        indent = len(stripped) - len(stripped.lstrip(" "))
+        lines.append((number, indent, stripped.strip(), original.rstrip()))
+    if not lines:
+        raise ValueError("empty graph file")
+    if lines[0][1] != 0:
+        raise ValueError(f"line {lines[0][0]}: top-level keys must start at column 0")
+    value, next_i = _graph_yaml_parse_mapping(lines, raw_lines, 0, 0)
+    if next_i != len(lines):
+        raise ValueError(f"line {lines[next_i][0]}: unexpected content after the top-level mapping")
+    return value
+
+
+def load_task_graph(path):
+    """Parse a task-graph file (YAML `.yaml`/`.yml` or JSON `.json`) into raw data.
+
+    Raises ValueError for an unreadable file, an unsupported suffix, or a
+    malformed document. No dispatch, no writes.
+    """
+    suffix = os.path.splitext(path)[1].lower()
+    try:
+        with open(path, encoding="utf-8") as stream:
+            text = stream.read()
+    except OSError as error:
+        raise ValueError(f"cannot read graph file {path!r}: {error.strerror or error}") from error
+    if suffix == ".json":
+        try:
+            return json.loads(text)
+        except ValueError as error:
+            raise ValueError(f"graph file {path!r} is not valid JSON: {error}") from error
+    if suffix in (".yaml", ".yml"):
+        try:
+            return parse_graph_yaml(text)
+        except ValueError as error:
+            raise ValueError(f"graph file {path!r}: {error}") from error
+    raise ValueError(f"unsupported graph file suffix {suffix!r} for {path!r} (expected .yaml, .yml, or .json)")
+
+
+def topo_sort_graph_cards(deps_by_card, declaration_order):
+    """Order graph cards so every dependency precedes its dependents.
+
+    Same contract as topo_sort_cards (self-dependency, unknown dependency,
+    and cycles raise ValueError naming the card and the fix), except the
+    tie-break among ready cards is declaration order in the graph file
+    instead of filename order. A cycle is named explicitly
+    (``a -> b -> a``) rather than reported as a bare sort failure.
+    """
+    for name in declaration_order:
+        for dep in deps_by_card[name]:
+            if dep == name:
+                raise ValueError(
+                    f"card {name!r} depends on itself; remove {name!r} from its own depends_on list")
+            if dep not in deps_by_card:
+                raise ValueError(
+                    f"card {name!r} depends on unknown card {dep!r} (no such card in the graph file); "
+                    f"add the missing card or remove {dep!r} from {name!r}'s depends_on list")
+    visiting, visited, stack = set(), set(), []
+
+    def visit(name):
+        if name in visited:
+            return
+        if name in visiting:
+            cycle = stack[stack.index(name):] + [name]
+            raise ValueError(
+                "dependency cycle detected: " + " -> ".join(cycle) +
+                "; break the cycle by removing one depends_on entry")
+        visiting.add(name)
+        stack.append(name)
+        for dep in deps_by_card[name]:
+            visit(dep)
+        stack.pop()
+        visiting.discard(name)
+        visited.add(name)
+
+    for name in declaration_order:
+        visit(name)
+    remaining = {name: set(deps_by_card[name]) for name in declaration_order}
+    order = []
+    while remaining:
+        ready = [name for name in declaration_order if name in remaining and not remaining[name]]
+        first = ready[0]
+        order.append(first)
+        del remaining[first]
+        for deps in remaining.values():
+            deps.discard(first)
+    return order
+
+
+def validate_task_graph(data, known_backends=None):
+    """Validate parsed task-graph data and return its normalized form.
+
+    Normalized form: ``{"version": 1, "defaults": {"backend", "verify"},
+    "cards": [{"id", "backend", "verify", "depends_on", "task", "order"}],
+    "order": [ids in dispatch order]}``. Per-card ``backend``/``verify``
+    are the effective values after applying ``defaults``; ``backend`` is
+    None when neither the card nor ``defaults`` names one (resolved at
+    dispatch time, like a batch without --backend). Every structural
+    problem found is reported at once; a cycle is checked only once the
+    references are clean. Raises ValueError listing every problem.
+    """
+    known = set(known_backends) if known_backends is not None else set(KNOWN_BACKEND_IDS)
+    errors = []
+    if not isinstance(data, dict):
+        raise ValueError("graph file must contain a top-level mapping with 'version' and 'cards'")
+    for key in sorted(data):
+        if key not in GRAPH_TOP_FIELDS:
+            errors.append(f"unknown top-level field {key!r} (expected: version, defaults, cards)")
+    version = data.get("version")
+    if "version" not in data:
+        errors.append("missing 'version' (expected 1)")
+    elif isinstance(version, bool) or version != GRAPH_FORMAT_VERSION:
+        errors.append(f"unsupported graph version {version!r} (expected {GRAPH_FORMAT_VERSION})")
+    defaults, default_backend, default_verify = {}, None, None
+    if "defaults" in data:
+        if not isinstance(data["defaults"], dict):
+            errors.append("'defaults' must be a mapping with optional 'backend' and 'verify'")
+        else:
+            defaults = data["defaults"]
+            for key in sorted(defaults):
+                if key not in GRAPH_DEFAULT_FIELDS:
+                    errors.append(f"unknown defaults field {key!r} (expected: backend, verify)")
+            if "backend" in defaults:
+                backend = defaults["backend"]
+                if not isinstance(backend, str) or not backend:
+                    errors.append("'defaults.backend' must be a non-empty backend name")
+                else:
+                    default_backend = canonical_backend(backend)
+                    if default_backend not in known:
+                        errors.append(f"unknown backend {backend!r} in 'defaults.backend' "
+                                      f"(known: {', '.join(sorted(known))})")
+            if "verify" in defaults:
+                if not isinstance(defaults["verify"], str) or not defaults["verify"].strip():
+                    errors.append("'defaults.verify' must be a non-empty acceptance command")
+                else:
+                    default_verify = defaults["verify"]
+    raw_cards = data.get("cards")
+    cards, ids = [], []
+    if "cards" not in data:
+        errors.append("missing 'cards' (expected a non-empty list of cards)")
+    elif not isinstance(raw_cards, list) or not raw_cards:
+        errors.append("'cards' must be a non-empty list of cards")
+    else:
+        for index, raw in enumerate(raw_cards):
+            where = f"cards[{index}]"
+            if not isinstance(raw, dict):
+                errors.append(f"{where} must be a mapping with 'id'")
+                continue
+            for key in sorted(raw):
+                if key not in GRAPH_CARD_FIELDS:
+                    errors.append(f"{where}: unknown card field {key!r} "
+                                  f"(expected: id, backend, verify, depends_on, task)")
+            card_id = raw.get("id")
+            if "id" not in raw:
+                errors.append(f"{where}: missing 'id'")
+                continue
+            if not isinstance(card_id, str) or not GRAPH_ID_RE.fullmatch(card_id):
+                errors.append(f"{where}: 'id' {card_id!r} must start with a letter or digit and "
+                              "contain only letters, digits, dot, underscore, or hyphen (max 80 chars)")
+                continue
+            if card_id in ids:
+                errors.append(f"duplicate card id {card_id!r}")
+                continue
+            ids.append(card_id)
+            backend, verify, depends_on, task = None, None, [], None
+            if "backend" in raw:
+                if not isinstance(raw["backend"], str) or not raw["backend"]:
+                    errors.append(f"card {card_id!r}: 'backend' must be a non-empty backend name")
+                else:
+                    backend = canonical_backend(raw["backend"])
+                    if backend not in known:
+                        errors.append(f"card {card_id!r}: unknown backend {raw['backend']!r} "
+                                      f"(known: {', '.join(sorted(known))})")
+            if "verify" in raw:
+                if not isinstance(raw["verify"], str) or not raw["verify"].strip():
+                    errors.append(f"card {card_id!r}: 'verify' must be a non-empty acceptance command")
+                else:
+                    verify = raw["verify"]
+            if "depends_on" in raw:
+                deps = raw["depends_on"]
+                if not isinstance(deps, list) or any(not isinstance(dep, str) or not dep for dep in deps):
+                    errors.append(f"card {card_id!r}: 'depends_on' must be a list of card ids")
+                else:
+                    for dep in deps:
+                        if dep not in depends_on:
+                            depends_on.append(dep)
+            if "task" in raw:
+                if not isinstance(raw["task"], str) or not raw["task"].strip():
+                    errors.append(f"card {card_id!r}: 'task' must be a non-empty string when present")
+                else:
+                    task = raw["task"]
+            cards.append({"id": card_id, "backend": backend, "verify": verify,
+                          "depends_on": depends_on, "task": task})
+    if errors:
+        raise ValueError("invalid task graph: " + "; ".join(errors))
+    for card in cards:
+        if card["backend"] is None:
+            card["backend"] = default_backend
+        if card["verify"] is None:
+            card["verify"] = default_verify
+        if card["verify"] is None:
+            errors.append(f"card {card['id']!r} has no acceptance command: "
+                          "set 'verify' on the card or under 'defaults'")
+    for card in cards:
+        for dep in card["depends_on"]:
+            if dep == card["id"]:
+                errors.append(f"card {card['id']!r} depends on itself; "
+                              f"remove {card['id']!r} from its own depends_on list")
+            elif dep not in ids:
+                errors.append(f"card {card['id']!r} depends on unknown card {dep!r} "
+                              "(no such card in the graph file); "
+                              f"add the missing card or remove {dep!r} from {card['id']!r}'s depends_on list")
+    if errors:
+        raise ValueError("invalid task graph: " + "; ".join(errors))
+    deps_by_card = {card["id"]: card["depends_on"] for card in cards}
+    order = topo_sort_graph_cards(deps_by_card, ids)
+    position = {name: i for i, name in enumerate(order)}
+    for card in cards:
+        card["order"] = position[card["id"]]
+    cards.sort(key=lambda card: card["order"])
+    return {"version": GRAPH_FORMAT_VERSION,
+            "defaults": {"backend": default_backend, "verify": default_verify},
+            "cards": cards, "order": order}
+
+
+def cmd_graph_validate(args):
+    """Validate a task-graph file without dispatching anything (M39 slice 1, #300).
+
+    Read-only: the file is parsed and checked, nothing is dispatched and no
+    ledger, batch, or run state is written. Prints the dispatch order (or
+    the normalized graph with --json) and returns it. Raises ValueError on
+    any problem; the caller exits non-zero.
+    """
+    known = list(KNOWN_BACKEND_IDS)
+    if getattr(args, "backends_file", None):
+        known.extend(backend["id"] for backend in load_custom_backends(
+            policy=load_policy(), explicit=args.backends_file))
+    graph = validate_task_graph(load_task_graph(args.file), known_backends=known)
+    if getattr(args, "json", False):
+        print(json.dumps(graph, indent=2, ensure_ascii=False))
+    else:
+        print(f"valid: {args.file}: {len(graph['cards'])} cards, "
+              f"dispatch order: {' -> '.join(graph['order'])}")
+    return graph
+
+
 _UNSET = object()
 """Sentinel for "no per-card override given" in batch_launch() /
 batch_provider_slot_available(): a batch backend may legitimately be None
@@ -24212,6 +24621,13 @@ def main():
     sp.add_argument("--batch-id", help=argparse.SUPPRESS)
     sp.add_argument("--poll-seconds", type=float, default=2, help=argparse.SUPPRESS)
 
+    sp = sub.add_parser("graph", help="declarative task-graph files (M39, #299)")
+    graph_sub = sp.add_subparsers(dest="graph_cmd", required=True)
+    fp = graph_sub.add_parser("validate", help="validate a task-graph file without dispatching anything (read-only; M39 slice 1, #300)")
+    fp.add_argument("file", help="task-graph file (.yaml, .yml, or .json)")
+    fp.add_argument("--json", action="store_true", help="print the normalized graph as JSON")
+    fp.add_argument("--backends-file", help="custom backends config (JSON); ids defined there count as known backends")
+
     sp = sub.add_parser("verify-remote", help="verify a fleet run in a temporary worktree on another host")
     sp.add_argument("--from", dest="from_host", required=True)
     sp.add_argument("--run", dest="run_id", required=True)
@@ -24515,6 +24931,13 @@ def main():
                 cmd_verify_remote(a)
         except (ValueError, RuntimeError) as e:
             print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
+            sys.exit(2)
+    elif a.cmd == "graph":
+        try:
+            if a.graph_cmd == "validate":
+                cmd_graph_validate(a)
+        except (ValueError, OSError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
             sys.exit(2)
     elif a.cmd == "intake":
         try:

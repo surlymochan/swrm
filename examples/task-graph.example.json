@@ -1,0 +1,1 @@
+{"cards":[{"id":"setup","task":"Set up the fixture repo"},{"backend":"ocgo","depends_on":["setup"],"id":"impl","task":"Implement the feature.\nKeep it small.\n"},{"depends_on":["impl"],"id":"check","task":"Verify the feature","verify":"pytest tests/test_x.py -q"}],"defaults":{"backend":"codex","verify":"pytest -q"},"version":1}
