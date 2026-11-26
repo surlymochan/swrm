@@ -1,0 +1,20 @@
+# Example task graph (M39, #300). Validate with:
+#   openswarm graph validate examples/task-graph.example.yaml
+version: 1
+defaults:
+  backend: codex
+  verify: pytest -q
+cards:
+  - id: setup
+    task: Set up the fixture repo
+  - id: impl
+    backend: ocgo
+    depends_on: [setup]
+    task: |
+      Implement the feature.
+      Keep it small.
+  - id: check
+    depends_on:
+      - impl
+    verify: pytest tests/test_x.py -q
+    task: Verify the feature

@@ -228,6 +228,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm batch` | Queue task cards across fleet hosts and collect their branches. | `openswarm batch --repo project --cards ./cards --hosts worker,sandbox --per-host 1 --backend pi --budget-minutes 20 --detach` |
 | `openswarm batch status` | Show the state of one batch. | `openswarm batch status <batch-id>` |
 | `openswarm batch plan` | Validate card dependencies and print the dispatch order without launching. | `openswarm batch plan --cards ./cards` |
+| `openswarm graph validate` | Validate a declarative task-graph file (YAML/JSON) without dispatching anything. Format: `docs/task-graph-format.md`. | `openswarm graph validate examples/task-graph.example.yaml` |
 | `openswarm bus init` | Create the bus labels, issue template, and protocol README. | `openswarm bus init acme/openswarm-bus` |
 | `openswarm bus status` | Show open bus issues with their executor and age. | `openswarm bus status --json` |
 | `openswarm bus-worker` | Run the reference bus executor; `--once` claims at most one queued issue. | `openswarm bus-worker --bus acme/openswarm-bus --name runner-1 --backend codex --once` |
